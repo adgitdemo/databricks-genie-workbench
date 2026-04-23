@@ -4,6 +4,7 @@
 /scratch
 /output
 /.build/
+/.roadmap/
 .cursor/
 .codex/
 .agents/
@@ -240,3 +241,6 @@ lerna-debug.log*
 *.njsproj
 *.sln
 *.sw?
+
+# LevelUp presentation working tree (built locally; shared via docs folder)
+presentation/
