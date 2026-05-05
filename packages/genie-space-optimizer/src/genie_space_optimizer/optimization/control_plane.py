@@ -258,6 +258,52 @@ _DIAGNOSTIC_AG_DIRECTIVES: dict[str, dict[str, str]] = {
 }
 
 
+def union_ag_levers_with_recommended(
+    *,
+    ag: dict,
+    cluster: dict,
+) -> dict:
+    """Cycle 10 W2 — return a new AG dict whose ``lever_directives``
+    contain at minimum every lever in ``cluster.recommended_levers``.
+
+    The diagnostic directive's existing payload (kind, root_cause,
+    guidance, target_qids) is preserved unchanged. Levers added from
+    the cluster's recommendation that are not already present get a
+    ``recommended_passthrough`` directive shape so the strategist
+    sees them in the AG-emit slate without a hard guidance string.
+
+    Cycle 10 W8 — the returned dict carries ``_levers_before_union``,
+    a snapshot of the keys that existed before the union, so the AG-
+    emit finalize site can decide whether to emit
+    ``AG_LEVERS_UNIONED``.
+
+    Pure: no I/O, no clock, no logger. Always returns a new dict
+    (does not mutate input).
+    """
+    out = dict(ag or {})
+    existing = dict((ag or {}).get("lever_directives") or {})
+    existing_before_keys = list(existing.keys())
+    rec_levers = list((cluster or {}).get("recommended_levers") or [])
+    for lv in rec_levers:
+        key = str(lv)
+        if key not in existing:
+            existing[key] = {
+                "kind": "recommended_passthrough",
+                "root_cause": str((cluster or {}).get("root_cause") or "unknown"),
+                "guidance": (
+                    "Cluster recommended this lever; consider it during "
+                    "AG-emit even when no diagnostic directive applies."
+                ),
+                "target_qids": [
+                    str(q) for q in (cluster or {}).get("question_ids", []) or []
+                    if str(q)
+                ],
+            }
+    out["lever_directives"] = existing
+    out["_levers_before_union"] = existing_before_keys
+    return out
+
+
 def diagnostic_action_group_for_cluster(cluster: dict) -> dict:
     """Build a deterministic AG when the strategist omits a hard cluster.
 
