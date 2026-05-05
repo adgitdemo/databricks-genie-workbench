@@ -214,20 +214,43 @@ class DoaFingerprintBuffer:
     """
 
     _by_ag: dict[str, set] = field(default_factory=dict)
+    # Cycle 10 W5 — body-only fingerprint index that catches reproposals
+    # which switch ``patch_type`` (e.g. ``update_instruction_section`` ↔
+    # ``rewrite_instruction``) but keep the same body text. ``contains``
+    # checks both indices when ``GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH``
+    # is on.
+    _by_ag_body: dict[str, set] = field(default_factory=dict)
 
     def add(self, *, ag_id: str, patch: dict[str, Any]) -> None:
         if not ag_id or not patch:
             return
         sig = patch_retry_signature(patch)
         self._by_ag.setdefault(str(ag_id), set()).add(sig)
+        body_fp = patch_body_fingerprint(patch)
+        if body_fp:
+            self._by_ag_body.setdefault(str(ag_id), set()).add(body_fp)
 
     def contains(self, *, ag_id: str, patch: dict[str, Any]) -> bool:
         if not ag_id or not patch:
             return False
         sigs = self._by_ag.get(str(ag_id))
-        if not sigs:
+        if sigs and patch_retry_signature(patch) in sigs:
+            return True
+        try:
+            from genie_space_optimizer.common.config import (
+                doa_fingerprint_patch_body_match_enabled,
+            )
+        except Exception:
             return False
-        return patch_retry_signature(patch) in sigs
+        if not doa_fingerprint_patch_body_match_enabled():
+            return False
+        body_fp = patch_body_fingerprint(patch)
+        if not body_fp:
+            return False
+        body_sigs = self._by_ag_body.get(str(ag_id))
+        if not body_sigs:
+            return False
+        return body_fp in body_sigs
 
     def signatures_for(self, ag_id: str) -> tuple:
         return tuple(self._by_ag.get(str(ag_id), ()))

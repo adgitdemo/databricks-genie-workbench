@@ -5601,3 +5601,14 @@ def l6_narrow_replacement_patch_aware_enabled() -> bool:
     filter-only path.
     """
     return _flag_default_on("GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE")
+
+
+def doa_fingerprint_patch_body_match_enabled() -> bool:
+    """Cycle 10 W5 — DOA fingerprint buffer also indexes
+    ``patch_body_fingerprint`` so reproposals that switch
+    ``patch_type`` (e.g. ``update_instruction_section`` ↔
+    ``rewrite_instruction``) are still caught. Default-on; replay
+    sets ``GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH=0`` to preserve the
+    Cycle 9 W4 retry-signature-only path.
+    """
+    return _flag_default_on("GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH")

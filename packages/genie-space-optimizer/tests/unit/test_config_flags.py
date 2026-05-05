@@ -64,3 +64,19 @@ def test_l6_narrow_replacement_patch_aware_off(monkeypatch):
         l6_narrow_replacement_patch_aware_enabled,
     )
     assert l6_narrow_replacement_patch_aware_enabled() is False
+
+
+def test_doa_fingerprint_patch_body_match_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH", raising=False)
+    from genie_space_optimizer.common.config import (
+        doa_fingerprint_patch_body_match_enabled,
+    )
+    assert doa_fingerprint_patch_body_match_enabled() is True
+
+
+def test_doa_fingerprint_patch_body_match_off(monkeypatch):
+    monkeypatch.setenv("GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH", "0")
+    from genie_space_optimizer.common.config import (
+        doa_fingerprint_patch_body_match_enabled,
+    )
+    assert doa_fingerprint_patch_body_match_enabled() is False
