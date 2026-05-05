@@ -128,3 +128,32 @@ def test_patch_cap_decision_records_use_phase_b_contract() -> None:
     assert records[0].affected_qids == ("q028",)
     assert records[1].proposal_id == "P001"
     assert records[1].gate == "patch_cap"
+
+
+# Cycle 10 — new ReasonCode membership assertions
+def test_reason_code_lever6_force_llm_declined_membership():
+    from genie_space_optimizer.optimization.rca_decision_trace import (
+        ReasonCode,
+    )
+    assert ReasonCode.LEVER6_FORCE_LLM_DECLINED.value == "lever6_force_llm_declined"
+
+
+def test_reason_code_lever6_force_raised_membership():
+    from genie_space_optimizer.optimization.rca_decision_trace import (
+        ReasonCode,
+    )
+    assert ReasonCode.LEVER6_FORCE_RAISED.value == "lever6_force_raised"
+
+
+def test_reason_code_narrow_not_applicable():
+    from genie_space_optimizer.optimization.rca_decision_trace import (
+        ReasonCode,
+    )
+    assert ReasonCode.NARROW_NOT_APPLICABLE.value == "narrow_not_applicable"
+
+
+def test_reason_code_ag_levers_unioned_membership():
+    from genie_space_optimizer.optimization.rca_decision_trace import (
+        ReasonCode,
+    )
+    assert ReasonCode.AG_LEVERS_UNIONED.value == "ag_levers_unioned"

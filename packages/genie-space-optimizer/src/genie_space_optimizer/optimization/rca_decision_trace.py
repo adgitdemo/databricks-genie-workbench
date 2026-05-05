@@ -126,6 +126,20 @@ class ReasonCode(str, Enum):
     CAP_CONSERVATION_REPAIRED = "cap_conservation_repaired"
     NON_CANONICAL_JUDGE_ROW = "non_canonical_judge_row"
     INVARIANT_VIOLATION_DOWNGRADED = "invariant_violation_downgraded"
+    # Cycle 10 W3 — typed outcomes for the Cycle 7 N3 force-Lever-6
+    # silent path. ``LEVER6_FORCE_LLM_DECLINED`` fires when the LLM
+    # returns no candidate; ``LEVER6_FORCE_RAISED`` fires when the
+    # generator raises.
+    LEVER6_FORCE_LLM_DECLINED = "lever6_force_llm_declined"
+    LEVER6_FORCE_RAISED = "lever6_force_raised"
+    # Cycle 10 W4 — narrow-L6 replacement does not apply for the
+    # current patch_type (e.g., add_sql_snippet_measure /
+    # add_sql_snippet_expression lack a where_predicate to narrow).
+    NARROW_NOT_APPLICABLE = "narrow_not_applicable"
+    # Cycle 10 W8 — AG-emit observability companion to W2: emitted
+    # when ``union_ag_levers_with_recommended`` widened the AG's
+    # lever set with cluster.recommended_levers entries.
+    AG_LEVERS_UNIONED = "ag_levers_unioned"
 
 
 class RejectReason(str, Enum):
