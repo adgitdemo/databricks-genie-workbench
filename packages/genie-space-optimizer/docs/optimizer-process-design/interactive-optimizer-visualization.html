@@ -266,47 +266,80 @@ section.hero {
 
 .hero-instrument {
   position: relative;
+  width: 100%;
+  max-width: 460px;
   aspect-ratio: 1 / 1;
-  max-width: 480px;
   margin-left: auto;
+  justify-self: end;
 }
+@media (max-width: 900px) {
+  .hero-instrument { margin-left: 0; justify-self: center; }
+}
+
+/* Dial body: inset slightly so ticks sit on its rim without leaving the container */
 .dial {
-  position: absolute; inset: 0;
+  position: absolute; inset: 40px;
   border-radius: 50%;
   background:
     radial-gradient(circle at 50% 50%, var(--bg-2), var(--bg) 70%);
   border: 1px solid var(--border-2);
   box-shadow: 0 0 80px var(--accent-glow), inset 0 0 60px rgba(0,0,0,0.5);
 }
+
+/* Concentric guide rings (positions are relative to .dial) */
 .dial-ring {
   position: absolute;
   border-radius: 50%;
   border: 1px dashed var(--evidence);
   opacity: 0.45;
 }
-.dial-ring.r1 { inset: 14%; }
-.dial-ring.r2 { inset: 28%; }
+.dial-ring.r1 { inset: calc(40px + 12%); }
+.dial-ring.r2 { inset: calc(40px + 26%); }
+
+/* Ticks: positioned at 5 evenly-spaced polar angles (72° apart),
+   starting from 12 o'clock and going clockwise in loop order:
+   Measure → Diagnose → Intervene → Prove → Learn → (back to Measure).
+
+   Polar radius is ~40.9% of container, which is the dial's edge
+   when .hero-instrument is the bounding box and .dial is inset 40px. */
 .dial-tick {
   position: absolute;
-  width: 60px; height: 60px;
+  top: 50%; left: 50%;
+  width: 84px; height: 84px;
   border-radius: 50%;
   background: var(--surface);
-  border: 1px solid var(--border-2);
-  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--border-2);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 4px;
   font-family: var(--font-mono);
-  font-size: 0.65rem;
-  font-weight: 600;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   color: var(--text-dim);
-  letter-spacing: 0.04em;
   text-align: center;
-  box-shadow: var(--shadow-md);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+  transform: translate(-50%, -50%);
+  z-index: 2;
 }
-.dial-tick svg { width: 18px; height: 18px; margin-bottom: 2px; }
-.dial-tick.measure  { top: -10px; left: 50%; transform: translateX(-50%); border-color: var(--evidence); color: var(--evidence); }
-.dial-tick.diagnose { right: -10px; top: 50%; transform: translateY(-50%); border-color: var(--gate); color: var(--gate); }
-.dial-tick.intervene { bottom: -10px; left: 50%; transform: translateX(-50%); border-color: var(--accent); color: var(--accent); }
-.dial-tick.prove    { left: -10px; top: 50%; transform: translateY(-50%); border-color: var(--accept); color: var(--accept); }
-.dial-tick.learn    { top: 8%; right: 8%; border-color: var(--info); color: var(--info); }
+.dial-tick .ic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.dial-tick svg { width: 22px; height: 22px; }
+.dial-tick .lab {
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* Polar offsets relative to container center (50%, 50%). */
+.dial-tick.measure   { top:  9.1%;  left: 50%;     border-color: var(--evidence); color: var(--evidence); background: var(--evidence-glow); }
+.dial-tick.diagnose  { top: 37.36%; left: 88.91%;  border-color: var(--gate);     color: var(--gate);     background: var(--gate-glow); }
+.dial-tick.intervene { top: 83.42%; left: 74.04%;  border-color: var(--accent);   color: var(--accent);   background: var(--accent-glow); }
+.dial-tick.prove     { top: 83.42%; left: 25.96%;  border-color: var(--accept);   color: var(--accept);   background: var(--accept-glow); }
+.dial-tick.learn     { top: 37.36%; left: 11.09%;  border-color: var(--info);     color: var(--info);     background: var(--info-glow); }
 .dial-center {
   position: absolute;
   top: 50%; left: 50%;
@@ -1707,21 +1740,29 @@ footer.site-foot a:hover { color: var(--text); }
       <div class="dial-ring r1"></div>
       <div class="dial-ring r2"></div>
       <div class="dial-needle"></div>
-      <div class="dial-tick measure">
-        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span>
+
+      <!-- Five evenly-spaced loop stages, clockwise from 12 o'clock -->
+      <div class="dial-tick measure" aria-label="Step 1 of 5: Measure">
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></span>
+        <span class="lab">Measure</span>
       </div>
-      <div class="dial-tick diagnose">
-        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></span>
+      <div class="dial-tick diagnose" aria-label="Step 2 of 5: Diagnose">
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></span>
+        <span class="lab">Diagnose</span>
       </div>
-      <div class="dial-tick intervene">
-        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
+      <div class="dial-tick intervene" aria-label="Step 3 of 5: Intervene">
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
+        <span class="lab">Intervene</span>
       </div>
-      <div class="dial-tick prove">
-        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span>
+      <div class="dial-tick prove" aria-label="Step 4 of 5: Prove">
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span>
+        <span class="lab">Prove</span>
       </div>
-      <div class="dial-tick learn">
-        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 9 3-3 3 3"/><path d="M13 18H7a4 4 0 0 1-4-4V6"/><path d="m22 15-3 3-3-3"/><path d="M11 6h6a4 4 0 0 1 4 4v8"/></svg></span>
+      <div class="dial-tick learn" aria-label="Step 5 of 5: Learn">
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 9 3-3 3 3"/><path d="M13 18H7a4 4 0 0 1-4-4V6"/><path d="m22 15-3 3-3-3"/><path d="M11 6h6a4 4 0 0 1 4 4v8"/></svg></span>
+        <span class="lab">Learn</span>
       </div>
+
       <div class="dial-center">
         <strong>Evidence</strong>
         not intuition
