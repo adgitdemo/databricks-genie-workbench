@@ -23,6 +23,10 @@ def _clean_env(monkeypatch):
         "GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_ENABLED",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Module-level constants are computed at import time, so other tests
+    # in the suite may have left them in a non-default state. Pin them to
+    # the production-default values for the duration of the test.
+    monkeypatch.setattr(evaluation, "EVAL_DISABLE_LITELLM_RETRIES", True)
     yield
 
 
@@ -42,7 +46,7 @@ def test_attempt_1_uses_tier_1_workers_and_disables_litellm_retries(monkeypatch,
         )
         return SimpleNamespace(metrics={}, tables={})
 
-    monkeypatch.setattr(evaluation.mlflow.genai, "evaluate", fake_evaluate)
+    monkeypatch.setattr(evaluation.mlflow.genai, "evaluate", fake_evaluate, raising=False)
     monkeypatch.setattr(evaluation, "_patch_mlflow_harness_none_trace", lambda: None)
 
     result, attempts = evaluation._run_evaluate_with_retries(
@@ -66,7 +70,7 @@ def test_watchdog_timeout_is_classified_retryable_and_degrades(monkeypatch, _cle
             raise EvalHangTimeoutError("simulated hang")
         return SimpleNamespace(metrics={}, tables={})
 
-    monkeypatch.setattr(evaluation.mlflow.genai, "evaluate", fake_evaluate)
+    monkeypatch.setattr(evaluation.mlflow.genai, "evaluate", fake_evaluate, raising=False)
     monkeypatch.setattr(evaluation, "_patch_mlflow_harness_none_trace", lambda: None)
     monkeypatch.setattr(evaluation, "EVAL_RETRY_SLEEP_SECONDS", 0)
 
@@ -89,7 +93,7 @@ def test_env_is_restored_after_run(monkeypatch, _clean_env):
     def fake_evaluate(**_kwargs):
         return SimpleNamespace(metrics={}, tables={})
 
-    monkeypatch.setattr(evaluation.mlflow.genai, "evaluate", fake_evaluate)
+    monkeypatch.setattr(evaluation.mlflow.genai, "evaluate", fake_evaluate, raising=False)
     monkeypatch.setattr(evaluation, "_patch_mlflow_harness_none_trace", lambda: None)
 
     evaluation._run_evaluate_with_retries(
