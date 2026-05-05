@@ -16,3 +16,19 @@ def test_rca_ungrounded_records_enabled_off(monkeypatch):
         rca_ungrounded_records_enabled,
     )
     assert rca_ungrounded_records_enabled() is False
+
+
+def test_ag_levers_union_recommended_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_AG_LEVERS_UNION_RECOMMENDED", raising=False)
+    from genie_space_optimizer.common.config import (
+        ag_levers_union_recommended_enabled,
+    )
+    assert ag_levers_union_recommended_enabled() is True
+
+
+def test_ag_levers_union_recommended_off(monkeypatch):
+    monkeypatch.setenv("GSO_AG_LEVERS_UNION_RECOMMENDED", "0")
+    from genie_space_optimizer.common.config import (
+        ag_levers_union_recommended_enabled,
+    )
+    assert ag_levers_union_recommended_enabled() is False

@@ -5573,3 +5573,12 @@ def rca_ungrounded_records_enabled() -> bool:
     to preserve the legacy silent-absorption byte-stable path.
     """
     return _flag_default_on("GSO_RCA_UNGROUNDED_RECORDS_ENABLED")
+
+
+def ag_levers_union_recommended_enabled() -> bool:
+    """Cycle 10 W2 — decomposer + strategist enforce
+    ``AG.Levers ⊇ cluster.recommended_levers``. Default-on; tests/replay
+    set ``GSO_AG_LEVERS_UNION_RECOMMENDED=0`` to preserve the legacy
+    "diagnostic-directive lever only" path.
+    """
+    return _flag_default_on("GSO_AG_LEVERS_UNION_RECOMMENDED")
