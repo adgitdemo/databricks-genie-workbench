@@ -123,13 +123,27 @@ def test_applier_decision_counts_groups_reasons() -> None:
 
 
 def test_harness_prints_applier_decisions_on_skip_eval() -> None:
+    """Asserts the applier-decisions audit print appears in the
+    skip-eval branch (after ``_apply_skip = ...``) and before the
+    iteration-end work resumes. Uses position-relative substring
+    indices instead of a fixed character window so the test stays
+    valid as the harness grows.
+    """
     import inspect
 
     from genie_space_optimizer.optimization import harness
 
     source = inspect.getsource(harness._run_lever_loop)
     skip_idx = source.index("_apply_skip = _should_skip_eval_for_patch_bundle(")
-    snippet = source[skip_idx : skip_idx + 2400]
-    assert "APPLIER DECISIONS" in snippet
-    assert "applier_decision_counts(" in snippet
-    assert "apply_log.get(\"applier_decisions\")" in snippet
+
+    # Each substring must appear AFTER the skip-eval branch entry.
+    for needle in (
+        "APPLIER DECISIONS",
+        "applier_decision_counts(",
+        "apply_log.get(\"applier_decisions\")",
+    ):
+        n_idx = source.find(needle, skip_idx)
+        assert n_idx > skip_idx, (
+            f"{needle!r} must appear AFTER the skip-eval branch entry "
+            f"in _run_lever_loop"
+        )

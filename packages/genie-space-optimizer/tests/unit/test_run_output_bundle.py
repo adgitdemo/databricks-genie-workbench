@@ -37,6 +37,11 @@ def test_build_artifact_index_lists_all_iterations_and_stages() -> None:
 
 
 def test_build_run_summary_carries_baseline_and_terminal_state() -> None:
+    """Cycle 6 F-6 — accuracy fields are normalized to canonical 0-100
+    units at the build_run_summary boundary so downstream renderers
+    never multiply (the original symptom was ``Baseline accuracy:
+    8947.0%``). 0-1 fractions get scaled by 100; 0-100 percents pass
+    through unchanged. Both rounded to one decimal."""
     from genie_space_optimizer.optimization.run_output_bundle import (
         build_run_summary,
     )
@@ -46,8 +51,10 @@ def test_build_run_summary_carries_baseline_and_terminal_state() -> None:
         iteration_count=5,
         accuracy_delta_pp=4.2,
     )
-    assert summary["baseline"]["overall_accuracy"] == 0.875
+    # 0.875 (fraction) → 87.5 (percent), per _normalize_accuracy_pct.
+    assert summary["baseline"]["overall_accuracy"] == 87.5
     assert summary["terminal_state"]["status"] == "convergence"
+    # 4.2 is already in 0-100 range so it passes through unchanged.
     assert summary["accuracy_delta_pp"] == 4.2
 
 

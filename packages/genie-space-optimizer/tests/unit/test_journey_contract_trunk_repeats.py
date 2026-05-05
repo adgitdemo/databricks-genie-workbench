@@ -73,34 +73,24 @@ def test_validate_question_journeys_rejects_soft_signal_self_transition() -> Non
     ``SOFT_SIGNAL -> SOFT_SIGNAL``. If a future change ever relaxes
     ``_LEGAL_NEXT[SOFT_SIGNAL]`` to admit the self-loop, this test
     fails and forces a deliberate review.
+
+    This locks the LEGAL_NEXT lookup directly because Cycle 6 F-5
+    added a producer-side ``dedupe_consecutive_trunk_events`` pass
+    at validator entry that collapses consecutive same-stage trunk
+    events for the same qid, so the end-to-end validator never sees
+    a raw ``soft_signal -> soft_signal`` trunk transition. The
+    invariant under test (the LEGAL_NEXT table rejecting the self-
+    loop) sits below the dedup, so we exercise it directly.
     """
-    from genie_space_optimizer.optimization.question_journey import (
-        QuestionJourneyEvent,
-    )
     from genie_space_optimizer.optimization.question_journey_contract import (
-        validate_question_journeys,
+        JourneyStage,
+        is_legal_next_stage,
     )
 
-    events = [
-        QuestionJourneyEvent(question_id="qid_x", stage="evaluated"),
-        QuestionJourneyEvent(
-            question_id="qid_x", stage="soft_signal", cluster_id="S001",
-        ),
-        QuestionJourneyEvent(
-            question_id="qid_x", stage="soft_signal", cluster_id="S002",
-        ),
-        QuestionJourneyEvent(question_id="qid_x", stage="post_eval"),
-    ]
-    report = validate_question_journeys(
-        events=events, eval_qids=["qid_x"],
-    )
-    illegal = [
-        v for v in report.violations
-        if v.kind == "illegal_transition"
-        and "soft_signal -> soft_signal" in v.detail
-    ]
-    assert illegal, (
-        "validator must report soft_signal -> soft_signal as an illegal "
-        "transition; got violations: "
-        + "; ".join(f"{v.kind}:{v.detail}" for v in report.violations)
+    assert is_legal_next_stage(
+        prev=JourneyStage.SOFT_SIGNAL, nxt=JourneyStage.SOFT_SIGNAL,
+    ) is False, (
+        "_LEGAL_NEXT[SOFT_SIGNAL] must NOT include SOFT_SIGNAL — "
+        "soft-pile and cluster-formation should not both append a "
+        "soft_signal trunk event for the same qid"
     )
