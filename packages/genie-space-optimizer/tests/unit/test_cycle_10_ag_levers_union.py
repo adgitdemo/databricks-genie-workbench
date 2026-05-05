@@ -61,6 +61,39 @@ def test_union_handles_missing_lever_directives_block():
     assert set(out["lever_directives"].keys()) == {"3", "6"}
 
 
+def test_diagnostic_action_group_unions_recommended_levers(monkeypatch):
+    monkeypatch.setenv("GSO_AG_LEVERS_UNION_RECOMMENDED", "1")
+    from genie_space_optimizer.optimization.control_plane import (
+        diagnostic_action_group_for_cluster,
+    )
+    cluster = {
+        "cluster_id": "H001",
+        "root_cause": "missing_filter",
+        "recommended_levers": [3, 5, 6],
+        "question_ids": ["gs_009", "gs_024"],
+        "asi_counterfactual_fixes": ["add WHERE outbound_total = 1"],
+        "rca_id": "rca_abc",
+    }
+    ag = diagnostic_action_group_for_cluster(cluster)
+    assert set(ag["lever_directives"].keys()) == {"3", "5", "6"}
+
+
+def test_diagnostic_action_group_flag_off_byte_stable(monkeypatch):
+    monkeypatch.setenv("GSO_AG_LEVERS_UNION_RECOMMENDED", "0")
+    from genie_space_optimizer.optimization.control_plane import (
+        diagnostic_action_group_for_cluster,
+    )
+    cluster = {
+        "cluster_id": "H001",
+        "root_cause": "missing_filter",
+        "recommended_levers": [3, 5, 6],
+        "question_ids": ["gs_009"],
+        "rca_id": "rca_abc",
+    }
+    ag = diagnostic_action_group_for_cluster(cluster)
+    assert set(ag["lever_directives"].keys()) == {"5"}
+
+
 def test_union_records_levers_before():
     from genie_space_optimizer.optimization.control_plane import (
         union_ag_levers_with_recommended,

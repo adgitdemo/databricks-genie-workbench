@@ -337,7 +337,7 @@ def diagnostic_action_group_for_cluster(cluster: dict) -> dict:
     # ``needs_rca_regeneration=True`` AGs to the regen branch when
     # GSO_DIAGNOSTIC_AG_RCA_REGEN is on.
     has_parent_rca = bool(cluster.get("rca_id"))
-    return {
+    base_ag = {
         "id": f"AG_COVERAGE_{cid}",
         "root_cause_summary": f"{root}: {fix_text}",
         "affected_questions": qids,
@@ -349,6 +349,18 @@ def diagnostic_action_group_for_cluster(cluster: dict) -> dict:
         "rca_id": str(cluster.get("rca_id") or ""),
         "primary_cluster_id": cid,
     }
+    try:
+        from genie_space_optimizer.common.config import (
+            ag_levers_union_recommended_enabled,
+        )
+        if ag_levers_union_recommended_enabled():
+            return union_ag_levers_with_recommended(
+                ag=base_ag, cluster=cluster,
+            )
+    except Exception:
+        # Cycle 10 W2: union failure is non-fatal — fall through to legacy.
+        pass
+    return base_ag
 
 
 def compute_ag_stable_signature(
