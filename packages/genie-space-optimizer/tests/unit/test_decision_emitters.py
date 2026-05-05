@@ -510,3 +510,86 @@ def test_is_strict_mode_reads_env_var(monkeypatch) -> None:
     assert is_strict_mode() is False
     monkeypatch.setenv("GSO_DECISION_EMITTER_STRICT", "true")
     assert is_strict_mode() is True
+
+
+# ---------------------------------------------------------------------------
+# Plan N4 — invariant warn-and-degrade reason codes + emitters
+# ---------------------------------------------------------------------------
+
+
+def test_reason_codes_for_invariant_policy_exist() -> None:
+    from genie_space_optimizer.optimization.rca_decision_trace import ReasonCode
+
+    assert ReasonCode.QID_RELEASED_FROM_QUARANTINE.value == (
+        "qid_released_from_quarantine"
+    )
+    assert ReasonCode.REGRESSION_DEBT_PARTITION_INCOMPLETE.value == (
+        "regression_debt_partition_incomplete"
+    )
+    assert ReasonCode.CAP_CONSERVATION_REPAIRED.value == (
+        "cap_conservation_repaired"
+    )
+    assert ReasonCode.NON_CANONICAL_JUDGE_ROW.value == (
+        "non_canonical_judge_row"
+    )
+    assert ReasonCode.INVARIANT_VIOLATION_DOWNGRADED.value == (
+        "invariant_violation_downgraded"
+    )
+
+
+def test_qid_released_from_quarantine_record_has_typed_fields() -> None:
+    from genie_space_optimizer.optimization.decision_emitters import (
+        qid_released_from_quarantine_record,
+    )
+
+    rec = qid_released_from_quarantine_record(
+        run_id="r1", iteration=2, qids=("gs_009",),
+        cause="recovered_post_eval",
+    )
+    assert rec.iteration == 2
+    assert rec.target_qids == ("gs_009",)
+    assert rec.reason_code.value == "qid_released_from_quarantine"
+    assert "gs_009" in (rec.next_action or "")
+
+
+def test_regression_debt_partition_incomplete_record_has_typed_fields() -> None:
+    from genie_space_optimizer.optimization.decision_emitters import (
+        regression_debt_partition_incomplete_record,
+    )
+
+    rec = regression_debt_partition_incomplete_record(
+        run_id="r1", iteration=3, missing_qids=("gs_021", "gs_013"),
+    )
+    assert rec.iteration == 3
+    assert rec.reason_code.value == "regression_debt_partition_incomplete"
+    assert rec.target_qids == ("gs_013", "gs_021")  # sorted
+
+
+def test_cap_conservation_repaired_record_has_typed_fields() -> None:
+    from genie_space_optimizer.optimization.decision_emitters import (
+        cap_conservation_repaired_record,
+    )
+
+    rec = cap_conservation_repaired_record(
+        run_id="r1", iteration=4, func_name="select_under_cap",
+        decisions_in=3, decisions_out=2, input_count=2,
+    )
+    assert rec.gate == "select_under_cap"
+    assert rec.reason_code.value == "cap_conservation_repaired"
+    assert rec.metrics["decisions_in"] == 3
+    assert rec.metrics["decisions_out"] == 2
+    assert rec.metrics["input_count"] == 2
+
+
+def test_non_canonical_judge_row_record_has_typed_fields() -> None:
+    from genie_space_optimizer.optimization.decision_emitters import (
+        non_canonical_judge_row_record,
+    )
+
+    rec = non_canonical_judge_row_record(
+        run_id="r1", iteration=5, judge="result_correctness",
+        detail="missing rationale",
+    )
+    assert rec.gate == "result_correctness"
+    assert rec.reason_code.value == "non_canonical_judge_row"
+    assert "missing rationale" in (rec.reason_detail or "")

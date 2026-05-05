@@ -1690,3 +1690,148 @@ def soft_cluster_drift_recovered_record(
             "cluster_dropped": bool(cluster_dropped),
         },
     )
+
+
+def qid_released_from_quarantine_record(
+    *,
+    run_id: str,
+    iteration: int,
+    qids: tuple[str, ...],
+    cause: str = "",
+) -> DecisionRecord:
+    """Plan N4 — emit when the lenient quarantine-attribution
+    invariant releases recovered qids back into the live state.
+
+    The quarantine was set by the pre-loop arbiter; in-loop patches
+    in unrelated clusters can have positive side-effects that move a
+    qid into the passing set. The strict invariant treated that as a
+    drift and raised; the lenient policy recognises it as a desirable
+    end state and releases the qid so the next iteration starts from
+    a consistent state.
+
+    Surfaced as ``QID_RESOLUTION + INFO`` so the operator transcript's
+    Observed Results section records the release alongside the
+    matching post-eval resolution.
+    """
+    next_action = (
+        f"Released {len(qids)} qid(s) from quarantine: "
+        f"{sorted(qids)}. Cause: {cause or 'recovered_post_eval'}."
+    )
+    return DecisionRecord(
+        run_id=run_id,
+        iteration=int(iteration),
+        decision_type=DecisionType.QID_RESOLUTION,
+        outcome=DecisionOutcome.INFO,
+        reason_code=ReasonCode.QID_RELEASED_FROM_QUARANTINE,
+        target_qids=tuple(sorted(str(q) for q in qids if q)),
+        next_action=next_action,
+        metrics={
+            "released_qids": sorted(str(q) for q in qids if q),
+            "cause": str(cause or "recovered_post_eval"),
+        },
+    )
+
+
+def regression_debt_partition_incomplete_record(
+    *,
+    run_id: str,
+    iteration: int,
+    missing_qids: tuple[str, ...],
+) -> DecisionRecord:
+    """Plan N4 — emit when the regression-debt partition assertion
+    finds out_of_target_regressed_qids that are not the disjoint
+    union of the soft/passing/unknown to-hard buckets.
+
+    Bookkeeping-only: the candidate accept/reject outcome is left
+    unchanged (the gap is partition completeness, not correctness).
+    Surfaced as ``ACCEPTANCE_DECIDED + INFO`` so the operator
+    transcript surfaces the bookkeeping gap in the Applied Patches
+    And Acceptance section.
+    """
+    return DecisionRecord(
+        run_id=run_id,
+        iteration=int(iteration),
+        decision_type=DecisionType.ACCEPTANCE_DECIDED,
+        outcome=DecisionOutcome.INFO,
+        reason_code=ReasonCode.REGRESSION_DEBT_PARTITION_INCOMPLETE,
+        target_qids=tuple(sorted(str(q) for q in missing_qids if q)),
+        next_action=(
+            f"Regression-debt partition is incomplete: "
+            f"{len(missing_qids)} qid(s) unbucketed: "
+            f"{sorted(missing_qids)}. Acceptance outcome unchanged; "
+            f"audit the partition logic."
+        ),
+        metrics={
+            "missing_qids": sorted(str(q) for q in missing_qids if q),
+        },
+    )
+
+
+def cap_conservation_repaired_record(
+    *,
+    run_id: str,
+    iteration: int,
+    func_name: str,
+    decisions_in: int,
+    decisions_out: int,
+    input_count: int,
+) -> DecisionRecord:
+    """Plan N4 — emit when ``_assert_cap_conservation`` repairs a
+    decision-list count mismatch instead of raising.
+
+    Reconciliation truncates extras and pads missing slots with
+    explicit ``decision="dropped"`` entries carrying
+    ``reason="cap_conservation_repaired"``, so the survival ledger
+    downstream sees a typed dropped-decision rather than a count
+    mismatch.
+
+    Surfaced as ``GATE_DECISION + INFO`` so the Proposal Survival
+    section surfaces the repair.
+    """
+    return DecisionRecord(
+        run_id=run_id,
+        iteration=int(iteration),
+        decision_type=DecisionType.GATE_DECISION,
+        outcome=DecisionOutcome.INFO,
+        reason_code=ReasonCode.CAP_CONSERVATION_REPAIRED,
+        gate=str(func_name),
+        next_action=(
+            f"{func_name} returned {decisions_in} decision(s) for "
+            f"{input_count} input(s); reconciled to {decisions_out}."
+        ),
+        metrics={
+            "func_name": str(func_name),
+            "decisions_in": int(decisions_in),
+            "decisions_out": int(decisions_out),
+            "input_count": int(input_count),
+        },
+    )
+
+
+def non_canonical_judge_row_record(
+    *,
+    run_id: str,
+    iteration: int,
+    judge: str,
+    detail: str = "",
+) -> DecisionRecord:
+    """Plan N4 — emit when ``_summary_judges_or_raise`` encounters a
+    non-canonical judge row under ``GSO_ASSERT_ROW_CANONICAL=1`` in
+    lenient mode. The function continues with the existing empty-
+    rationale value; this record surfaces the non-canonical row in
+    the operator transcript.
+    """
+    return DecisionRecord(
+        run_id=run_id,
+        iteration=int(iteration),
+        decision_type=DecisionType.EVAL_CLASSIFIED,
+        outcome=DecisionOutcome.INFO,
+        reason_code=ReasonCode.NON_CANONICAL_JUDGE_ROW,
+        gate=str(judge),
+        reason_detail=str(detail),
+        next_action=(
+            f"Non-canonical judge row for {judge}; "
+            f"continuing with empty rationale. Audit the row schema."
+        ),
+        metrics={"judge": str(judge), "detail": str(detail)},
+    )

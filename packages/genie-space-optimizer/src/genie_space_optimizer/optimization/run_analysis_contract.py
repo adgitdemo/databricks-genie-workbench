@@ -396,3 +396,36 @@ def no_structural_candidate_marker(
             "attempted_archetypes": list(attempted_archetypes or ()),
         },
     )
+
+
+def gso_invariant_violation_marker(
+    *,
+    optimization_run_id: str,
+    iteration: int,
+    invariant_name: str,
+    offending_qids: Sequence[str] | None = None,
+    degradation: str = "",
+    payload: Mapping[str, Any] | None = None,
+) -> str:
+    """Plan N4 — single-shape stdout marker for every invariant
+    violation downgraded by the warn-and-degrade policy.
+
+    Postmortem skills pivot on the typed ``invariant_name`` field
+    (closed vocabulary: ``quarantine_attribution_drift``,
+    ``regression_debt_partition_incomplete``,
+    ``soft_cluster_currency_drift``, ``cap_conservation_violated``,
+    ``non_canonical_judge_row``). Marker frequency itself is the
+    production health signal — a single line per violation lets
+    operators ``grep`` for the marker and pivot the histogram.
+    """
+    return marker_line(
+        "GSO_INVARIANT_VIOLATION_V1",
+        {
+            "optimization_run_id": str(optimization_run_id),
+            "iteration": int(iteration),
+            "invariant_name": str(invariant_name),
+            "offending_qids": list(offending_qids or ()),
+            "degradation": str(degradation),
+            "payload": dict(payload or {}),
+        },
+    )

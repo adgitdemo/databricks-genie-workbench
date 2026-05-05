@@ -147,3 +147,72 @@ def test_phase_b_end_marker_carries_no_records_iterations_list() -> None:
     payload = _json_payload(line)
     assert payload["total_records"] == 0
     assert payload["no_records_iterations"] == [1, 2, 3, 4, 5]
+
+
+# ---------------------------------------------------------------------------
+# Plan N4 — invariant violation marker
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_violation_marker_round_trip() -> None:
+    from genie_space_optimizer.optimization.run_analysis_contract import (
+        gso_invariant_violation_marker,
+    )
+
+    line = gso_invariant_violation_marker(
+        optimization_run_id="r1",
+        iteration=3,
+        invariant_name="quarantine_attribution_drift",
+        offending_qids=("gs_009",),
+        degradation="released_from_quarantine",
+    )
+    assert line.startswith("GSO_INVARIANT_VIOLATION_V1")
+    payload = _json_payload(line)
+    assert payload["optimization_run_id"] == "r1"
+    assert payload["iteration"] == 3
+    assert payload["invariant_name"] == "quarantine_attribution_drift"
+    assert payload["offending_qids"] == ["gs_009"]
+    assert payload["degradation"] == "released_from_quarantine"
+
+
+def test_invariant_violation_marker_handles_all_five_invariant_names() -> None:
+    """The marker is the single canonical line postmortems pivot on;
+    all five closed-vocabulary ``invariant_name`` values must
+    round-trip cleanly."""
+    from genie_space_optimizer.optimization.run_analysis_contract import (
+        gso_invariant_violation_marker,
+    )
+
+    names = [
+        "quarantine_attribution_drift",
+        "regression_debt_partition_incomplete",
+        "soft_cluster_currency_drift",
+        "cap_conservation_violated",
+        "non_canonical_judge_row",
+    ]
+    for name in names:
+        line = gso_invariant_violation_marker(
+            optimization_run_id="r1",
+            iteration=2,
+            invariant_name=name,
+        )
+        payload = _json_payload(line)
+        assert payload["invariant_name"] == name
+        assert payload["iteration"] == 2
+
+
+def test_invariant_violation_marker_carries_payload_dict() -> None:
+    from genie_space_optimizer.optimization.run_analysis_contract import (
+        gso_invariant_violation_marker,
+    )
+
+    line = gso_invariant_violation_marker(
+        optimization_run_id="r1",
+        iteration=1,
+        invariant_name="cap_conservation_violated",
+        payload={"decisions_in": 3, "decisions_out": 2, "input_count": 2},
+    )
+    payload = _json_payload(line)
+    assert payload["payload"]["decisions_in"] == 3
+    assert payload["payload"]["decisions_out"] == 2
+    assert payload["payload"]["input_count"] == 2

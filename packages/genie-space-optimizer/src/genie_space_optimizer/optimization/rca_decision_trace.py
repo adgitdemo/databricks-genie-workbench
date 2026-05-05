@@ -116,6 +116,16 @@ class ReasonCode(str, Enum):
     # the drifted qid (or the entire cluster if every qid drifted)
     # instead of raising.
     SOFT_CLUSTER_DRIFT_RECOVERED = "soft_cluster_drift_recovered"
+    # Plan N4 — invariant warn-and-degrade reason codes. Each maps
+    # to one of the five ``raise AssertionError`` sites that ship
+    # under the new policy:
+    QID_RELEASED_FROM_QUARANTINE = "qid_released_from_quarantine"
+    REGRESSION_DEBT_PARTITION_INCOMPLETE = (
+        "regression_debt_partition_incomplete"
+    )
+    CAP_CONSERVATION_REPAIRED = "cap_conservation_repaired"
+    NON_CANONICAL_JUDGE_ROW = "non_canonical_judge_row"
+    INVARIANT_VIOLATION_DOWNGRADED = "invariant_violation_downgraded"
 
 
 class RejectReason(str, Enum):
