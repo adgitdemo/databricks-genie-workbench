@@ -1364,6 +1364,158 @@ _PRODUCTIVE_ITERATION_NO_OP_REASON_CODES: tuple[str, ...] = (
 )
 
 
+def _enforce_quarantine_attribution_invariant(
+    *,
+    correction_state: dict,
+    currently_passing_qids,
+    currently_hard_qids,
+    run_id: str,
+    iteration: int,
+    emit_record,
+    emit_marker,
+    strict: bool | None = None,
+) -> None:
+    """Plan N4 — invariant warn-and-degrade for the quarantine
+    attribution check.
+
+    Two violations are recognised:
+
+    1. **Drift**: a quarantined qid is currently passing. The
+       lenient path drops the qid from
+       ``correction_state["quarantined_qids"]`` (the next iteration
+       starts consistent), emits ``qid_released_from_quarantine_record``,
+       and emits ``GSO_INVARIANT_VIOLATION_V1``.
+    2. **Singleton-hard**: only one hard qid remains and it is
+       quarantined. The lenient path releases it so the strategist
+       still has a target.
+
+    Strict mode preserves the legacy ``AssertionError`` for CI /
+    replay. ``strict=None`` reads the env var via
+    ``invariant_policy.is_invariant_strict_mode``.
+
+    Trigger run 2026-05-05 06:56:03 UTC: ``gs_009`` was quarantined
+    by the pre-loop arbiter, then a side-effect patch in a different
+    cluster moved it into the passing set.
+    """
+    from genie_space_optimizer.optimization.invariant_policy import (
+        InvariantViolation,
+        handle_invariant_violation,
+        is_invariant_strict_mode,
+    )
+    from genie_space_optimizer.optimization.decision_emitters import (
+        qid_released_from_quarantine_record,
+    )
+    from genie_space_optimizer.optimization.run_analysis_contract import (
+        gso_invariant_violation_marker,
+    )
+
+    if strict is None:
+        strict = is_invariant_strict_mode()
+
+    quarantined = {
+        str(q)
+        for q in (correction_state.get("quarantined_qids") or set())
+        if str(q)
+    }
+    passing = {str(q) for q in currently_passing_qids if str(q)}
+    hard = {str(q) for q in currently_hard_qids if str(q)}
+
+    drifted = quarantined & passing
+    singleton_locked = (
+        hard if (len(hard) == 1 and (hard & quarantined)) else set()
+    )
+
+    if not drifted and not singleton_locked:
+        return  # invariant holds; lenient path is silent on success
+
+    # Drift: passing qids in quarantine.
+    if drifted:
+        violation = InvariantViolation(
+            name="quarantine_attribution_drift",
+            payload={
+                "drifted_qids": sorted(drifted),
+                "quarantined": sorted(quarantined),
+                "passing": sorted(passing),
+            },
+            message=(
+                f"passing qids appear in quarantine: "
+                f"{sorted(drifted)}; quarantine source must be "
+                f"currently-failing rows only"
+            ),
+        )
+
+        def _lenient_drift(_v) -> None:
+            # Release recovered qids so the next iteration starts
+            # from a consistent state.
+            qs = correction_state.get("quarantined_qids")
+            if qs is not None:
+                for q in drifted:
+                    qs.discard(q)
+            emit_record(qid_released_from_quarantine_record(
+                run_id=run_id,
+                iteration=iteration,
+                qids=tuple(sorted(drifted)),
+                cause="recovered_post_eval",
+            ))
+            emit_marker(gso_invariant_violation_marker(
+                optimization_run_id=run_id,
+                iteration=iteration,
+                invariant_name="quarantine_attribution_drift",
+                offending_qids=tuple(sorted(drifted)),
+                degradation="released_from_quarantine",
+                payload={"passing_overlap": sorted(drifted)},
+            ))
+
+        handle_invariant_violation(
+            violation, strict=strict, lenient_callback=_lenient_drift,
+        )
+
+    # Singleton-hard: only one hard qid and it is quarantined. Only
+    # fires when no drift was handled this iteration — drift release
+    # already gives the strategist a target via the released qid, so
+    # an additional singleton-hard release would be redundant and
+    # would over-release legitimately-quarantined recurring failures.
+    if singleton_locked and not drifted:
+        violation = InvariantViolation(
+            name="quarantine_attribution_drift",
+            payload={
+                "hard": sorted(hard),
+                "quarantined": sorted(quarantined),
+            },
+            message=(
+                f"singleton-hard qid cannot be quarantined: "
+                f"hard={sorted(hard)}, quarantined={sorted(quarantined)}; "
+                f"the only remaining hard target must be available to the "
+                f"strategist"
+            ),
+        )
+
+        def _lenient_singleton(_v) -> None:
+            # Release the singleton so the strategist has a target.
+            qs = correction_state.get("quarantined_qids")
+            if qs is not None:
+                for q in singleton_locked:
+                    qs.discard(q)
+            emit_record(qid_released_from_quarantine_record(
+                run_id=run_id,
+                iteration=iteration,
+                qids=tuple(sorted(singleton_locked)),
+                cause="singleton_hard_release",
+            ))
+            emit_marker(gso_invariant_violation_marker(
+                optimization_run_id=run_id,
+                iteration=iteration,
+                invariant_name="quarantine_attribution_drift",
+                offending_qids=tuple(sorted(singleton_locked)),
+                degradation="singleton_hard_released",
+                payload={"hard_set": sorted(hard)},
+            ))
+
+        handle_invariant_violation(
+            violation, strict=strict, lenient_callback=_lenient_singleton,
+        )
+
+
 def _emit_idempotency_key(record: dict) -> tuple:
     """Cycle 6 F-1 — idempotency key for the per-iteration emit-dedup
     set. A record duplicate is detected on::
@@ -13672,15 +13824,6 @@ def _run_lever_loop(
         # remaining target). Both invariants raise on violation so the
         # loop stops with a clear traceback rather than silently
         # soft-skipping the wrong qid.
-        from genie_space_optimizer.optimization.control_plane import (
-            assert_quarantine_attribution_sound,
-        )
-
-        _quarantined_for_audit = {
-            str(q)
-            for q in _correction_state.get("quarantined_qids", set()) or set()
-            if str(q)
-        }
         _all_eval_qids_for_audit = {
             str(q)
             for q in (_latest_eval_result or {}).get("question_ids") or []
@@ -13696,10 +13839,21 @@ def _run_lever_loop(
         }
         _live_passing_for_audit = _all_eval_qids_for_audit - _live_hard_for_audit
 
-        assert_quarantine_attribution_sound(
-            quarantined_qids=_quarantined_for_audit,
+        # Plan N4 — lenient quarantine attribution.
+        # Default behaviour: drift releases recovered qids,
+        # singleton-hard releases the lone target, both emit typed
+        # records + ``GSO_INVARIANT_VIOLATION_V1`` markers, and the
+        # loop continues. ``GSO_INVARIANT_STRICT=1`` (or
+        # ``GSO_DECISION_EMITTER_STRICT=1`` for replay) flips back to
+        # the legacy ``AssertionError`` path so CI still fails loud.
+        _enforce_quarantine_attribution_invariant(
+            correction_state=_correction_state,
             currently_passing_qids=_live_passing_for_audit,
             currently_hard_qids=_live_hard_for_audit,
+            run_id=run_id,
+            iteration=iteration_counter,
+            emit_record=lambda r: _decision_emit(r),
+            emit_marker=lambda m: print(m, flush=True),
         )
 
         # ── Cluster-driven synthesis iteration-scoped state ──────────
