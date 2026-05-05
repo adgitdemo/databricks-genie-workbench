@@ -1364,6 +1364,135 @@ _PRODUCTIVE_ITERATION_NO_OP_REASON_CODES: tuple[str, ...] = (
 )
 
 
+def _enforce_regression_debt_partition_invariant(
+    *,
+    decision,
+    run_id: str,
+    iteration: int,
+    emit_record,
+    emit_marker,
+    strict: bool | None = None,
+) -> None:
+    """Plan N4 — invariant warn-and-degrade for the regression-debt
+    partition completeness check.
+
+    The strict invariant raises when ``out_of_target_regressed_qids``
+    is not the disjoint union of ``soft_to_hard / passing_to_hard /
+    unknown_to_hard``. In production, partition completeness is a
+    bookkeeping concern, not a runtime correctness failure: the
+    candidate accept/reject outcome is left untouched. The lenient
+    path emits a typed record + marker so the gap is auditable.
+    """
+    from genie_space_optimizer.common.config import (
+        regression_debt_invariant_enabled,
+    )
+    from genie_space_optimizer.optimization.invariant_policy import (
+        InvariantViolation,
+        handle_invariant_violation,
+        is_invariant_strict_mode,
+    )
+    from genie_space_optimizer.optimization.decision_emitters import (
+        regression_debt_partition_incomplete_record,
+    )
+    from genie_space_optimizer.optimization.run_analysis_contract import (
+        gso_invariant_violation_marker,
+    )
+
+    if not regression_debt_invariant_enabled():
+        return
+
+    if strict is None:
+        strict = is_invariant_strict_mode()
+
+    out_of_target = {
+        str(q) for q in decision.out_of_target_regressed_qids if str(q)
+    }
+    soft = {str(q) for q in decision.soft_to_hard_regressed_qids if str(q)}
+    passing = {
+        str(q) for q in decision.passing_to_hard_regressed_qids if str(q)
+    }
+    unknown = {
+        str(q) for q in decision.unknown_to_hard_regressed_qids if str(q)
+    }
+
+    union = soft | passing | unknown
+    missing = sorted(out_of_target - union)
+    overlaps = sorted(
+        (soft & passing) | (soft & unknown) | (passing & unknown)
+    )
+
+    if not missing and not overlaps:
+        return  # invariant holds; lenient path is silent on success
+
+    if missing:
+        violation = InvariantViolation(
+            name="regression_debt_partition_incomplete",
+            payload={
+                "missing_qids": missing,
+                "out_of_target": sorted(out_of_target),
+            },
+            message=(
+                f"regression-debt partition incomplete: out_of_target "
+                f"qids {missing} are not in soft_to_hard / "
+                f"passing_to_hard / unknown_to_hard. Bucket "
+                f"attribution silently dropped these."
+            ),
+        )
+
+        def _lenient_missing(_v) -> None:
+            emit_record(regression_debt_partition_incomplete_record(
+                run_id=run_id,
+                iteration=iteration,
+                missing_qids=tuple(missing),
+            ))
+            emit_marker(gso_invariant_violation_marker(
+                optimization_run_id=run_id,
+                iteration=iteration,
+                invariant_name="regression_debt_partition_incomplete",
+                offending_qids=tuple(missing),
+                degradation="bookkeeping_only_no_acceptance_flip",
+            ))
+
+        handle_invariant_violation(
+            violation, strict=strict, lenient_callback=_lenient_missing,
+        )
+
+    if overlaps:
+        violation = InvariantViolation(
+            name="regression_debt_partition_incomplete",
+            payload={
+                "overlapping_qids": overlaps,
+                "soft_to_hard": sorted(soft),
+                "passing_to_hard": sorted(passing),
+                "unknown_to_hard": sorted(unknown),
+            },
+            message=(
+                f"regression-debt partition not disjoint: qids "
+                f"{overlaps} appear in multiple sub-buckets "
+                f"simultaneously."
+            ),
+        )
+
+        def _lenient_overlap(_v) -> None:
+            emit_record(regression_debt_partition_incomplete_record(
+                run_id=run_id,
+                iteration=iteration,
+                missing_qids=tuple(overlaps),
+            ))
+            emit_marker(gso_invariant_violation_marker(
+                optimization_run_id=run_id,
+                iteration=iteration,
+                invariant_name="regression_debt_partition_incomplete",
+                offending_qids=tuple(overlaps),
+                degradation="bookkeeping_only_no_acceptance_flip",
+                payload={"kind": "non_disjoint_overlap"},
+            ))
+
+        handle_invariant_violation(
+            violation, strict=strict, lenient_callback=_lenient_overlap,
+        )
+
+
 def _enforce_quarantine_attribution_invariant(
     *,
     correction_state: dict,
@@ -11187,12 +11316,20 @@ def _run_gate_checks(
         candidate_pre_arbiter_accuracy=_candidate_pre_arbiter_pct,
         thresholds_met=_gate_thresholds_met,
     )
-    # P1 invariant — partition every out-of-target regression into
-    # exactly one of soft/passing/unknown. Raises AssertionError when
-    # GSO_REGRESSION_DEBT_INVARIANT is on (default) and the partition
-    # is incomplete or non-disjoint, so unattributed regression debt
-    # fails loud at runtime instead of silently in the marker.
-    assert_regression_debt_partition_complete(_control_plane_decision)
+    # Plan N4 — lenient regression-debt partition.
+    # Default: bookkeeping gaps emit
+    # ``GSO_INVARIANT_VIOLATION_V1`` +
+    # ``REGRESSION_DEBT_PARTITION_INCOMPLETE`` and the run continues
+    # (acceptance outcome unchanged — the gap is bookkeeping, not
+    # correctness). ``GSO_INVARIANT_STRICT=1`` flips back to the
+    # legacy raise for CI / replay.
+    _enforce_regression_debt_partition_invariant(
+        decision=_control_plane_decision,
+        run_id=run_id,
+        iteration=iteration_counter,
+        emit_record=lambda r: _decision_emit(r),
+        emit_marker=lambda m: print(m, flush=True),
+    )
 
     # v2 Task 2 — Pre-arbiter regression guardrail. A candidate that drops
     # broad pre-arbiter accuracy without flipping any declared target qid
