@@ -1819,6 +1819,87 @@ def _emit_diagnostic_ag_trunk_events(
             )
 
 
+def _emit_rca_ungrounded_records_for_unfit_clusters(
+    *,
+    run_id: str,
+    iteration: int,
+    clusters,
+    rca_id_by_cluster: dict,
+    ag_emitted_for_cluster: dict,
+    iter_inputs: dict,
+) -> int:
+    """Cycle 10 W1 — emit ``RCA_FORMED + UNRESOLVED + RCA_UNGROUNDED``
+    decision records for every cluster that reached AG-emit without a
+    fit RCA.
+
+    "Unfit RCA" = ``rca_id_by_cluster[cid]`` is empty AND
+    ``ag_emitted_for_cluster[cid]`` is True. The strategist produced
+    an AG but the RCA pipeline never grounded a fix surface, so any
+    patch downstream is patchless-by-construction.
+
+    Returns the number of records appended. Default-off (legacy) is 0.
+    """
+    from genie_space_optimizer.common.config import (
+        rca_ungrounded_records_enabled,
+    )
+    if not rca_ungrounded_records_enabled():
+        return 0
+    try:
+        from genie_space_optimizer.optimization.decision_emitters import (
+            unresolved_rca_records,
+        )
+    except Exception:
+        logger.debug(
+            "Cycle 10 W1: unresolved_rca_records import failed (non-fatal)",
+            exc_info=True,
+        )
+        return 0
+    rca_lookup = {
+        str(k): str(v or "") for k, v in (rca_id_by_cluster or {}).items()
+    }
+    ag_lookup = {
+        str(k): bool(v) for k, v in (ag_emitted_for_cluster or {}).items()
+    }
+    eligible = []
+    for cluster in clusters or ():
+        cid = str((cluster or {}).get("cluster_id") or "")
+        if not cid:
+            continue
+        if rca_lookup.get(cid):
+            continue
+        if not ag_lookup.get(cid):
+            continue
+        eligible.append(cluster)
+    if not eligible:
+        return 0
+    try:
+        records = unresolved_rca_records(
+            run_id=str(run_id),
+            iteration=int(iteration),
+            clusters=eligible,
+            rca_id_by_cluster=rca_lookup,
+        )
+    except Exception:
+        logger.debug(
+            "Cycle 10 W1: unresolved_rca_records call failed (non-fatal)",
+            exc_info=True,
+        )
+        return 0
+    n = 0
+    for rec in records or ():
+        try:
+            iter_inputs.setdefault("decision_records", []).append(
+                rec.to_dict()
+            )
+            n += 1
+        except Exception:
+            logger.debug(
+                "Cycle 10 W1: rca_ungrounded record append failed (non-fatal)",
+                exc_info=True,
+            )
+    return n
+
+
 def _regenerate_rca_for_cluster(
     *,
     spark,
@@ -20551,6 +20632,43 @@ def _run_lever_loop(
             )
             if _phase_b_strict_mode():
                 raise
+
+        # Cycle 10 W1 — RCA-ungrounded records for clusters that reached
+        # AG-emit without a fit RCA. Companion to orphan_rca_records:
+        # orphan = AG emitted but qids not covered by any AG; ungrounded =
+        # AG covers the cluster but no RCA grounded the fix surface.
+        try:
+            _w1_action_groups = list(
+                (_strategy_for_orphan or {}).get("action_groups") or []
+            )
+            _w1_ag_emitted = {
+                str(cid): True
+                for ag in _w1_action_groups
+                for cid in (ag.get("source_cluster_ids") or ())
+                if str(cid)
+            }
+            _w1_rca_id_by_cluster = {
+                str(c.get("cluster_id") or ""): str(c.get("rca_id") or "")
+                for c in (clusters or [])
+            }
+            _w1_count = _emit_rca_ungrounded_records_for_unfit_clusters(
+                run_id=str(run_id),
+                iteration=int(iteration_counter),
+                clusters=list(clusters or ()),
+                rca_id_by_cluster=_w1_rca_id_by_cluster,
+                ag_emitted_for_cluster=_w1_ag_emitted,
+                iter_inputs=_current_iter_inputs,
+            )
+            if _w1_count:
+                logger.info(
+                    "Cycle 10 W1: emitted %d rca_ungrounded records",
+                    _w1_count,
+                )
+        except Exception:
+            logger.debug(
+                "Cycle 10 W1: rca_ungrounded wiring failed (non-fatal)",
+                exc_info=True,
+            )
 
         # Cycle 5 T1 — productive-iteration budget accounting end-of-iter
         # decision. Gated by ``GSO_PRODUCTIVE_ITERATION_BUDGET`` (Option
