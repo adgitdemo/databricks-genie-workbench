@@ -5621,3 +5621,13 @@ def plateau_counts_quarantined_enabled() -> bool:
     preserve the legacy bypass path.
     """
     return _flag_default_on("GSO_PLATEAU_COUNTS_QUARANTINED")
+
+
+def proposal_trace_one_source_enabled() -> bool:
+    """Cycle 10 W7 — proposal trace ``consumed`` flag is computed in
+    one helper and read by both the post-strategist trace and the
+    acceptance trace, eliminating the dual-source drift visible in
+    run 1099b152. Default-on; replay sets
+    ``GSO_PROPOSAL_TRACE_ONE_SOURCE=0`` to preserve legacy.
+    """
+    return _flag_default_on("GSO_PROPOSAL_TRACE_ONE_SOURCE")

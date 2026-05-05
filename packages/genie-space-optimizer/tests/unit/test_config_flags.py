@@ -96,3 +96,19 @@ def test_plateau_counts_quarantined_off(monkeypatch):
         plateau_counts_quarantined_enabled,
     )
     assert plateau_counts_quarantined_enabled() is False
+
+
+def test_proposal_trace_one_source_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_PROPOSAL_TRACE_ONE_SOURCE", raising=False)
+    from genie_space_optimizer.common.config import (
+        proposal_trace_one_source_enabled,
+    )
+    assert proposal_trace_one_source_enabled() is True
+
+
+def test_proposal_trace_one_source_off(monkeypatch):
+    monkeypatch.setenv("GSO_PROPOSAL_TRACE_ONE_SOURCE", "0")
+    from genie_space_optimizer.common.config import (
+        proposal_trace_one_source_enabled,
+    )
+    assert proposal_trace_one_source_enabled() is False

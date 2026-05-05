@@ -1926,6 +1926,37 @@ def compute_current_hard_qids(
     return base | quarantined_active
 
 
+def compute_proposal_consumed_flag(
+    *,
+    proposal: dict,
+    applied_proposal_ids,
+    blast_dropped_proposal_ids,
+    rca_dropped_proposal_ids,
+) -> bool:
+    """Cycle 10 W7 — one-source-of-truth ``consumed`` flag for proposal
+    trace and acceptance trace.
+
+    Returns True iff the proposal was applied. False iff it was
+    dropped at any gate (blast-radius, rca_groundedness, or any
+    other rejection that lands its id in the dropped sets).
+
+    With ``GSO_PROPOSAL_TRACE_ONE_SOURCE`` off, the helper still
+    returns the same value (the helper itself is gate-agnostic);
+    it's the harness's call-site that gates whether the helper is
+    consulted vs. the legacy inline calculation.
+    """
+    pid = str((proposal or {}).get("proposal_id") or "")
+    if not pid:
+        return False
+    if pid in (applied_proposal_ids or frozenset()):
+        return True
+    if pid in (blast_dropped_proposal_ids or frozenset()):
+        return False
+    if pid in (rca_dropped_proposal_ids or frozenset()):
+        return False
+    return False
+
+
 def _emit_force_l6_outcome(
     *,
     outcome: str,  # one of "declined" | "raised"
