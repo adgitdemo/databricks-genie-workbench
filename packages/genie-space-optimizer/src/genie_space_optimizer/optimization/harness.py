@@ -1957,6 +1957,64 @@ def compute_proposal_consumed_flag(
     return False
 
 
+def emit_ag_levers_unioned_if_widened(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    levers_before,
+    levers_after,
+    iter_inputs: dict,
+) -> int:
+    """Cycle 10 W8 — emit one ``AG_LEVERS_UNIONED`` record when the
+    union widened the AG's lever set. No-op when the sets match.
+
+    Default-on; flag-off path emits nothing.
+    """
+    from genie_space_optimizer.common.config import (
+        ag_levers_union_recommended_enabled,
+    )
+    if not ag_levers_union_recommended_enabled():
+        return 0
+    before = tuple(str(l) for l in (levers_before or ()))
+    after = tuple(str(l) for l in (levers_after or ()))
+    if set(before) >= set(after):
+        return 0
+    try:
+        from genie_space_optimizer.optimization.decision_emitters import (
+            ag_levers_unioned_record,
+        )
+        from genie_space_optimizer.common.mlflow_markers import (
+            ag_levers_unioned_marker,
+        )
+        rec = ag_levers_unioned_record(
+            run_id=run_id, iteration=iteration, ag_id=ag_id,
+            cluster_id=cluster_id,
+            levers_before=before, levers_after=after,
+        )
+        iter_inputs.setdefault("decision_records", []).append(rec.to_dict())
+        try:
+            marker = ag_levers_unioned_marker(
+                run_id=run_id, iteration=iteration, ag_id=ag_id,
+                cluster_id=cluster_id,
+                levers_before=before, levers_after=after,
+            )
+            iter_inputs.setdefault("markers", []).append(marker)
+        except Exception:
+            logger.debug(
+                "Cycle 10 W8: ag_levers_unioned marker emit failed (non-fatal)",
+                exc_info=True,
+            )
+        return 1
+    except Exception:
+        logger.debug(
+            "Cycle 10 W8: ag_levers_unioned emit failed (non-fatal)",
+            exc_info=True,
+        )
+        return 0
+
+
 def _emit_force_l6_outcome(
     *,
     outcome: str,  # one of "declined" | "raised"
@@ -15417,6 +15475,39 @@ def _run_lever_loop(
                     )
                 action_groups = _decomposed_action_groups
                 action_groups = sorted(action_groups, key=_ag_sort_key)
+                # Cycle 10 W8 — emit AG_LEVERS_UNIONED for each AG
+                # whose lever set was widened by Cycle 10 W2 union.
+                # The pre-union snapshot lives on the AG dict as
+                # ``_levers_before_union`` (see
+                # ``union_ag_levers_with_recommended``).
+                try:
+                    for _ag_w8 in (action_groups or []):
+                        _ag_id_w8 = str(_ag_w8.get("id") or "")
+                        _before_w8 = tuple(
+                            str(k) for k in
+                            (_ag_w8.get("_levers_before_union") or ())
+                        )
+                        _after_w8 = tuple(
+                            str(k) for k in
+                            ((_ag_w8.get("lever_directives") or {}).keys())
+                        )
+                        if _before_w8 and set(_before_w8) < set(_after_w8):
+                            emit_ag_levers_unioned_if_widened(
+                                run_id=str(run_id),
+                                iteration=int(iteration_counter),
+                                ag_id=_ag_id_w8,
+                                cluster_id=str(
+                                    (_ag_w8.get("source_cluster_ids") or ["?"])[0]
+                                ),
+                                levers_before=_before_w8,
+                                levers_after=_after_w8,
+                                iter_inputs=_current_iter_inputs,
+                            )
+                except Exception:
+                    logger.debug(
+                        "Cycle 10 W8: ag_levers_unioned wiring failed (non-fatal)",
+                        exc_info=True,
+                    )
                 ag = action_groups[0] if action_groups else None
                 if _process_all_ags and len(action_groups) > 1:
                     pending_action_groups = list(

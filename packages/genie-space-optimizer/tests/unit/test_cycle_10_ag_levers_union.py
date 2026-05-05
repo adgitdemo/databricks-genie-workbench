@@ -102,3 +102,57 @@ def test_union_records_levers_before():
     cluster = {"cluster_id": "H1", "recommended_levers": [3, 5, 6]}
     out = union_ag_levers_with_recommended(ag=ag, cluster=cluster)
     assert out["_levers_before_union"] == ["5"]
+
+
+def test_diagnostic_action_group_emits_ag_levers_unioned_when_widened(monkeypatch):
+    monkeypatch.setenv("GSO_AG_LEVERS_UNION_RECOMMENDED", "1")
+    from genie_space_optimizer.optimization.harness import (
+        emit_ag_levers_unioned_if_widened,
+    )
+    iter_inputs = {"decision_records": [], "markers": []}
+    n = emit_ag_levers_unioned_if_widened(
+        run_id="r1", iteration=2,
+        ag_id="AG_DECOMPOSED_H001", cluster_id="H001",
+        levers_before=("5",),
+        levers_after=("3", "5", "6"),
+        iter_inputs=iter_inputs,
+    )
+    assert n == 1
+    assert iter_inputs["decision_records"][0]["reason_code"] == "ag_levers_unioned"
+    assert any(
+        m.startswith("GSO_AG_LEVERS_UNIONED_V1 ")
+        for m in iter_inputs["markers"]
+    )
+
+
+def test_emit_ag_levers_unioned_no_op_when_not_widened(monkeypatch):
+    monkeypatch.setenv("GSO_AG_LEVERS_UNION_RECOMMENDED", "1")
+    from genie_space_optimizer.optimization.harness import (
+        emit_ag_levers_unioned_if_widened,
+    )
+    iter_inputs = {"decision_records": [], "markers": []}
+    n = emit_ag_levers_unioned_if_widened(
+        run_id="r1", iteration=2,
+        ag_id="AG_DECOMPOSED_H001", cluster_id="H001",
+        levers_before=("3", "5", "6"),
+        levers_after=("3", "5", "6"),
+        iter_inputs=iter_inputs,
+    )
+    assert n == 0
+
+
+def test_emit_ag_levers_unioned_flag_off_byte_stable(monkeypatch):
+    monkeypatch.setenv("GSO_AG_LEVERS_UNION_RECOMMENDED", "0")
+    from genie_space_optimizer.optimization.harness import (
+        emit_ag_levers_unioned_if_widened,
+    )
+    iter_inputs = {"decision_records": [], "markers": []}
+    n = emit_ag_levers_unioned_if_widened(
+        run_id="r1", iteration=2,
+        ag_id="AG_DECOMPOSED_H001", cluster_id="H001",
+        levers_before=("5",),
+        levers_after=("3", "5", "6"),
+        iter_inputs=iter_inputs,
+    )
+    assert n == 0
+    assert iter_inputs["decision_records"] == []
