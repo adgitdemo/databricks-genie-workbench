@@ -5564,3 +5564,12 @@ def diagnostic_ag_rca_regen_enabled() -> bool:
     cycle-5 deploy; set ``GSO_DIAGNOSTIC_AG_RCA_REGEN=0`` for
     emergency disable."""
     return _flag_default_on("GSO_DIAGNOSTIC_AG_RCA_REGEN")
+
+
+def rca_ungrounded_records_enabled() -> bool:
+    """Cycle 10 W1 — emit ``RCA_FORMED + UNRESOLVED + RCA_UNGROUNDED``
+    record + marker for every cluster that reaches AG-emit with no fit
+    RCA. Default-on; tests/replay set ``GSO_RCA_UNGROUNDED_RECORDS_ENABLED=0``
+    to preserve the legacy silent-absorption byte-stable path.
+    """
+    return _flag_default_on("GSO_RCA_UNGROUNDED_RECORDS_ENABLED")

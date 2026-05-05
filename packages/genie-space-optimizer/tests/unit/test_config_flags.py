@@ -1,0 +1,18 @@
+"""Cycle 10 — config-flag accessors for the seven workstreams."""
+from __future__ import annotations
+
+
+def test_rca_ungrounded_records_enabled_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_RCA_UNGROUNDED_RECORDS_ENABLED", raising=False)
+    from genie_space_optimizer.common.config import (
+        rca_ungrounded_records_enabled,
+    )
+    assert rca_ungrounded_records_enabled() is True
+
+
+def test_rca_ungrounded_records_enabled_off(monkeypatch):
+    monkeypatch.setenv("GSO_RCA_UNGROUNDED_RECORDS_ENABLED", "0")
+    from genie_space_optimizer.common.config import (
+        rca_ungrounded_records_enabled,
+    )
+    assert rca_ungrounded_records_enabled() is False
