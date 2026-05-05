@@ -81,6 +81,14 @@ from genie_space_optimizer.optimization.eval_progress import (
     eval_force_sequential,
     slice_eval_records_for_debug,
 )
+from genie_space_optimizer.optimization.eval_concurrency import (
+    concurrency_tier_for_attempt,
+)
+from genie_space_optimizer.optimization.eval_watchdog import (
+    EvalHangTimeoutError,
+    compute_eval_deadline_seconds,
+    run_with_watchdog,
+)
 from genie_space_optimizer.common.genie_client import (
     detect_asset_type,
     fetch_genie_result_df,
@@ -525,6 +533,19 @@ STRICT_PROMPT_REGISTRATION = (
 FAIL_ON_INFRA_EVAL_ERRORS = (
     os.getenv("GENIE_SPACE_OPTIMIZER_FAIL_ON_INFRA_EVAL_ERRORS", "true").lower()
     in {"1", "true", "yes", "on"}
+)
+EVAL_DISABLE_LITELLM_RETRIES = (
+    os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_DISABLE_LITELLM_RETRIES", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+EVAL_WATCHDOG_PER_CALL_BUDGET_SECONDS = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_PER_CALL_BUDGET_SECONDS", "90")
+)
+EVAL_WATCHDOG_FLOOR_SECONDS = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_FLOOR_SECONDS", "600")
+)
+EVAL_WATCHDOG_CAP_SECONDS = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_CAP_SECONDS", "7200")
 )
 
 
@@ -6033,7 +6054,12 @@ def _is_retryable_eval_exception(exc: Exception) -> bool:
       1. ``eval_item.trace`` is None  ->  AttributeError: 'NoneType' ... 'info'
       2. ``eval_item.trace.info`` is None  ->  AttributeError on .assessments
       3. Transient gRPC / Spark Connect timeouts during scorer execution
+      4. EvalHangTimeoutError raised by the liveness watchdog when
+         ``mlflow.genai.evaluate`` exceeds its deadline (Cycle: eval-hang
+         defense; the next attempt degrades concurrency via the tier ladder).
     """
+    if isinstance(exc, EvalHangTimeoutError):
+        return True
     message = str(exc).lower()
     full_tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
     tb_text = "".join(full_tb).lower()
@@ -6363,44 +6389,78 @@ def _run_evaluate_with_retries(
     *,
     evaluate_kwargs: dict[str, Any],
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Run mlflow.genai.evaluate() with targeted retry for transient harness errors."""
+    """Run mlflow.genai.evaluate() with adaptive concurrency, watchdog, and retry."""
     _patch_mlflow_harness_none_trace()
 
     attempts: list[dict[str, Any]] = []
     initial_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS")
     initial_scorer_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS")
     initial_skip_validation = os.getenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION")
+    initial_async_timeout = os.getenv("MLFLOW_GENAI_EVAL_ASYNC_TIMEOUT")
+    initial_litellm_retries = os.getenv("LITELLM_NUM_RETRIES")
+
     os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = "True"
-    os.environ["MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS"] = "10"
+    if EVAL_DISABLE_LITELLM_RETRIES:
+        os.environ["LITELLM_NUM_RETRIES"] = "0"
+
+    data_for_estimate = evaluate_kwargs.get("data")
+    try:
+        row_count = (
+            len(data_for_estimate) if hasattr(data_for_estimate, "__len__") else 1
+        )
+    except Exception:
+        row_count = 1
+    scorer_count = len(evaluate_kwargs.get("scorers") or []) or 1
 
     try:
         for attempt in range(1, max(1, EVAL_MAX_ATTEMPTS) + 1):
-            workers = "1" if attempt == 1 else EVAL_SINGLE_WORKER_FALLBACK
-            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = workers
+            tier = concurrency_tier_for_attempt(attempt)
+            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = str(tier.data_workers)
+            os.environ["MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS"] = str(tier.scorer_workers)
+
+            deadline = compute_eval_deadline_seconds(
+                row_count=row_count,
+                scorer_count=scorer_count,
+                per_call_budget_seconds=EVAL_WATCHDOG_PER_CALL_BUDGET_SECONDS,
+                floor_seconds=EVAL_WATCHDOG_FLOOR_SECONDS,
+                cap_seconds=EVAL_WATCHDOG_CAP_SECONDS,
+            )
+            os.environ["MLFLOW_GENAI_EVAL_ASYNC_TIMEOUT"] = str(deadline)
+
+            attempt_meta: dict[str, Any] = {
+                "attempt": attempt,
+                f"data_workers_attempt_{attempt}": str(tier.data_workers),
+                f"scorer_workers_attempt_{attempt}": str(tier.scorer_workers),
+                "watchdog_deadline_seconds": deadline,
+                "litellm_retries": os.getenv("LITELLM_NUM_RETRIES", ""),
+            }
 
             try:
-                result = mlflow.genai.evaluate(**evaluate_kwargs)
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "workers": os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS"),
-                        "status": "success",
-                    }
+                result = run_with_watchdog(
+                    lambda: mlflow.genai.evaluate(**evaluate_kwargs),
+                    deadline_seconds=deadline,
+                    on_progress=lambda elapsed: logger.info(
+                        "mlflow.genai.evaluate still running attempt=%d elapsed=%.0fs deadline=%ds",
+                        attempt,
+                        elapsed,
+                        deadline,
+                    ),
                 )
+                attempt_meta["status"] = "success"
+                attempts.append(attempt_meta)
                 return result, attempts
             except Exception as exc:
                 err_type = type(exc).__name__
                 err_message = str(exc)
-                attempts.append(
+                attempt_meta.update(
                     {
-                        "attempt": attempt,
-                        "workers": os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS"),
                         "status": "failed",
                         "error_type": err_type,
                         "error_message": err_message[:1000],
                         "traceback": traceback.format_exc(limit=30),
                     }
                 )
+                attempts.append(attempt_meta)
                 retryable = _is_retryable_eval_exception(exc)
                 logger.exception(
                     "mlflow.genai.evaluate failed (attempt %d/%d, retryable=%s)",
@@ -6413,18 +6473,17 @@ def _run_evaluate_with_retries(
                     raise
                 time.sleep(EVAL_RETRY_SLEEP_SECONDS * attempt)
     finally:
-        if initial_workers is None:
-            os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
-        else:
-            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = initial_workers
-        if initial_scorer_workers is None:
-            os.environ.pop("MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS", None)
-        else:
-            os.environ["MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS"] = initial_scorer_workers
-        if initial_skip_validation is None:
-            os.environ.pop("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", None)
-        else:
-            os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = initial_skip_validation
+        for var, original in (
+            ("MLFLOW_GENAI_EVAL_MAX_WORKERS", initial_workers),
+            ("MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS", initial_scorer_workers),
+            ("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", initial_skip_validation),
+            ("MLFLOW_GENAI_EVAL_ASYNC_TIMEOUT", initial_async_timeout),
+            ("LITELLM_NUM_RETRIES", initial_litellm_retries),
+        ):
+            if original is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = original
 
     raise RuntimeError("Evaluation retry loop exhausted unexpectedly")
 
