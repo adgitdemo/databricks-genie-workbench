@@ -80,3 +80,19 @@ def test_doa_fingerprint_patch_body_match_off(monkeypatch):
         doa_fingerprint_patch_body_match_enabled,
     )
     assert doa_fingerprint_patch_body_match_enabled() is False
+
+
+def test_plateau_counts_quarantined_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_PLATEAU_COUNTS_QUARANTINED", raising=False)
+    from genie_space_optimizer.common.config import (
+        plateau_counts_quarantined_enabled,
+    )
+    assert plateau_counts_quarantined_enabled() is True
+
+
+def test_plateau_counts_quarantined_off(monkeypatch):
+    monkeypatch.setenv("GSO_PLATEAU_COUNTS_QUARANTINED", "0")
+    from genie_space_optimizer.common.config import (
+        plateau_counts_quarantined_enabled,
+    )
+    assert plateau_counts_quarantined_enabled() is False

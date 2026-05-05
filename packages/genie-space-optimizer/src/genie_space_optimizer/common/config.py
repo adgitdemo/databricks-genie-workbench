@@ -5612,3 +5612,12 @@ def doa_fingerprint_patch_body_match_enabled() -> bool:
     Cycle 9 W4 retry-signature-only path.
     """
     return _flag_default_on("GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH")
+
+
+def plateau_counts_quarantined_enabled() -> bool:
+    """Cycle 10 W6 — convergence-quarantined hard qids count toward
+    plateau guard until an applied SQL delta retires them.
+    Default-on; replay sets ``GSO_PLATEAU_COUNTS_QUARANTINED=0`` to
+    preserve the legacy bypass path.
+    """
+    return _flag_default_on("GSO_PLATEAU_COUNTS_QUARANTINED")

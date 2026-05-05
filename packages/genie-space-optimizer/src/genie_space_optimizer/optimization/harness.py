@@ -1893,6 +1893,39 @@ def _emit_diagnostic_ag_trunk_events(
             )
 
 
+def compute_current_hard_qids(
+    *,
+    currently_failing,
+    convergence_quarantined,
+    retired_by_sql_delta,
+    debt,
+) -> frozenset:
+    """Cycle 10 W6 — return the set of qids the plateau guard should
+    treat as "still hard" this iteration.
+
+    Always: ``currently_failing - retired_by_sql_delta - debt``.
+    Plus, when ``GSO_PLATEAU_COUNTS_QUARANTINED`` is on:
+      ``+ convergence_quarantined - retired_by_sql_delta``.
+
+    Pure: no I/O. Set algebra over frozensets.
+    """
+    from genie_space_optimizer.common.config import (
+        plateau_counts_quarantined_enabled,
+    )
+    base = (
+        frozenset(currently_failing or ())
+        - frozenset(retired_by_sql_delta or ())
+        - frozenset(debt or ())
+    )
+    if not plateau_counts_quarantined_enabled():
+        return base
+    quarantined_active = (
+        frozenset(convergence_quarantined or ())
+        - frozenset(retired_by_sql_delta or ())
+    )
+    return base | quarantined_active
+
+
 def _emit_force_l6_outcome(
     *,
     outcome: str,  # one of "declined" | "raised"
@@ -13256,7 +13289,7 @@ def _run_lever_loop(
                 _plateau_rows = list(_state_iter.get("rows") or [])
             except Exception:
                 _plateau_rows = []
-            _current_hard_qids = set(
+            _current_hard_qids_raw = set(
                 _hard_failure_qids_for_plateau(_plateau_rows)
             )
             _regression_debt_qids = set(
@@ -13264,6 +13297,19 @@ def _run_lever_loop(
             )
             _quarantined_qids = set(
                 _correction_state.get("quarantined_qids", set()) or set()
+            )
+            # Cycle 10 W6 — fold convergence-quarantined qids back into
+            # the still-hard set when the flag is on. Run 1099b152
+            # soft-skipped gs_009 / gs_024 into the quarantine bucket,
+            # which made ``_current_hard_qids`` empty at the plateau
+            # decision and bypassed the Cycle 9 W2 open-hard guard.
+            _current_hard_qids = set(
+                compute_current_hard_qids(
+                    currently_failing=frozenset(_current_hard_qids_raw),
+                    convergence_quarantined=frozenset(_quarantined_qids),
+                    retired_by_sql_delta=frozenset(),
+                    debt=frozenset(_regression_debt_qids),
+                )
             )
             # Task 20 — collect target qids for which any rejected AG
             # produced an SQL-shape delta. The resolver routes these to
