@@ -20,6 +20,13 @@ class RcaTerminalStatus(str, Enum):
     # Track G — plateau detector cannot fire while a queued diagnostic
     # or buffered AG still covers a live hard qid (signature overlap).
     PLATEAU_PENDING_DIAGNOSTIC_AGS = "plateau_pending_diagnostic_ags"
+    # Cycle 9 W2 — plateau detector cannot fire while ``current_hard_qids
+    # - quarantined - regression_debt`` is non-empty. Run 1099b152 hit
+    # this gap when gs_009/gs_013/gs_024 had been released from
+    # quarantine but no resolver branch above caught them, so the
+    # legacy fall-through declared a clean plateau and the loop
+    # terminated with hard qids still open.
+    PROGRESS_PENDING_OPEN_HARD = "progress_pending_open_hard"
 
 
 @dataclass(frozen=True)
@@ -222,6 +229,32 @@ def resolve_terminal_on_plateau(
             ),
             retired_ags=retired_ags_tuple,
         )
+    # Cycle 9 W2 — guard against clean-plateau false positives.
+    # When ``current_hard_qids - quarantined - regression_debt`` is
+    # non-empty and no other branch fired, the loop has hard qids it
+    # can still try (next iteration may produce a fresh SQL delta or
+    # a re-clustering). Returning ``should_continue=True`` prevents
+    # premature termination.
+    open_hard = sorted(
+        set(current_hard_qids)
+        - set(quarantined_qids)
+        - set(regression_debt_qids)
+    )
+    if open_hard:
+        from genie_space_optimizer.common.config import (
+            plateau_requires_zero_open_hard_enabled,
+        )
+        if plateau_requires_zero_open_hard_enabled():
+            return RcaTerminalDecision(
+                status=RcaTerminalStatus.PROGRESS_PENDING_OPEN_HARD,
+                should_continue=True,
+                reason=(
+                    f"plateau suppressed — {len(open_hard)} hard qid(s) "
+                    f"remain open with no SQL delta or queued AG: "
+                    f"{open_hard}"
+                ),
+                retired_ags=retired_ags_tuple,
+            )
     return RcaTerminalDecision(
         status=RcaTerminalStatus.PLATEAU_NO_OPEN_FAILURES,
         should_continue=False,

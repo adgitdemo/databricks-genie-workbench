@@ -916,6 +916,17 @@ def _resolve_lever_loop_exit_reason(
             status_value = plateau_decision.status.value
         except AttributeError:
             status_value = str(plateau_decision.status)
+        # Cycle 9 W5: avoid double-prefix when ``status_value`` already
+        # starts with ``plateau_`` (e.g. ``plateau_no_open_failures``)
+        # so the marker reader doesn't see ``plateau_plateau_*``.
+        from genie_space_optimizer.common.config import (
+            plateau_reason_no_double_prefix_enabled,
+        )
+        if (
+            plateau_reason_no_double_prefix_enabled()
+            and status_value.startswith("plateau_")
+        ):
+            return status_value
         return f"plateau_{status_value}"
     if divergence_label:
         return str(divergence_label)
@@ -15817,10 +15828,31 @@ def _run_lever_loop(
                 )
                 if not isinstance(_force_cluster, dict):
                     continue
-                _force_target_qids = tuple(
+                # Cycle 9 W1: AG_DECOMPOSED_* AGs (Cycle 6
+                # decompose_overbroad_ag) populate ``affected_questions``
+                # but leave ``target_qids`` empty. The legacy reader
+                # silently disabled Cycle 7 N3 for those AGs in
+                # production runs (run 1099b152). Fall back to
+                # ``affected_questions`` when the flag is on.
+                from genie_space_optimizer.common.config import (
+                    force_l6_reads_affected_questions_enabled
+                    as _force_l6_fallback_on,
+                )
+                _force_target_qids_legacy = tuple(
                     str(q) for q in (ag.get("target_qids") or ())
                     if str(q)
                 )
+                if (
+                    _force_target_qids_legacy
+                    or not _force_l6_fallback_on()
+                ):
+                    _force_target_qids = _force_target_qids_legacy
+                else:
+                    _force_target_qids = tuple(
+                        str(q)
+                        for q in (ag.get("affected_questions") or ())
+                        if str(q)
+                    )
                 _forced_l6 = _force_lever6_proposal_for_ag(
                     run_id=str(run_id),
                     iteration=int(iteration_counter),

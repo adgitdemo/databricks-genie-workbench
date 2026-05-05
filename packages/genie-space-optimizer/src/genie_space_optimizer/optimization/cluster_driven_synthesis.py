@@ -1123,3 +1123,85 @@ def run_cluster_driven_synthesis_for_single_cluster(
         attempted_archetypes=tuple(_attempted_archetypes_so_far),
         skipped_reason="",
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cycle 9 W3 — narrow-replacement builder for L6 patches dropped at
+# ``high_collateral_risk_flagged``. Pure helper, no I/O, no logger;
+# safe to unit-test.
+
+_L6_PATCH_TYPES: frozenset[str] = frozenset({
+    "add_sql_snippet_measure",
+    "add_sql_snippet_filter",
+    "add_sql_snippet_expression",
+})
+
+
+def add_qid_scope_to_predicate(
+    predicate: str,
+    *,
+    qids: tuple[str, ...],
+    qid_column: str = "query_id",
+) -> str:
+    """Cycle 9 W3 — wrap ``predicate`` in an AND-clause that scopes it
+    to the supplied ``qids``. Returns the input unchanged when the
+    predicate already mentions every qid (so the narrow-replacement
+    builder can detect the no-op case)."""
+    if not predicate or not qids:
+        return predicate
+    base = str(predicate).strip()
+    if not base:
+        return base
+    if all(q in base for q in qids):
+        return base
+    quoted = ",".join(f"'{q}'" for q in qids)
+    return f"({base}) AND ({qid_column} IN ({quoted}))"
+
+
+def build_narrow_l6_replacement(
+    *,
+    original_patch: dict,
+    ag_target_qids: tuple[str, ...],
+    root_cause: str,
+) -> dict | None:
+    """Cycle 9 W3 — synthesize a narrow-scope variant of an L6 patch
+    that was dropped at ``high_collateral_risk_flagged``.
+
+    Returns ``None`` when the original is not a recognized L6 patch
+    type, when the AG has no target qids, when the original lacks a
+    ``where_predicate`` to narrow, or when narrowing would be a no-op
+    (predicate already scoped).
+
+    Pure: no I/O, no clock, no logger.
+    """
+    _ = root_cause  # reserved for future per-RCA narrowing strategies
+    ptype = str((original_patch or {}).get("patch_type") or "")
+    if ptype not in _L6_PATCH_TYPES:
+        return None
+    qids = tuple(str(q) for q in (ag_target_qids or ()) if str(q))
+    if not qids:
+        return None
+    base_predicate = str(
+        (original_patch or {}).get("where_predicate") or ""
+    ).strip()
+    if not base_predicate:
+        return None
+    qid_column = str(
+        (original_patch or {}).get("qid_predicate_column") or "query_id"
+    )
+    narrowed = add_qid_scope_to_predicate(
+        base_predicate, qids=qids, qid_column=qid_column,
+    )
+    if narrowed == base_predicate:
+        return None
+    return {
+        **original_patch,
+        "proposal_id": (
+            f"{original_patch.get('proposal_id') or 'P_L6'}#NARROW"
+        ),
+        "where_predicate": narrowed,
+        "derived_from": str(original_patch.get("proposal_id") or ""),
+        "narrow_replacement_reason": "high_collateral_risk_flagged",
+        "narrow_target_qids": qids,
+        "_cycle_9_narrow_replacement": True,
+    }

@@ -5424,6 +5424,65 @@ def force_structural_synthesis_on_lever5_drop_enabled() -> bool:
     return True
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Cycle 9 — Patch-Acceptance Reliability flag accessors (default-on).
+# Anchor runs: 1099b152 (anchor) + 2afb0be2 596465849524605 (variance).
+
+
+def force_l6_reads_affected_questions_enabled() -> bool:
+    """Cycle 9 W1 — when on, the Cycle 7 N3 force-L6 wiring at the
+    per-AG aggregation block in ``harness.py`` falls back to
+    ``ag["affected_questions"]`` when ``ag["target_qids"]`` is empty.
+
+    Closes the silent failure observed in run 1099b152 where the
+    predicate's guard #4 (non-empty target_qids) blocked all
+    ``AG_DECOMPOSED_*`` AGs because the decompose-overbroad-AG
+    builder writes ``affected_questions`` rather than ``target_qids``.
+
+    Default-on. Set ``GSO_FORCE_L6_READS_AFFECTED_QUESTIONS=0`` to
+    restore the legacy decomposed-AG silent-skip behaviour.
+    """
+    return _flag_default_on("GSO_FORCE_L6_READS_AFFECTED_QUESTIONS")
+
+
+def plateau_requires_zero_open_hard_enabled() -> bool:
+    """Cycle 9 W2 — when on, ``resolve_terminal_on_plateau`` returns
+    ``PROGRESS_PENDING_OPEN_HARD`` (continue) when ``current_hard_qids
+    - quarantined_qids - regression_debt_qids`` is non-empty.
+    Default-on; set ``GSO_PLATEAU_REQUIRES_ZERO_OPEN_HARD=0`` for
+    legacy clean-plateau behaviour.
+    """
+    return _flag_default_on("GSO_PLATEAU_REQUIRES_ZERO_OPEN_HARD")
+
+
+def l6_narrow_replacement_on_hcrf_enabled() -> bool:
+    """Cycle 9 W3 — when on, the harness blast-radius site
+    synthesizes a narrow-scope variant of any L6 patch dropped at
+    ``high_collateral_risk_flagged`` and re-submits it to the same
+    gate. Default-on; set ``GSO_L6_NARROW_REPLACEMENT_ON_HCRF=0`` to
+    restore the legacy drop-and-give-up behaviour.
+    """
+    return _flag_default_on("GSO_L6_NARROW_REPLACEMENT_ON_HCRF")
+
+
+def doa_fingerprint_block_reproposal_enabled() -> bool:
+    """Cycle 9 W4 — when on, strategist preprocessing prunes any
+    candidate whose ``patch_retry_signature`` was already captured
+    in the per-run DOA fingerprint buffer (rolled back with
+    ``cause=target_still_hard`` in a prior iteration). Default-on.
+    """
+    return _flag_default_on("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL")
+
+
+def plateau_reason_no_double_prefix_enabled() -> bool:
+    """Cycle 9 W5 — when on, ``_resolve_lever_loop_exit_reason`` does
+    not double-prefix ``plateau_*`` statuses. Pure observability fix.
+    Default-on; set ``GSO_PLATEAU_REASON_NO_DOUBLE_PREFIX=0`` for
+    replay byte-stability against legacy fixtures.
+    """
+    return _flag_default_on("GSO_PLATEAU_REASON_NO_DOUBLE_PREFIX")
+
+
 def require_lever6_for_sql_shape_rca_enabled() -> bool:
     """Cycle 7 N3 — when on, every Action Group whose cluster has
     ``root_cause`` in ``_SQL_SHAPE_ROOT_CAUSES`` AND

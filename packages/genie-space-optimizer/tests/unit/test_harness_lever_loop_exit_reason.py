@@ -15,6 +15,11 @@ def test_default_when_loop_runs_to_completion():
 
 
 def test_uses_resolver_status_value_when_plateau_break():
+    """Cycle 9 W5 — when the resolver status already starts with
+    ``plateau_`` the helper passes it through verbatim instead of
+    double-prefixing it. The legacy double-prefix bug is preserved
+    behind the ``GSO_PLATEAU_REASON_NO_DOUBLE_PREFIX=0`` env override
+    (covered separately in test_cycle_9_patch_acceptance_reliability)."""
     decision = RcaTerminalDecision(
         status=RcaTerminalStatus.PLATEAU_NO_OPEN_FAILURES,
         should_continue=False,
@@ -22,7 +27,7 @@ def test_uses_resolver_status_value_when_plateau_break():
     )
     assert (
         _resolve_lever_loop_exit_reason(decision, None)
-        == "plateau_plateau_no_open_failures"
+        == "plateau_no_open_failures"
     )
 
 

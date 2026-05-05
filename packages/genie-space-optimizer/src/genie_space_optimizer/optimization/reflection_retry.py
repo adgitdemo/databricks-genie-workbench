@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -196,3 +196,38 @@ def retry_allowed_after_rollback(
     if rollback_cause in {"infra_schema_failure", "insufficient_gain", "target_still_hard"}:
         return RetryDecision(True, f"retry_allowed_for_{rollback_cause}")
     return RetryDecision(False, "same_harmful_patch_signature")
+
+
+@dataclass
+class DoaFingerprintBuffer:
+    """Cycle 9 W4 — per-run, per-AG buffer of patch fingerprints whose
+    last application was rolled back with ``cause="target_still_hard"``.
+
+    Reuses ``patch_retry_signature`` as the keying function so the
+    buffer participates in the same dedup contract as Cycle 2 T1's
+    reflection-retry path.
+
+    Closes the run-to-run reproposal cycle observed in run
+    ``1099b152`` where the same
+    ``(add_sql_snippet_filter, tkt_doc, outbound_route_total_segments,
+    ...)`` patch was reproposed and rolled back across iterations 2-4.
+    """
+
+    _by_ag: dict[str, set] = field(default_factory=dict)
+
+    def add(self, *, ag_id: str, patch: dict[str, Any]) -> None:
+        if not ag_id or not patch:
+            return
+        sig = patch_retry_signature(patch)
+        self._by_ag.setdefault(str(ag_id), set()).add(sig)
+
+    def contains(self, *, ag_id: str, patch: dict[str, Any]) -> bool:
+        if not ag_id or not patch:
+            return False
+        sigs = self._by_ag.get(str(ag_id))
+        if not sigs:
+            return False
+        return patch_retry_signature(patch) in sigs
+
+    def signatures_for(self, ag_id: str) -> tuple:
+        return tuple(self._by_ag.get(str(ag_id), ()))
