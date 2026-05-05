@@ -142,31 +142,114 @@ def _deduplicate_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, An
     return deduped
 
 
+def reconcile_cap_conservation(
+    *,
+    decisions: list[dict[str, Any]],
+    input_count: int,
+) -> list[dict[str, Any]]:
+    """Plan N4 — pure helper that repairs a count-mismatched cap-
+    selector output.
+
+    Truncates extras (drops trailing entries when ``len(decisions) >
+    input_count``) and pads missing slots with explicit
+    ``decision="dropped"`` entries carrying
+    ``reason="cap_conservation_repaired"``. The survival ledger
+    downstream sees a typed dropped-decision rather than a count
+    mismatch.
+
+    Pure function: no I/O, no logging, no policy. Used by the
+    lenient callback wired into ``_assert_cap_conservation``.
+    """
+    if len(decisions) > input_count:
+        return list(decisions[:input_count])
+    if len(decisions) < input_count:
+        padded = list(decisions)
+        for _ in range(input_count - len(decisions)):
+            padded.append({
+                "decision": "dropped",
+                "reason": "cap_conservation_repaired",
+            })
+        return padded
+    return list(decisions)
+
+
 def _assert_cap_conservation(
     *,
     func_name: str,
     input_count: int,
     decisions: list[dict[str, Any]],
+    on_violation=None,
 ) -> None:
     """Hard-fail when a cap selector loses or duplicates a decision row.
 
     Surfaces the May-01 ESR ``Original 4, Kept 3, Dropped 0`` defect class
     immediately rather than letting it propagate through survival ledgers
     and journey events.
+
+    Plan N4 — when ``on_violation`` is provided, the count or
+    kept+dropped check failure builds an
+    ``invariant_policy.InvariantViolation`` and routes through
+    ``handle_invariant_violation(strict=is_invariant_strict_mode(),
+    lenient_callback=on_violation)``. Default (callback ``None``)
+    keeps the legacy raise so existing CI tests stay green.
     """
+    from genie_space_optimizer.optimization.invariant_policy import (
+        InvariantViolation,
+        handle_invariant_violation,
+        is_invariant_strict_mode,
+    )
+
+    def _dispatch(violation: InvariantViolation) -> None:
+        if on_violation is None:
+            # Legacy raise preserved for callers that have not opted
+            # into the policy. Routes through ``handle_invariant_
+            # violation(strict=True)`` for a uniform error format.
+            raise AssertionError(
+                f"{violation.name}: {violation.message}"
+            )
+        handle_invariant_violation(
+            violation,
+            strict=is_invariant_strict_mode(),
+            lenient_callback=on_violation,
+        )
+
     if len(decisions) != input_count:
         identities = [_stable_identity(d) for d in decisions]
-        raise AssertionError(
-            f"{func_name}: cap conservation violated: input={input_count} "
-            f"decisions={len(decisions)} identities={identities!r}"
-        )
+        _dispatch(InvariantViolation(
+            name="cap_conservation_violated",
+            payload={
+                "func_name": func_name,
+                "input_count": int(input_count),
+                "decisions_count": len(decisions),
+                "identities": identities,
+            },
+            message=(
+                f"{func_name}: cap conservation violated: "
+                f"input={input_count} decisions={len(decisions)} "
+                f"identities={identities!r}"
+            ),
+        ))
+        # When on_violation absorbed the violation we still fall
+        # through; the caller is expected to invoke
+        # ``reconcile_cap_conservation`` to repair the list.
+        return
     kept = sum(1 for d in decisions if d.get("decision") == "selected")
     dropped = sum(1 for d in decisions if d.get("decision") == "dropped")
     if kept + dropped != input_count:
-        raise AssertionError(
-            f"{func_name}: kept ({kept}) + dropped ({dropped}) != input "
-            f"({input_count})"
-        )
+        _dispatch(InvariantViolation(
+            name="cap_conservation_violated",
+            payload={
+                "func_name": func_name,
+                "input_count": int(input_count),
+                "kept": int(kept),
+                "dropped": int(dropped),
+                "kind": "kept_dropped_mismatch",
+            },
+            message=(
+                f"{func_name}: kept ({kept}) + dropped ({dropped}) "
+                f"!= input ({input_count})"
+            ),
+        ))
 
 
 def _deduplicate_patches(patches: list[dict[str, Any]]) -> list[dict[str, Any]]:
