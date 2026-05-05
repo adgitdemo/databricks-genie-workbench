@@ -663,3 +663,30 @@ C-7-C (seed): Clusterer / RCA root-cause flips for the same QID across iteration
 ``GSO_INVARIANT_STRICT`` is **off by default** on the production deploy; CI / replay tooling sets it (or ``GSO_DECISION_EMITTER_STRICT``, the existing fallback) to keep the loud failure mode for wiring bugs. Production reviews ``GSO_INVARIANT_VIOLATION_V1`` markers in the postmortem bundle — marker frequency is itself a health signal.
 
 **Status:** SHIPPED.
+
+
+## Cycle 10 — RCA Grounding & Loop-Control Reliability (2026-05-05)
+
+**Anchor run:** [`1099b152-8655-4f1e-ab43-1240a9400280`](./runid_analysis/1099b152-8655-4f1e-ab43-1240a9400280/postmortem.md)
+
+**Workstreams (all default-on):**
+
+- W1 — `rca_ungrounded_record` wired for unfit-RCA clusters (`GSO_RCA_UNGROUNDED_RECORDS_ENABLED`); wraps `unresolved_rca_records` filtered to clusters where AG was emitted.
+- W2 — AG `Levers ⊇ cluster.recommended_levers` (`GSO_AG_LEVERS_UNION_RECOMMENDED`); `union_ag_levers_with_recommended` helper, wired through `diagnostic_action_group_for_cluster` (which the AG decomposer also uses), plus `build_ag_emit_prompt_clusters_block` for the strategist prompt.
+- W3 — typed outcomes for the Cycle 7 N3 force-Lever-6 silent path (`GSO_LEVER6_FORCE_TYPED_OUTCOMES`); replaces the `harness.py:16135-16146` swallow with `LEVER6_FORCE_LLM_DECLINED` / `LEVER6_FORCE_RAISED` / `PROPOSAL_GENERATION_EMPTY` records via `_emit_force_l6_outcome`.
+- W4 — patch-aware narrow-L6 replacement (`GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE`); `narrow_replacement_diagnosis` partitions filter vs measure/expression and emits `NARROW_NOT_APPLICABLE` at HCRF sites with L5 example_sql fallback.
+- W5 — DOA fingerprint patch-body match (`GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH`); `DoaFingerprintBuffer` indexes both `patch_retry_signature` and `patch_body_fingerprint`, catching `update_instruction_section ↔ rewrite_instruction` shape splits.
+- W6 — plateau guard counts convergence-quarantined hard qids (`GSO_PLATEAU_COUNTS_QUARANTINED`); `compute_current_hard_qids` set-algebra helper folds quarantined qids back into the "still hard" set so the Cycle 9 W2 open-hard guard fires.
+- W7 — single-source proposal-consumed flag (`GSO_PROPOSAL_TRACE_ONE_SOURCE`); `compute_proposal_consumed_flag` pure helper landed for future trace/acceptance-emit migrations (no inline `consumed=...` call-sites exist on HEAD today, so the migration is no-op).
+- W8 — `AG_LEVERS_UNIONED` typed observability for W2; `emit_ag_levers_unioned_if_widened` helper wired at the AG-emit finalize site, reading `_levers_before_union` from the union helper.
+
+**Verification**
+
+- 3613 passed / 1 skipped / 3 xfailed across the full GSO unit-test suite (``pytest tests/unit/ -q``).
+- 13 passed / 2 skipped on ``test_lever_loop_replay`` at ``BURNDOWN_BUDGET=0`` for both flag-off and flag-on configurations — replay byte-stability holds in both directions.
+
+**Production-default contract:** all eight Cycle 10 flags ship default-on. CI/replay tooling sets each `GSO_*=0` to preserve byte-stable legacy paths (PF-3 baseline 13 passed / 2 skipped).
+
+**Corpus delta:** corpus run on the airline space deferred — to be launched from a Databricks workspace post-deploy and documented in a follow-up postmortem under `runid_analysis/<post-cycle-10-run-id>/`.
+
+**Status:** SHIPPED.
