@@ -5592,3 +5592,12 @@ def lever6_force_typed_outcomes_enabled() -> bool:
     DEBUG-swallow byte-stable path.
     """
     return _flag_default_on("GSO_LEVER6_FORCE_TYPED_OUTCOMES")
+
+
+def l6_narrow_replacement_patch_aware_enabled() -> bool:
+    """Cycle 10 W4 — narrow-L6 replacement branches by ``patch_type``
+    instead of assuming ``where_predicate``. Default-on; replay sets
+    ``GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE=0`` to preserve the legacy
+    filter-only path.
+    """
+    return _flag_default_on("GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE")

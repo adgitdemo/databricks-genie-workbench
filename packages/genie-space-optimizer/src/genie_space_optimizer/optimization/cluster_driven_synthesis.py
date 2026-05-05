@@ -1158,26 +1158,109 @@ def add_qid_scope_to_predicate(
     return f"({base}) AND ({qid_column} IN ({quoted}))"
 
 
+# Cycle 10 W4 — patch-type-aware partition. Filter narrows via
+# ``where_predicate``; measure / expression lack a predicate and need
+# an L5 example_sql fallback instead.
+_FILTER_PATCH_TYPES: frozenset[str] = frozenset({"add_sql_snippet_filter"})
+_MEASURE_OR_EXPR_PATCH_TYPES: frozenset[str] = frozenset({
+    "add_sql_snippet_measure",
+    "add_sql_snippet_expression",
+})
+
+
+def narrow_replacement_diagnosis(
+    *,
+    original_patch: dict,
+    ag_target_qids: tuple,
+    root_cause: str,
+) -> dict:
+    """Cycle 10 W4 — return a structured diagnosis of whether a narrow
+    L6 replacement is applicable for ``original_patch``.
+
+    Pure: no I/O.
+
+    Returns ``{"applicable": bool, "reason": str, "original_patch_type": str}``.
+    """
+    _ = root_cause
+    ptype = str((original_patch or {}).get("patch_type") or "")
+    qids = tuple(str(q) for q in (ag_target_qids or ()) if str(q))
+    if ptype in _MEASURE_OR_EXPR_PATCH_TYPES:
+        return {
+            "applicable": False,
+            "reason": "patch_type_lacks_where_predicate",
+            "original_patch_type": ptype,
+        }
+    if ptype not in _FILTER_PATCH_TYPES:
+        return {
+            "applicable": False,
+            "reason": "unrecognized_patch_type",
+            "original_patch_type": ptype,
+        }
+    if not qids:
+        return {
+            "applicable": False,
+            "reason": "no_target_qids",
+            "original_patch_type": ptype,
+        }
+    base_predicate = str(
+        (original_patch or {}).get("where_predicate") or ""
+    ).strip()
+    if not base_predicate:
+        return {
+            "applicable": False,
+            "reason": "filter_missing_where_predicate",
+            "original_patch_type": ptype,
+        }
+    return {
+        "applicable": True,
+        "reason": "filter_predicate_narrowable",
+        "original_patch_type": ptype,
+    }
+
+
 def build_narrow_l6_replacement(
     *,
     original_patch: dict,
     ag_target_qids: tuple[str, ...],
     root_cause: str,
 ) -> dict | None:
-    """Cycle 9 W3 — synthesize a narrow-scope variant of an L6 patch
-    that was dropped at ``high_collateral_risk_flagged``.
+    """Cycle 9 W3 / Cycle 10 W4 — synthesize a narrow-scope variant of
+    an L6 patch dropped at ``high_collateral_risk_flagged``.
 
-    Returns ``None`` when the original is not a recognized L6 patch
-    type, when the AG has no target qids, when the original lacks a
-    ``where_predicate`` to narrow, or when narrowing would be a no-op
-    (predicate already scoped).
+    Cycle 10 W4 splits behavior by patch_type when
+    ``GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE`` is on:
+
+    * ``add_sql_snippet_filter`` → narrow ``where_predicate`` with
+      ``query_id IN (...)`` scoping. (existing behavior)
+    * ``add_sql_snippet_measure`` / ``add_sql_snippet_expression``
+      → return ``None``. The harness uses ``narrow_replacement_diagnosis``
+      to emit ``NARROW_NOT_APPLICABLE`` and falls back to L5
+      example_sql synthesis.
+
+    With the flag off, the legacy filter-only path runs (measure /
+    expression also returned ``None`` legacy because they lack a
+    where_predicate, so flag-off byte-stability holds).
 
     Pure: no I/O, no clock, no logger.
     """
+    from genie_space_optimizer.common.config import (
+        l6_narrow_replacement_patch_aware_enabled,
+    )
     _ = root_cause  # reserved for future per-RCA narrowing strategies
     ptype = str((original_patch or {}).get("patch_type") or "")
-    if ptype not in _L6_PATCH_TYPES:
-        return None
+    if l6_narrow_replacement_patch_aware_enabled():
+        diag = narrow_replacement_diagnosis(
+            original_patch=original_patch,
+            ag_target_qids=ag_target_qids,
+            root_cause=root_cause,
+        )
+        if not diag["applicable"]:
+            return None
+    else:
+        # Legacy path: only proceed for known L6 types with a
+        # where_predicate present.
+        if ptype not in _L6_PATCH_TYPES:
+            return None
     qids = tuple(str(q) for q in (ag_target_qids or ()) if str(q))
     if not qids:
         return None

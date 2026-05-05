@@ -48,3 +48,19 @@ def test_lever6_force_typed_outcomes_off(monkeypatch):
         lever6_force_typed_outcomes_enabled,
     )
     assert lever6_force_typed_outcomes_enabled() is False
+
+
+def test_l6_narrow_replacement_patch_aware_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE", raising=False)
+    from genie_space_optimizer.common.config import (
+        l6_narrow_replacement_patch_aware_enabled,
+    )
+    assert l6_narrow_replacement_patch_aware_enabled() is True
+
+
+def test_l6_narrow_replacement_patch_aware_off(monkeypatch):
+    monkeypatch.setenv("GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE", "0")
+    from genie_space_optimizer.common.config import (
+        l6_narrow_replacement_patch_aware_enabled,
+    )
+    assert l6_narrow_replacement_patch_aware_enabled() is False
