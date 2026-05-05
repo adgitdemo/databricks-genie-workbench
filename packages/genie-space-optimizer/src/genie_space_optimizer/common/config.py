@@ -5582,3 +5582,13 @@ def ag_levers_union_recommended_enabled() -> bool:
     "diagnostic-directive lever only" path.
     """
     return _flag_default_on("GSO_AG_LEVERS_UNION_RECOMMENDED")
+
+
+def lever6_force_typed_outcomes_enabled() -> bool:
+    """Cycle 10 W3 — emit typed records (``LEVER6_FORCE_LLM_DECLINED`` /
+    ``LEVER6_FORCE_RAISED`` / ``PROPOSAL_GENERATION_EMPTY``) when the
+    Cycle 7 N3 force-L6 path produces no candidate. Default-on; replay
+    sets ``GSO_LEVER6_FORCE_TYPED_OUTCOMES=0`` to preserve the legacy
+    DEBUG-swallow byte-stable path.
+    """
+    return _flag_default_on("GSO_LEVER6_FORCE_TYPED_OUTCOMES")

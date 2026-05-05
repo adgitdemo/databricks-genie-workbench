@@ -32,3 +32,19 @@ def test_ag_levers_union_recommended_off(monkeypatch):
         ag_levers_union_recommended_enabled,
     )
     assert ag_levers_union_recommended_enabled() is False
+
+
+def test_lever6_force_typed_outcomes_default_on(monkeypatch):
+    monkeypatch.delenv("GSO_LEVER6_FORCE_TYPED_OUTCOMES", raising=False)
+    from genie_space_optimizer.common.config import (
+        lever6_force_typed_outcomes_enabled,
+    )
+    assert lever6_force_typed_outcomes_enabled() is True
+
+
+def test_lever6_force_typed_outcomes_off(monkeypatch):
+    monkeypatch.setenv("GSO_LEVER6_FORCE_TYPED_OUTCOMES", "0")
+    from genie_space_optimizer.common.config import (
+        lever6_force_typed_outcomes_enabled,
+    )
+    assert lever6_force_typed_outcomes_enabled() is False
