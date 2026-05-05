@@ -151,9 +151,14 @@ def test_assert_canonical_off_allows_missing_rationale(monkeypatch):
 
 
 def test_assert_canonical_on_raises_for_missing_rationale(monkeypatch):
+    """Plan N4: ``GSO_ASSERT_ROW_CANONICAL=1`` alone now logs and
+    continues (production default is lenient). Both
+    ``GSO_ASSERT_ROW_CANONICAL=1`` AND ``GSO_INVARIANT_STRICT=1``
+    are required for the loud raise (CI / debug path)."""
     monkeypatch.setenv("GSO_ASSERT_ROW_CANONICAL", "1")
+    monkeypatch.setenv("GSO_INVARIANT_STRICT", "1")
     row = {"arbiter/value": "no", "arbiter/rationale": ""}
-    with pytest.raises(AssertionError, match="Non-canonical summary row"):
+    with pytest.raises(AssertionError, match="non_canonical_judge_row"):
         _build_summary_row(row)
 
 

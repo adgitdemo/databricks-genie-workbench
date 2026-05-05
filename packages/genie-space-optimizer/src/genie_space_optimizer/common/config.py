@@ -610,6 +610,18 @@ for high-confidence auto-removal."""
 # (``-- BEGIN/END GSO_QUALITY_V1:<key>``) are swept out on any apply.
 #
 # ``GSO_ASSERT_ROW_CANONICAL`` is a dev-only assertion; defaults to off.
+#
+# ``GSO_INVARIANT_STRICT`` (Plan N4 / Cycle 8) controls the lever
+# loop's invariant warn-and-degrade policy. Defaults to **off** on
+# the production deploy: the five sites that historically raised
+# ``AssertionError`` (quarantine attribution drift, regression-debt
+# partition completeness, cap conservation, soft-cluster currency,
+# non-canonical judge row) now emit ``GSO_INVARIANT_VIOLATION_V1``
+# stdout markers + typed decision records and degrade gracefully.
+# CI and replay tooling that sets ``GSO_DECISION_EMITTER_STRICT=1``
+# automatically inherits strict invariant behaviour via fallback.
+# Operators who want strict-debug locally set
+# ``GSO_INVARIANT_STRICT=1``.
 
 _SCORING_V2_ALLOWED = ("on", "shadow", "off")
 
