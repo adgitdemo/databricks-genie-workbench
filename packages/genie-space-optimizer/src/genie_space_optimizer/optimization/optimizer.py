@@ -13315,6 +13315,40 @@ def _resolve_source_cluster_for_ag(
     return None
 
 
+def _prune_doa_fingerprints(
+    proposals: list[dict],
+    *,
+    buffer: Any,  # DoaFingerprintBuffer | None
+    ag_id: str,
+) -> list[dict]:
+    """Cycle 9 W4 — drop any candidate whose retry signature was
+    already captured as DOA in this run.
+
+    End-of-function prune (rather than per-append filtering) is
+    dramatically simpler and behaviourally equivalent because no
+    caller reads the partial proposal list mid-function. No-op when
+    ``buffer is None`` or when the
+    ``GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL`` flag is off, so the
+    flag-default-off path is byte-stable with the legacy code.
+    """
+    from genie_space_optimizer.common.config import (
+        doa_fingerprint_block_reproposal_enabled,
+    )
+    if buffer is None or not doa_fingerprint_block_reproposal_enabled():
+        return proposals
+    try:
+        return [
+            p for p in (proposals or [])
+            if not buffer.contains(ag_id=str(ag_id), patch=p)
+        ]
+    except Exception:
+        logger.debug(
+            "Cycle 9 W4: DOA fingerprint prune failed (non-fatal)",
+            exc_info=True,
+        )
+        return proposals
+
+
 def generate_proposals_from_strategy(
     strategy: dict,
     action_group: dict,
@@ -13328,6 +13362,7 @@ def generate_proposals_from_strategy(
     gold_schema: str = "",
     warehouse_id: str = "",
     benchmarks: list[dict] | None = None,
+    doa_fingerprint_buffer: Any = None,
 ) -> list[dict]:
     """Generate proposals for a single lever guided by the holistic strategy.
 
@@ -14957,7 +14992,11 @@ def generate_proposals_from_strategy(
             ag_id, target_lever, len(proposals),
         )
 
-    return proposals
+    return _prune_doa_fingerprints(
+        proposals,
+        buffer=doa_fingerprint_buffer,
+        ag_id=str(ag_id),
+    )
 
 
 def generate_metadata_proposals(

@@ -15668,6 +15668,11 @@ def _run_lever_loop(
                 gold_schema=schema,
                 warehouse_id=resolve_warehouse_id(""),
                 benchmarks=benchmarks,
+                # Cycle 9 W4 — pass the per-run DOA fingerprint buffer so
+                # the strategist's end-of-function prune drops candidates
+                # whose retry signature was already captured as
+                # target_still_hard in this run.
+                doa_fingerprint_buffer=_doa_fingerprint_buffer,
             )
             all_proposals.extend(lever_proposals)
 

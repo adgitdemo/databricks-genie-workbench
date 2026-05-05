@@ -541,3 +541,110 @@ def test_w4_capture_no_op_when_buffer_is_none(
         )],
     )
     assert n == 0
+
+
+# ── W4 wiring — strategist-preprocessing prune helper ───────────────
+
+
+def test_w4_prune_drops_buffered_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import optimizer as _optimizer
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    blocked = _w4_patch(
+        ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+    )
+    buf.add(ag_id="ag_1", patch=blocked)
+    out = _optimizer._prune_doa_fingerprints(
+        [blocked], buffer=buf, ag_id="ag_1",
+    )
+    assert out == []
+
+
+def test_w4_prune_keeps_unmatched_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import optimizer as _optimizer
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    blocked = _w4_patch(
+        ptype="add_sql_snippet_filter", table="t", column="c1", body="x",
+    )
+    fresh = _w4_patch(
+        ptype="add_sql_snippet_filter", table="t", column="c2", body="x",
+    )
+    buf.add(ag_id="ag_1", patch=blocked)
+    out = _optimizer._prune_doa_fingerprints(
+        [fresh], buffer=buf, ag_id="ag_1",
+    )
+    assert len(out) == 1
+    assert out[0] is fresh
+
+
+def test_w4_prune_passes_through_when_buffer_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import optimizer as _optimizer
+
+    candidates = [
+        _w4_patch(
+            ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+        ),
+    ]
+    out = _optimizer._prune_doa_fingerprints(
+        candidates, buffer=None, ag_id="ag_1",
+    )
+    assert out == candidates
+
+
+def test_w4_prune_passes_through_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", "0")
+    from genie_space_optimizer.optimization import optimizer as _optimizer
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    blocked = _w4_patch(
+        ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+    )
+    buf.add(ag_id="ag_1", patch=blocked)
+    # Flag off — even though the signature is buffered, prune is a no-op.
+    out = _optimizer._prune_doa_fingerprints(
+        [blocked], buffer=buf, ag_id="ag_1",
+    )
+    assert len(out) == 1
+
+
+def test_w4_prune_buffer_per_ag_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffered signatures for ag_1 must NOT prune candidates for ag_2."""
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import optimizer as _optimizer
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    patch = _w4_patch(
+        ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+    )
+    buf.add(ag_id="ag_1", patch=patch)
+    # Same patch shape, but the prune is keyed against ag_2 — should NOT drop.
+    out = _optimizer._prune_doa_fingerprints(
+        [patch], buffer=buf, ag_id="ag_2",
+    )
+    assert len(out) == 1
