@@ -730,7 +730,7 @@ wheels = [
 
 [[package]]
 name = "databricks-connect"
-version = "18.1.2"
+version = "18.0.3"
 source = { registry = "https://pypi-proxy.dev.databricks.com/simple/" }
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -751,7 +751,7 @@ dependencies = [
     { name = "zstandard", marker = "python_full_version >= '3.12'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/ab/0f51fda312fe10737e67edf18c1fb000a95e778ff19e59530aeb54b0f30c/databricks_connect-18.1.2-py2.py3-none-any.whl", hash = "sha256:b9133a113d111acd828d5fd8aad588a9f355b431d6926dbaeb3e28f4757cc8bb", size = 2842760, upload-time = "2026-03-19T08:17:26.274Z" },
+    { url = "https://files.pythonhosted.org/packages/49/8c/f732d4ac8b40842c661862cd297a18464edb0b212726e69965e6e00d046a/databricks_connect-18.0.3-py2.py3-none-any.whl", hash = "sha256:5939c3fae3418a1c0bb37657b7fd411137c9a56d669d1fc8f2a98114f10b15f4", size = 2767690, upload-time = "2026-02-12T15:11:10.213Z" },
 ]
 
 [[package]]
@@ -1103,7 +1103,7 @@ dependencies = [
 [package.optional-dependencies]
 spark = [
     { name = "databricks-connect", version = "16.1.7", source = { registry = "https://pypi-proxy.dev.databricks.com/simple/" }, marker = "python_full_version < '3.12'" },
-    { name = "databricks-connect", version = "18.1.2", source = { registry = "https://pypi-proxy.dev.databricks.com/simple/" }, marker = "python_full_version >= '3.12'" },
+    { name = "databricks-connect", version = "18.0.3", source = { registry = "https://pypi-proxy.dev.databricks.com/simple/" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.dev-dependencies]
@@ -1115,28 +1115,29 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "databricks-connect", marker = "extra == 'spark'", specifier = ">=15.0.0" },
+    { name = "databricks-connect", marker = "python_full_version >= '3.12' and extra == 'spark'", specifier = "==18.0.3" },
+    { name = "databricks-connect", marker = "python_full_version < '3.12' and extra == 'spark'", specifier = "==16.1.7" },
     { name = "databricks-sdk", specifier = "==0.102.0" },
-    { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "fastapi", specifier = "==0.135.2" },
     { name = "litellm", specifier = "==1.82.6" },
-    { name = "mlflow", extras = ["databricks"], specifier = ">=3.11.0,<4.0.0" },
+    { name = "mlflow", extras = ["databricks"], specifier = "==3.11.1" },
     { name = "openai", specifier = "==2.30.0" },
-    { name = "pandas", specifier = ">=2.0" },
-    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2.11" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pydantic-settings", specifier = ">=2.11.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "sqlglot", specifier = ">=29.0.1" },
-    { name = "sqlmodel", specifier = ">=0.0.27" },
-    { name = "uvicorn", specifier = ">=0.34.0" },
+    { name = "pandas", specifier = "==2.3.3" },
+    { name = "psycopg", extras = ["binary", "pool"], specifier = "==3.3.3" },
+    { name = "pydantic", specifier = "==2.12.5" },
+    { name = "pydantic-settings", specifier = "==2.13.1" },
+    { name = "pyyaml", specifier = "==6.0.3" },
+    { name = "sqlglot", specifier = "==30.0.3" },
+    { name = "sqlmodel", specifier = "==0.0.37" },
+    { name = "uvicorn", specifier = "==0.42.0" },
 ]
 provides-extras = ["spark"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.27.0" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "ty", specifier = ">=0.0.12" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "pytest", specifier = "==9.0.2" },
+    { name = "ty", specifier = "==0.0.25" },
 ]
 
 [[package]]

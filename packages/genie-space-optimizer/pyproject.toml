@@ -4,29 +4,35 @@ dynamic = ["version"]
 description = "Add your description here"
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.115.0",
-    "pydantic-settings>=2.11.0",
-    "uvicorn>=0.34.0",
+    "fastapi==0.135.2",
+    "pydantic-settings==2.13.1",
+    "uvicorn==0.42.0",
     "databricks-sdk==0.102.0",
-    "mlflow[databricks]>=3.11.0,<4.0.0",
+    "mlflow[databricks]==3.11.1",
     "openai==2.30.0",
     "litellm==1.82.6",
-    "pyyaml>=6.0",
-    "pydantic>=2.0",
-    "pandas>=2.0",
-    "sqlmodel>=0.0.27",
-    "psycopg[binary,pool]>=3.2.11",
-    "sqlglot>=29.0.1",
+    "pyyaml==6.0.3",
+    "pydantic==2.12.5",
+    "pandas==2.3.3",
+    "sqlmodel==0.0.37",
+    "psycopg[binary,pool]==3.3.3",
+    "sqlglot==30.0.3",
 ]
 
 [project.optional-dependencies]
-spark = ["databricks-connect>=15.0.0"]
+# databricks-connect ships separate wheels for Python <3.12 and >=3.12;
+# both are pinned exactly via PEP 508 environment markers so the
+# resolution stays exact under any supported interpreter.
+spark = [
+    "databricks-connect==16.1.7; python_version < '3.12'",
+    "databricks-connect==18.0.3; python_version >= '3.12'",
+]
 
 [dependency-groups]
 dev = [
-    "ty>=0.0.12",
-    "pytest>=8.0",
-    "httpx>=0.27.0",
+    "ty==0.0.25",
+    "pytest==9.0.2",
+    "httpx==0.28.1",
 ]
 
 [tool.pytest.ini_options]
