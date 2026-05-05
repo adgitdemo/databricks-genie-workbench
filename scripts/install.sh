@@ -295,20 +295,49 @@ _warn "You must have CREATE SCHEMA permission on the selected catalog."
 echo ""
 
 _info "Discovering available catalogs..."
+
+# Try to detect the workspace's default catalog and the user's home catalog
+# hint so we can surface likely choices at the top of the list.
+HOME_HINT=$(databricks current-user me --profile "$PROFILE" -o json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    u = json.load(sys.stdin).get('userName', '')
+    prefix = u.split('@', 1)[0] if u else ''
+    print(prefix.replace('.', '_'))
+except: pass
+" 2>/dev/null || true)
+
+DEFAULT_CATALOG=$(databricks settings default-namespace get --profile "$PROFILE" -o json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print((d.get('namespace') or {}).get('value', '') if isinstance(d, dict) else '')
+except: pass
+" 2>/dev/null || true)
+
 CATALOG_NAMES=()
 while IFS= read -r name; do
     [ -n "$name" ] && CATALOG_NAMES+=("$name")
 done < <(
-    databricks catalogs list --profile "$PROFILE" -o json 2>/dev/null \
-    | python3 -c "
-import sys, json
+    databricks catalogs list --profile "$PROFILE" --limit 0 -o json 2>/dev/null \
+    | HOME_HINT="$HOME_HINT" DEFAULT_CATALOG="$DEFAULT_CATALOG" python3 -c "
+import sys, json, os
 try:
     data = json.load(sys.stdin)
     cats = data if isinstance(data, list) else data.get('catalogs', [])
-    for c in cats[:30]:
-        name = c.get('name','') if isinstance(c, dict) else str(c)
-        if name:
-            print(name)
+    names = sorted({(c.get('name','') if isinstance(c, dict) else str(c)) for c in cats}, key=str.lower)
+    names = [n for n in names if n]
+    head = []
+    home = os.environ.get('HOME_HINT', '')
+    default = os.environ.get('DEFAULT_CATALOG', '')
+    if default and default in names and default not in head:
+        names.remove(default); head.append(default)
+    if home and home in names and home not in head:
+        names.remove(home); head.append(home)
+    for n in head + names:
+        print(n)
 except: pass
 " 2>/dev/null
 )
@@ -317,8 +346,61 @@ if [ ${#CATALOG_NAMES[@]} -eq 0 ]; then
     _warn "Could not list catalogs. Enter a catalog name manually."
     _prompt CATALOG "Catalog name" ""
 else
-    _info "Available catalogs:"
-    _select_from CATALOG "Select the catalog to use" "${CATALOG_NAMES[@]}"
+    TOTAL=${#CATALOG_NAMES[@]}
+    _info "Available catalogs (${TOTAL}):"
+
+    # Build display labels with markers for home / workspace default
+    CATALOG_LABELS=()
+    for name in "${CATALOG_NAMES[@]}"; do
+        label="$name"
+        if [ -n "$DEFAULT_CATALOG" ] && [ "$name" = "$DEFAULT_CATALOG" ]; then
+            label="$name  (workspace default)"
+        elif [ -n "$HOME_HINT" ] && [ "$name" = "$HOME_HINT" ]; then
+            label="$name  (home)"
+        fi
+        CATALOG_LABELS+=("$label")
+    done
+
+    PAGE_SIZE=20
+    PAGE=0
+    MAX_PAGE=$(( (TOTAL - 1) / PAGE_SIZE ))
+    CATALOG=""
+    while [ -z "$CATALOG" ]; do
+        START=$(( PAGE * PAGE_SIZE ))
+        END=$(( START + PAGE_SIZE ))
+        [ $END -gt $TOTAL ] && END=$TOTAL
+        echo ""
+        echo "  Page $((PAGE + 1)) of $((MAX_PAGE + 1))"
+        for ((i = START; i < END; i++)); do
+            printf "    %3d) %s\n" "$((i + 1))" "${CATALOG_LABELS[$i]}"
+        done
+        echo ""
+        nav_hint="number"
+        [ $PAGE -lt $MAX_PAGE ] && nav_hint="$nav_hint, n=next"
+        [ $PAGE -gt 0 ] && nav_hint="$nav_hint, p=prev"
+        nav_hint="$nav_hint, m=manual"
+        echo -en "  Select catalog [$nav_hint]: "
+        read -r choice
+        case "$choice" in
+            n|N)
+                if [ $PAGE -lt $MAX_PAGE ]; then PAGE=$((PAGE + 1)); else echo "  Already on the last page."; fi
+                ;;
+            p|P)
+                if [ $PAGE -gt 0 ]; then PAGE=$((PAGE - 1)); else echo "  Already on the first page."; fi
+                ;;
+            m|M)
+                _prompt CATALOG "Catalog name" ""
+                break
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$TOTAL" ]; then
+                    CATALOG="${CATALOG_NAMES[$((choice - 1))]}"
+                else
+                    echo "  Enter a number between 1 and ${TOTAL}, or n/p/m."
+                fi
+                ;;
+        esac
+    done
 fi
 
 if [ -z "$CATALOG" ]; then
