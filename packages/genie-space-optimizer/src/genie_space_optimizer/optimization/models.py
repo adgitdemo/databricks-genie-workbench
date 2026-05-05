@@ -430,7 +430,7 @@ def _register_uc_version(
                 signature=signature,
                 input_example=input_example,
                 params=params or {},
-                pip_requirements=["mlflow[databricks]>=3.10.1", "pandas"],
+                pip_requirements=["mlflow[databricks]>=3.11.0", "pandas"],
             )
 
         logger.info(

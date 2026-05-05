@@ -8,7 +8,7 @@ dependencies = [
     "pydantic-settings>=2.11.0",
     "uvicorn>=0.34.0",
     "databricks-sdk==0.102.0",
-    "mlflow[databricks]==3.10.1",
+    "mlflow[databricks]>=3.11.0,<4.0.0",
     "openai==2.30.0",
     "litellm==1.82.6",
     "pyyaml>=6.0",
