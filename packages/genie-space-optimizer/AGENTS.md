@@ -70,22 +70,35 @@ Prompt Registry probe used by both `/permissions` (read) and preflight
 
 ## Dependency Security Policy
 
-All dependencies are pinned to exact versions. Lock files must be committed.
+All direct dependencies are pinned to exact versions. Lock files must be
+committed. Both root and GSO pyproject files share a hard rule: `mlflow`
+must resolve to the same version across the workspace (today: `3.11.1`).
+
+GSO is a uv workspace member; the authoritative lock is the root
+`uv.lock`. There is no separate `packages/genie-space-optimizer/uv.lock`.
 
 **To update a Python dependency:**
 
 ```bash
+# 1. Bump the exact version in packages/genie-space-optimizer/pyproject.toml
+#    (or the root pyproject.toml — workspace resolution is shared).
+# 2. Refresh the workspace lock.
 uv lock --upgrade-package <package-name>
-git add uv.lock
+git add packages/genie-space-optimizer/pyproject.toml uv.lock
 ```
 
-**To update a Bun dependency:**
+**To update an npm dependency:**
 
 ```bash
-npm install <package>@<version> --save-exact
-# package.json must record the exact version (no ^ or ~)
+cd packages/genie-space-optimizer
+npm install <package>@<exact-version> --save-exact
 git add package.json package-lock.json
 ```
+
+**`npm ci` must succeed without `--legacy-peer-deps`.** When a peer-dep
+conflict surfaces, fix the manifest by bumping the runtime-pinned
+package to a version inside the peer-dep range — do not reach for the
+escape-hatch flag.
 
 ## Testing
 
