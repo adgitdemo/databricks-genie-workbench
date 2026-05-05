@@ -1683,6 +1683,67 @@ def _emit_idempotency_key(record: dict) -> tuple:
     )
 
 
+def _run_narrow_l6_replacement_loop(
+    *,
+    blast_dropped: list[dict],
+    blast_target_qids: tuple[str, ...],
+    ag_root_cause: str,
+) -> list[dict]:
+    """Cycle 9 W3 — for each L6 patch dropped at HCRF
+    (``high_collateral_risk_flagged``), build a narrow-scope variant
+    and re-test it via ``patch_blast_radius_is_safe``. Returns the
+    list of survivors so the harness caller can extend ``_blast_kept``.
+
+    Gated by ``GSO_L6_NARROW_REPLACEMENT_ON_HCRF`` (default-on); the
+    flag-off path returns ``[]`` immediately so replay byte-stability
+    holds against the airline canonical fixture which predates this
+    behaviour.
+
+    Closes the variance source observed in run 1099b152 where three
+    iterations dropped the same ``add_sql_snippet_*`` patch with no
+    narrow-scope retry.
+    """
+    from genie_space_optimizer.common.config import (
+        l6_narrow_replacement_on_hcrf_enabled,
+    )
+    if not l6_narrow_replacement_on_hcrf_enabled():
+        return []
+    from genie_space_optimizer.optimization.cluster_driven_synthesis import (
+        build_narrow_l6_replacement,
+    )
+    from genie_space_optimizer.optimization.proposal_grounding import (
+        patch_blast_radius_is_safe,
+    )
+    survivors: list[dict] = []
+    for drop in blast_dropped or ():
+        if str((drop or {}).get("reason") or "") != "high_collateral_risk_flagged":
+            continue
+        original = (drop or {}).get("original_patch") or {}
+        narrow = build_narrow_l6_replacement(
+            original_patch=original,
+            ag_target_qids=tuple(blast_target_qids or ()),
+            root_cause=str(ag_root_cause or ""),
+        )
+        if narrow is None:
+            continue
+        try:
+            retest = patch_blast_radius_is_safe(
+                narrow,
+                ag_target_qids=tuple(blast_target_qids or ()),
+                max_outside_target=0,
+            )
+        except Exception:
+            logger.debug(
+                "Cycle 9 W3: narrow-replacement re-gate raised "
+                "(non-fatal); skipping candidate",
+                exc_info=True,
+            )
+            continue
+        if retest.get("safe") is True:
+            survivors.append(narrow)
+    return survivors
+
+
 def _emit_diagnostic_ag_trunk_events(
     *,
     journey_emit,
@@ -17374,6 +17435,10 @@ def _run_lever_loop(
                             or _candidate.get("table")
                             or ""
                         ),
+                        # Cycle 9 W3: stash the source patch so the
+                        # narrow-replacement loop has the full dict
+                        # (where_predicate, qid_predicate_column, ...).
+                        "original_patch": _candidate,
                     })
                     continue
                 # Task 2A — second classifier for broad instruction rewrites
@@ -17401,9 +17466,21 @@ def _run_lever_loop(
                             or _candidate.get("table")
                             or ""
                         ),
+                        # Cycle 9 W3: see comment above; same rationale.
+                        "original_patch": _candidate,
                     })
                     continue
                 _blast_kept.append(_candidate)
+            # Cycle 9 W3: synthesize narrow-scope variants for any L6
+            # patches dropped at HCRF and re-test through the same
+            # gate; appending survivors back to _blast_kept.
+            _narrow_kept = _run_narrow_l6_replacement_loop(
+                blast_dropped=_blast_dropped,
+                blast_target_qids=tuple(_blast_target_qids),
+                ag_root_cause=str(ag.get("root_cause") or ""),
+            )
+            if _narrow_kept:
+                _blast_kept = list(_blast_kept) + _narrow_kept
             if _blast_dropped:
                 print(
                     _section(f"[{ag_id}] BLAST-RADIUS GATE", "-") + "\n"
@@ -17585,7 +17662,20 @@ def _run_lever_loop(
                         "passing_dependents_outside_target": _decision.get(
                             "passing_dependents_outside_target", []
                         ),
+                        # Cycle 9 W3: stash the source patch so the
+                        # narrow-replacement loop has the full dict.
+                        "original_patch": _candidate,
                     })
+            # Cycle 9 W3: same narrow-replacement pass as Site A but
+            # for the import-fallback path (when
+            # ``instruction_patch_scope_is_safe`` import fails).
+            _narrow_kept = _run_narrow_l6_replacement_loop(
+                blast_dropped=_blast_dropped,
+                blast_target_qids=tuple(_blast_target_qids),
+                ag_root_cause=str(ag.get("root_cause") or ""),
+            )
+            if _narrow_kept:
+                _blast_kept = list(_blast_kept) + _narrow_kept
             if _blast_dropped:
                 logger.warning(
                     "AG %s blast-radius gate dropped %d/%d patches: %s",

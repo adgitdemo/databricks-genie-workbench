@@ -287,3 +287,111 @@ def test_w5_flag_off_preserves_legacy_double_prefix(
     )
     out = _resolve_lever_loop_exit_reason(decision, divergence_label=None)
     assert out == "plateau_plateau_no_open_failures"  # legacy bug pinned
+
+
+# ── W3 wiring — narrow-replacement loop helper at blast-radius sites ─
+
+
+def _hcrf_drop(patch: dict) -> dict:
+    """Build a synthetic _blast_dropped entry as the harness builds them."""
+    return {
+        "proposal_id": str(patch.get("proposal_id") or "?"),
+        "patch_type": str(patch.get("patch_type") or "?"),
+        "reason": "high_collateral_risk_flagged",
+        "passing_dependents_outside_target": [],
+        "target": "",
+        "original_patch": patch,
+    }
+
+
+def _other_drop(patch: dict) -> dict:
+    drop = _hcrf_drop(patch)
+    drop["reason"] = "non_semantic_collateral_warning"
+    return drop
+
+
+def test_w3_wiring_appends_narrow_replacement_when_l6_hcrf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_L6_NARROW_REPLACEMENT_ON_HCRF", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+    from genie_space_optimizer.optimization import proposal_grounding as _pg
+
+    monkeypatch.setattr(
+        _pg, "patch_blast_radius_is_safe",
+        lambda *a, **k: {"safe": True, "reason": "narrow_scope_safe"},
+    )
+    patch = {
+        "proposal_id": "P_L6_001",
+        "patch_type": "add_sql_snippet_filter",
+        "target_table": "tkt_doc",
+        "where_predicate": "outbound_route_total_segments = 1",
+        "qid_predicate_column": "query_id",
+    }
+    survivors = _harness._run_narrow_l6_replacement_loop(
+        blast_dropped=[_hcrf_drop(patch)],
+        blast_target_qids=("gs_009",),
+        ag_root_cause="missing_filter",
+    )
+    assert len(survivors) == 1
+    assert survivors[0]["patch_type"] == "add_sql_snippet_filter"
+    assert "gs_009" in survivors[0]["where_predicate"]
+
+
+def test_w3_wiring_skips_non_l6_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_L6_NARROW_REPLACEMENT_ON_HCRF", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+
+    patch = {
+        "proposal_id": "P_DESC_001",
+        "patch_type": "update_column_description",
+        "where_predicate": "x = 1",
+    }
+    survivors = _harness._run_narrow_l6_replacement_loop(
+        blast_dropped=[_hcrf_drop(patch)],
+        blast_target_qids=("gs_009",),
+        ag_root_cause="missing_filter",
+    )
+    assert survivors == []
+
+
+def test_w3_wiring_skips_non_hcrf_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_L6_NARROW_REPLACEMENT_ON_HCRF", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+
+    patch = {
+        "proposal_id": "P_L6_001",
+        "patch_type": "add_sql_snippet_filter",
+        "where_predicate": "x = 1",
+        "qid_predicate_column": "query_id",
+    }
+    survivors = _harness._run_narrow_l6_replacement_loop(
+        blast_dropped=[_other_drop(patch)],
+        blast_target_qids=("gs_009",),
+        ag_root_cause="missing_filter",
+    )
+    assert survivors == []
+
+
+def test_w3_wiring_returns_empty_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSO_L6_NARROW_REPLACEMENT_ON_HCRF", "0")
+    from genie_space_optimizer.optimization import harness as _harness
+
+    patch = {
+        "proposal_id": "P_L6_001",
+        "patch_type": "add_sql_snippet_filter",
+        "where_predicate": "x = 1",
+        "qid_predicate_column": "query_id",
+    }
+    survivors = _harness._run_narrow_l6_replacement_loop(
+        blast_dropped=[_hcrf_drop(patch)],
+        blast_target_qids=("gs_009",),
+        ag_root_cause="missing_filter",
+    )
+    assert survivors == []
