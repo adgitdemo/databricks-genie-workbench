@@ -1819,6 +1819,99 @@ def _emit_diagnostic_ag_trunk_events(
             )
 
 
+def _emit_force_l6_outcome(
+    *,
+    outcome: str,  # one of "declined" | "raised"
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    target_qids,
+    exception_repr: str,
+    iter_inputs: dict,
+) -> None:
+    """Cycle 10 W3.4 — record typed outcomes for the Cycle 7 N3
+    force-Lever-6 path. Emits two records when ``outcome="declined"``
+    (the typed L6 record + the existing proposal_generation_empty
+    record) so dashboards aggregating Typed-Proposal-Failure-Outcomes
+    pick the event up. Emits one record when ``outcome="raised"``.
+
+    Default-on; flag-off path is byte-stable (no records, no markers).
+    """
+    from genie_space_optimizer.common.config import (
+        lever6_force_typed_outcomes_enabled,
+    )
+    if not lever6_force_typed_outcomes_enabled():
+        return
+    try:
+        from genie_space_optimizer.optimization.decision_emitters import (
+            lever6_force_llm_declined_record,
+            lever6_force_raised_record,
+            proposal_generation_empty_record,
+        )
+        from genie_space_optimizer.common.mlflow_markers import (
+            lever6_force_llm_declined_marker,
+            lever6_force_raised_marker,
+        )
+    except Exception:
+        logger.debug(
+            "Cycle 10 W3.4: emitter import failed (non-fatal)",
+            exc_info=True,
+        )
+        return
+    qids = tuple(str(q) for q in (target_qids or ()) if str(q))
+    try:
+        if outcome == "declined":
+            rec_a = lever6_force_llm_declined_record(
+                run_id=run_id, iteration=iteration, ag_id=ag_id,
+                cluster_id=cluster_id, root_cause=root_cause,
+                target_qids=qids,
+            )
+            rec_b = proposal_generation_empty_record(
+                run_id=run_id, iteration=iteration, ag_id=ag_id,
+                cluster_id=cluster_id, root_cause=root_cause,
+                target_qids=qids,
+            )
+            iter_inputs.setdefault("decision_records", []).append(rec_a.to_dict())
+            iter_inputs.setdefault("decision_records", []).append(rec_b.to_dict())
+            try:
+                marker = lever6_force_llm_declined_marker(
+                    run_id=run_id, iteration=iteration, ag_id=ag_id,
+                    cluster_id=cluster_id, root_cause=root_cause,
+                )
+                iter_inputs.setdefault("markers", []).append(marker)
+            except Exception:
+                logger.debug(
+                    "Cycle 10 W3.4: declined marker emit failed (non-fatal)",
+                    exc_info=True,
+                )
+        elif outcome == "raised":
+            rec = lever6_force_raised_record(
+                run_id=run_id, iteration=iteration, ag_id=ag_id,
+                cluster_id=cluster_id, root_cause=root_cause,
+                exception_repr=exception_repr,
+            )
+            iter_inputs.setdefault("decision_records", []).append(rec.to_dict())
+            try:
+                marker = lever6_force_raised_marker(
+                    run_id=run_id, iteration=iteration, ag_id=ag_id,
+                    cluster_id=cluster_id, root_cause=root_cause,
+                    exception_repr=exception_repr,
+                )
+                iter_inputs.setdefault("markers", []).append(marker)
+            except Exception:
+                logger.debug(
+                    "Cycle 10 W3.4: raised marker emit failed (non-fatal)",
+                    exc_info=True,
+                )
+    except Exception:
+        logger.debug(
+            "Cycle 10 W3.4: force-L6 outcome emit failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 def _emit_rca_ungrounded_records_for_unfit_clusters(
     *,
     run_id: str,
@@ -16072,27 +16165,52 @@ def _run_lever_loop(
                         for q in (ag.get("affected_questions") or ())
                         if str(q)
                     )
-                _forced_l6 = _force_lever6_proposal_for_ag(
-                    run_id=str(run_id),
-                    iteration=int(iteration_counter),
-                    ag_id=str(ag_id),
-                    cluster=dict(_force_cluster),
-                    ag_target_qids=_force_target_qids,
-                    ag_proposals_so_far=list(all_proposals),
-                    metadata_snapshot=metadata_snapshot,
-                    decision_emit=lambda _rec: (
-                        _current_iter_inputs.setdefault(
-                            "decision_records", []
-                        ).append(_rec.to_dict())
-                    ),
-                    generate_lever6=_generate_lever6_proposal,
-                    w=w,
-                    spark=spark,
-                    catalog=catalog,
-                    gold_schema=schema,
-                    warehouse_id=resolve_warehouse_id(""),
-                    benchmarks=benchmarks,
-                )
+                # Cycle 10 W3.4 — narrow try/except around the inner
+                # call so we can attribute None vs raise outcomes to a
+                # typed decision record instead of the legacy DEBUG-
+                # swallow at the outer except.
+                _force_outcome = "ok"
+                _force_exception_repr = ""
+                _forced_l6 = None
+                try:
+                    _forced_l6 = _force_lever6_proposal_for_ag(
+                        run_id=str(run_id),
+                        iteration=int(iteration_counter),
+                        ag_id=str(ag_id),
+                        cluster=dict(_force_cluster),
+                        ag_target_qids=_force_target_qids,
+                        ag_proposals_so_far=list(all_proposals),
+                        metadata_snapshot=metadata_snapshot,
+                        decision_emit=lambda _rec: (
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_rec.to_dict())
+                        ),
+                        generate_lever6=_generate_lever6_proposal,
+                        w=w,
+                        spark=spark,
+                        catalog=catalog,
+                        gold_schema=schema,
+                        warehouse_id=resolve_warehouse_id(""),
+                        benchmarks=benchmarks,
+                    )
+                    if _forced_l6 is None:
+                        _force_outcome = "declined"
+                except Exception as _force_exc:
+                    _force_outcome = "raised"
+                    _force_exception_repr = repr(_force_exc)[:512]
+                    _phase_b_producer_exceptions["forced_lever6_n3"] = (
+                        _phase_b_producer_exceptions.get(
+                            "forced_lever6_n3", 0
+                        ) + 1
+                    )
+                    logger.debug(
+                        "Cycle 7 N3: forced Lever-6 emit raised (non-fatal)",
+                        exc_info=True,
+                    )
+                    if _phase_b_strict_mode():
+                        raise
+
                 if _forced_l6 is not None:
                     _forced_l6 = dict(_forced_l6)
                     _forced_l6["proposal_id"] = (
@@ -16132,6 +16250,24 @@ def _run_lever_loop(
                         _force_cluster.get("cluster_id", "?"),
                         _force_cluster.get("root_cause", "?"),
                     )
+                else:
+                    # Cycle 10 W3.4 — typed outcome instead of silent
+                    # absorption when force-L6 declined or raised.
+                    _emit_force_l6_outcome(
+                        outcome=_force_outcome,
+                        run_id=str(run_id),
+                        iteration=int(iteration_counter),
+                        ag_id=str(ag_id),
+                        cluster_id=str(
+                            _force_cluster.get("cluster_id", "?")
+                        ),
+                        root_cause=str(
+                            _force_cluster.get("root_cause", "?")
+                        ),
+                        target_qids=_force_target_qids,
+                        exception_repr=_force_exception_repr,
+                        iter_inputs=_current_iter_inputs,
+                    )
         except Exception:
             _phase_b_producer_exceptions["forced_lever6_n3"] = (
                 _phase_b_producer_exceptions.get(
@@ -16139,7 +16275,7 @@ def _run_lever_loop(
                 ) + 1
             )
             logger.debug(
-                "Cycle 7 N3: forced Lever-6 emit failed (non-fatal)",
+                "Cycle 7 N3: forced Lever-6 outer scope failed (non-fatal)",
                 exc_info=True,
             )
             if _phase_b_strict_mode():
