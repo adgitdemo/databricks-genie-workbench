@@ -640,32 +640,61 @@ section.hero {
 .artifact-row .desc { color: var(--text-mute); font-family: var(--font-sans); font-size: 0.8rem; }
 
 /* ============================================================
-   FUNNEL
+   FUNNEL — interactive (canvas left, detail panel right)
    ============================================================ */
+.funnel-stage {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
+  gap: var(--gap-6);
+  align-items: start;
+}
+@media (max-width: 980px) {
+  .funnel-stage { grid-template-columns: 1fr; }
+}
+.funnel-canvas { min-width: 0; }
 .funnel {
   display: flex; flex-direction: column;
   align-items: stretch;
-  max-width: 720px; margin: 0 auto;
+  max-width: 680px;
+  margin: 0;
 }
 .funnel-row {
-  margin: 0 auto;
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  text-align: center;
+  margin: 0 auto var(--gap-2);
   padding: var(--gap-3) var(--gap-4);
   border: 1px solid var(--gate);
   background: var(--gate-glow);
-  border-radius: var(--r-md);
-  font-family: var(--font-mono);
-  font-size: 0.85rem;
   color: var(--gate);
-  text-align: center;
-  margin-bottom: var(--gap-2);
+  border-radius: var(--r-md);
   position: relative;
+  cursor: pointer;
+  transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+.funnel-row:hover {
+  transform: translateY(-1px);
+  border-color: var(--evidence);
+  box-shadow: 0 4px 18px -8px rgba(255, 100, 200, 0.45);
+}
+.funnel-row:focus-visible {
+  outline: 2px solid var(--evidence);
+  outline-offset: 3px;
+}
+.funnel-row.is-active {
+  border-color: var(--evidence);
+  color: var(--evidence);
+  box-shadow: 0 0 0 1px var(--evidence) inset, 0 6px 22px -10px rgba(255, 100, 200, 0.55);
 }
 .funnel-row .rejected {
-  position: absolute;
-  right: -120px;
-  top: 50%; transform: translateY(-50%);
-  font-size: 0.7rem; color: var(--text-mute);
+  display: block;
+  margin-top: 4px;
+  font-size: 0.68rem;
+  color: var(--text-mute);
   font-family: var(--font-mono);
+  pointer-events: none;
+  letter-spacing: 0.02em;
 }
 .funnel-row.r1 { width: 100%; }
 .funnel-row.r2 { width: 92%; }
@@ -683,7 +712,12 @@ section.hero {
   border-radius: var(--r-md);
   text-align: center;
   font-family: var(--font-mono); font-size: 0.85rem;
+  cursor: pointer;
+  transition: transform 140ms ease, box-shadow 140ms ease;
 }
+.funnel-survivors:hover { transform: translateY(-1px); box-shadow: 0 4px 18px -8px rgba(120, 200, 255, 0.45); }
+.funnel-survivors:focus-visible { outline: 2px solid var(--evidence); outline-offset: 3px; }
+.funnel-survivors.is-active { box-shadow: 0 0 0 1px var(--evidence) inset, 0 6px 22px -10px rgba(120, 200, 255, 0.55); }
 .funnel-outcomes {
   display: flex; gap: var(--gap-4); justify-content: center;
   margin-top: var(--gap-4);
@@ -694,9 +728,139 @@ section.hero {
   font-family: var(--font-mono); font-size: 0.85rem;
   font-weight: 500;
   display: flex; align-items: center; gap: var(--gap-2);
+  cursor: pointer;
+  transition: transform 140ms ease, box-shadow 140ms ease;
 }
+.funnel-outcomes .outcome:hover { transform: translateY(-1px); }
+.funnel-outcomes .outcome:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
 .outcome.accept { background: var(--accept-glow); color: var(--accept); border: 1px solid var(--accept); }
+.outcome.accept.is-active { box-shadow: 0 0 0 1px var(--accept) inset, 0 6px 22px -10px rgba(80, 220, 150, 0.55); }
 .outcome.reject { background: var(--rose-glow); color: var(--rose); border: 1px solid var(--rose); }
+.outcome.reject.is-active { box-shadow: 0 0 0 1px var(--rose) inset, 0 6px 22px -10px rgba(255, 100, 120, 0.55); }
+
+/* Strip default button styles */
+button.funnel-row, button.funnel-survivors, button.outcome {
+  appearance: none;
+  font: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Detail panel */
+.funnel-detail {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--gap-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-4);
+  position: sticky;
+  top: 88px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-2) transparent;
+}
+@media (max-width: 980px) {
+  .funnel-detail { position: static; max-height: none; }
+}
+.funnel-detail::-webkit-scrollbar { width: 8px; }
+.funnel-detail::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+.fd-head { display: flex; flex-direction: column; gap: 6px; }
+.fd-tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  align-self: flex-start;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.fd-tag-entry  { color: var(--evidence); }
+.fd-tag-gate   { color: var(--gate); }
+.fd-tag-eval   { color: var(--evidence); }
+.fd-tag-accept { color: var(--accept); }
+.fd-tag-reject { color: var(--rose); }
+.funnel-detail h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: var(--text);
+  line-height: 1.25;
+}
+.fd-subtitle {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+.fd-section { display: flex; flex-direction: column; gap: 6px; }
+.fd-h {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  margin: 0;
+  font-weight: 600;
+  display: flex; align-items: center; gap: 6px;
+}
+.fd-body {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: var(--text);
+}
+.fd-without .fd-h .fd-mark {
+  display: inline-flex;
+  width: 14px; height: 14px;
+  border-radius: 999px;
+  background: var(--rose-glow);
+  color: var(--rose);
+  align-items: center; justify-content: center;
+  font-size: 0.65rem; font-weight: 800;
+  border: 1px solid var(--rose);
+}
+.fd-traces { display: flex; flex-direction: column; gap: var(--gap-2); }
+.fd-trace {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: var(--gap-3);
+  align-items: start;
+  padding: var(--gap-2) var(--gap-3);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2, rgba(255,255,255,0.02));
+}
+.fd-verdict {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 700;
+  text-align: center;
+  padding: 3px 6px;
+  border-radius: 4px;
+  align-self: start;
+}
+.fd-trace.fd-pass { border-color: rgba(80, 220, 150, 0.35); }
+.fd-trace.fd-pass .fd-verdict { background: var(--accept-glow); color: var(--accept); border: 1px solid var(--accept); }
+.fd-trace.fd-fail { border-color: rgba(255, 100, 120, 0.35); }
+.fd-trace.fd-fail .fd-verdict { background: var(--rose-glow); color: var(--rose); border: 1px solid var(--rose); }
+.fd-trace.fd-note .fd-verdict { background: rgba(120, 200, 255, 0.12); color: var(--evidence); border: 1px solid var(--evidence); }
+.fd-trace p { margin: 0; font-size: 0.82rem; line-height: 1.5; color: var(--text); }
+.fd-trace .mono { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
+.fd-hint {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-mute);
+  letter-spacing: 0.04em;
+  border-top: 1px dashed var(--border);
+  padding-top: var(--gap-3);
+}
 
 /* ============================================================
    SIX LEVERS HEXAGON
@@ -1771,33 +1935,41 @@ footer.site-foot a:hover { color: var(--text); }
   <h2>Many Proposals Enter. Few Survive. That's The Point.</h2>
   <p class="lede">The optimizer is skeptical by design. Every patch must pass independent gates before it even reaches re-evaluation, and only patches whose post-arbiter accuracy beats the gain floor are kept.</p>
 
-  <div class="funnel" aria-label="Patch survival funnel">
-    <div class="funnel-row r1">Many proposals — ideas from RCA evidence
-      <span class="rejected">↓ candidates: ~30</span>
-    </div>
-    <div class="funnel-row r2">① Causal grounding — does an RCA row support this patch?</div>
-    <div class="funnel-row r3">② Blast radius — does it modify only scoped paths?</div>
-    <div class="funnel-row r4">③ Patch cap — is the change set under budget?</div>
-    <div class="funnel-row r5">④ Teaching safety — does any instruction conflict?</div>
-    <div class="funnel-row r6">⑤ Leakage firewall — is anything from held-out leaking?</div>
-    <div class="funnel-row r7">⑥ Structural &amp; ⑦ Regression gates — valid + non-breaking?</div>
+  <div class="funnel-stage">
+    <div class="funnel-canvas">
+      <div class="funnel" aria-label="Patch survival funnel">
+        <button type="button" class="funnel-row r1" data-gate="proposals" aria-pressed="false">Many proposals — ideas from RCA evidence
+          <span class="rejected">↓ candidates: ~30</span>
+        </button>
+        <button type="button" class="funnel-row r2" data-gate="g1_causal"      aria-pressed="false">① Causal grounding — does an RCA row support this patch?</button>
+        <button type="button" class="funnel-row r3" data-gate="g2_blast"       aria-pressed="false">② Blast radius — does it modify only scoped paths?</button>
+        <button type="button" class="funnel-row r4" data-gate="g3_cap"         aria-pressed="false">③ Patch cap — is the change set under budget?</button>
+        <button type="button" class="funnel-row r5" data-gate="g4_teaching"    aria-pressed="false">④ Teaching safety — does any instruction conflict?</button>
+        <button type="button" class="funnel-row r6" data-gate="g5_leakage"     aria-pressed="false">⑤ Leakage firewall — is anything from held-out leaking?</button>
+        <button type="button" class="funnel-row r7" data-gate="g67_structural" aria-pressed="false">⑥ Structural &amp; ⑦ Regression gates — valid + non-breaking?</button>
 
-    <div class="funnel-survivors">
-      ⇣ surviving patch set
-    </div>
-    <div class="funnel-survivors" style="border-color: var(--evidence); color: var(--evidence);">
-      Re-evaluation against the train benchmark
-    </div>
-    <div class="funnel-outcomes">
-      <div class="outcome accept">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-        Accepted &amp; snapshotted
+        <button type="button" class="funnel-survivors" data-gate="survivors" aria-pressed="false">
+          ⇣ surviving patch set
+        </button>
+        <button type="button" class="funnel-survivors" data-gate="reeval" aria-pressed="false">
+          Re-evaluation against the train benchmark
+        </button>
+        <div class="funnel-outcomes">
+          <button type="button" class="outcome accept" data-gate="accept" aria-pressed="false">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            Accepted &amp; snapshotted
+          </button>
+          <button type="button" class="outcome reject" data-gate="reject" aria-pressed="false">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Rolled back &amp; recorded
+          </button>
+        </div>
       </div>
-      <div class="outcome reject">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        Rolled back &amp; recorded
-      </div>
     </div>
+
+    <aside class="funnel-detail" id="funnelDetail" aria-live="polite">
+      <!-- populated by JS -->
+    </aside>
   </div>
 
   <div class="takeaway" style="margin-top: var(--gap-8);">
@@ -3322,6 +3494,209 @@ function setupStoryRail() {
 }
 
 // ============================================================
+// ============================================================
+// FUNNEL — interactive gate explainer
+// ============================================================
+const FUNNEL_GATES = {
+  proposals: {
+    tag: "Entry · Lever Loop", tagClass: "fd-tag-entry",
+    name: "Many proposals from RCA evidence",
+    subtitle: "Each cycle the optimizer drafts ~30 candidate patches — JSON diffs scoped to a specific lever.",
+    what: "After RCA clusters the latest failures, the strategist picks an action group and the proposer drafts a wide set of candidate patches. Each candidate is a small, scoped JSON diff over the Genie Space config.",
+    why: "Diversity is cheap and rejection is cheaper than a bad ship. Generating many bets — different wordings, different table choices, different SQL shapes — lets the gates pick the one that survives.",
+    without: "We'd ship the first ad-hoc fix that came to mind. No competition between alternatives, no comparison signal — and no way to learn which lever actually moves the score.",
+    examples: [
+      { v: "note", text: "<b>Cluster F-3</b> (4 failures on \"revenue\" definitions) → strategist chooses Lever 4 (instructions) → proposer drafts 30 wording variants for the <span class='mono'>definitions:</span> block." }
+    ],
+    file: "optimization/stages/proposals.py · generate"
+  },
+  g1_causal: {
+    tag: "Gate ① · Causal grounding", tagClass: "fd-tag-gate",
+    name: "Causal grounding",
+    subtitle: "Does at least one RCA row whose evidence demonstrably supports this patch?",
+    what: "Each proposal must cite an <span class='mono'>RcaEvidence</span> row whose failures plausibly motivate the change. The gate checks that the cited cluster's symptoms match what the patch is fixing.",
+    why: "Provenance keeps the optimizer honest. With it, every patch traces back to an observed failure. The reflection log can later show <i>which</i> failure each accepted patch was meant to fix.",
+    without: "The optimizer drifts toward whatever the model finds most fluent. Patches \"fix\" things that aren't broken; the score might still go up by luck, but you've spent your patch cap on noise.",
+    examples: [
+      { v: "pass", text: "Proposal adds a <span class='mono'>definitions:</span> block for \"revenue\" and cites RCA row F-3 (4 failures asking <i>\"what does revenue mean?\"</i>). Cluster matches → grounded." },
+      { v: "fail", text: "Proposal rewrites a <span class='mono'>topics:</span> instruction unrelated to any cluster in the RCA bundle → no row cites it → rejected at gate ①." }
+    ],
+    file: "optimization/stages/gates.py · gate_causal_grounding"
+  },
+  g2_blast: {
+    tag: "Gate ② · Blast radius", tagClass: "fd-tag-gate",
+    name: "Blast radius",
+    subtitle: "Does the proposal touch only paths inside the chosen lever's scope?",
+    what: "Every lever declares a list of allowed JSON paths it may modify. The gate diffs the patch and rejects any operation whose target path falls outside that allowlist.",
+    why: "One lever per iteration keeps causality clean. When the score moves, we know exactly which lever moved it — making postmortems and reflection useful instead of hand-wavy.",
+    without: "A single iteration touches 6 systems at once. The score goes up but you can't tell <i>why</i>, and a regression three cycles later is impossible to bisect.",
+    examples: [
+      { v: "pass", text: "Lever 4 patch is scoped to <span class='mono'>instructions.text_instructions[*]</span>. All ops target that path → in scope." },
+      { v: "fail", text: "Same Lever 4 patch also rewrites <span class='mono'>general_instructions.content</span> → out-of-scope op detected → rejected at gate ②." }
+    ],
+    file: "optimization/stages/gates.py · gate_blast_radius"
+  },
+  g3_cap: {
+    tag: "Gate ③ · Patch cap", tagClass: "fd-tag-gate",
+    name: "Patch cap",
+    subtitle: "Is the total change set under the per-iteration budget?",
+    what: "The gate counts the number of operations (adds, removes, replaces) in the patch and rejects anything that exceeds <span class='mono'>patch_op_cap</span> from the run config.",
+    why: "Bounded change = bounded risk. Smaller diffs are easier to review, easier to roll back, and produce cleaner reflection entries the next cycle's strategist can actually use.",
+    without: "A single iteration ships a 200-op rewrite. If anything regresses, you can't bisect what caused it — and the next cycle's RCA is polluted by every change at once.",
+    examples: [
+      { v: "pass", text: "Cap = 12. Proposal has 9 ops → ✓." },
+      { v: "fail", text: "Same cap. Proposal has 14 ops → split into two patches, or rejected if it can't be split coherently." }
+    ],
+    file: "optimization/stages/gates.py · gate_patch_cap"
+  },
+  g4_teaching: {
+    tag: "Gate ④ · Teaching safety", tagClass: "fd-tag-gate",
+    name: "Teaching safety",
+    subtitle: "Does any new instruction contradict or duplicate existing teaching?",
+    what: "The gate compares each new or edited instruction against the rest of the instruction set, looking for direct contradictions and near-duplicate phrasing using a normalized similarity check.",
+    why: "Conflicting instructions are worse than no instructions — the planner picks one at random per question and accuracy gets <i>noisier</i>. Duplicates waste the planner's context budget.",
+    without: "Two instructions saying opposite things sit next to each other. Some questions route correctly; some don't. The macro score might look stable while the per-cluster score quietly degrades.",
+    examples: [
+      { v: "pass", text: "Existing rule: <i>\"use revenue_v2 for FY≥2024.\"</i> New rule: <i>\"use revenue_v1 for FY<2024.\"</i> → complements, no conflict." },
+      { v: "fail", text: "Same existing rule. New rule: <i>\"always use revenue_v1.\"</i> → direct contradiction → rejected at gate ④." }
+    ],
+    file: "optimization/stages/gates.py · gate_teaching_safety"
+  },
+  g5_leakage: {
+    tag: "Gate ⑤ · Leakage firewall", tagClass: "fd-tag-gate",
+    name: "Leakage firewall",
+    subtitle: "Does any held-out content appear inside the proposed patch?",
+    what: "The gate fingerprints every held-out question (question text, normalized SQL, table+filter combos) and rejects patches that embed any of them — verbatim or paraphrased — into example queries, instructions, or definitions.",
+    why: "The held-out split is the optimizer's only honest grader. If we let it leak into the space, the held-out score becomes a memorization test and we lose the ability to detect overfitting.",
+    without: "Optimizer \"learns\" the held-out and ships a space that scores 0.95 on held-out and 0.40 in production. You'd ship it because the score said you should.",
+    examples: [
+      { v: "pass", text: "Proposal adds an <span class='mono'>example_query</span> derived from a <i>train</i> question. Fingerprint check against held-out → no match → safe." },
+      { v: "fail", text: "Proposal embeds an <span class='mono'>example_query</span> whose normalized SQL fingerprint matches a held-out question's reference SQL → rejected at gate ⑤." }
+    ],
+    file: "optimization/stages/gates.py · gate_leakage_firewall"
+  },
+  g67_structural: {
+    tag: "Gates ⑥⑦ · Structural & regression", tagClass: "fd-tag-gate",
+    name: "Structural & regression",
+    subtitle: "After applying, does the space still validate — and does the targeted cluster get better, not worse?",
+    what: "Two gates fire together. <b>Structural</b> applies the patch to the working <span class='mono'>serialized_space</span> and runs schema validation (IDs, sorting, uniqueness, size). <b>Regression</b> re-runs the cluster's questions and requires post-patch <span class='mono'>result_correctness</span> ≥ pre-patch.",
+    why: "Structural failures are the only kind the Genie API would catch <i>after</i> ship — we want to find them now. Regression catches the worst trade: a patch that fixes one cluster while silently breaking another.",
+    without: "Either you ship a broken space (API rejects it on apply), or you accept a +3pp macro patch that's actually -5pp on the cluster it claimed to fix. Either way, the next cycle's RCA is fighting yesterday's gain.",
+    examples: [
+      { v: "pass", text: "Cluster-3 was 0.40. Post-patch on its 4 questions: 0.65. Schema validates → both gates pass." },
+      { v: "fail", text: "Patch adds an <span class='mono'>example_query</span> with an ID that already exists in the space → schema validation fails → rejected at gate ⑥." }
+    ],
+    file: "optimization/stages/gates.py · gate_structural, gate_regression"
+  },
+  survivors: {
+    tag: "Survivors", tagClass: "fd-tag-eval",
+    name: "Surviving patch set",
+    subtitle: "The handful of proposals that cleared all seven gates — typically 1–3 of the original 30.",
+    what: "Whatever is left after the funnel runs. These are the patches that have provenance, are in scope, fit the budget, don't conflict, don't leak, validate structurally, and don't regress their target cluster.",
+    why: "By the time a patch reaches this row, the optimizer has already done <i>most</i> of its quality work. The remaining decision is purely quantitative: does the live benchmark agree?",
+    without: "The funnel skipped means the only filter is the live-benchmark score, which is noisier and far slower. Most cycles would burn budget on doomed candidates.",
+    examples: [
+      { v: "note", text: "Typical run: <b>30 proposals → 1–3 survivors</b>. The reflection log records the full count at every stage so you can see where most candidates died." }
+    ],
+    file: "optimization/stages/gates.py · run_gates"
+  },
+  reeval: {
+    tag: "Re-evaluation", tagClass: "fd-tag-eval",
+    name: "Re-evaluation against the train benchmark",
+    subtitle: "Each surviving patch is applied to a copy of the space and re-graded by the same scorers and arbiter as the baseline.",
+    what: "The harness re-runs every train question with the surviving patch applied. Same scorers, same arbiter, same prompts — only the space differs. Output: a per-question accuracy delta.",
+    why: "Gates measure <i>shape</i>; only the live benchmark measures <i>effect</i>. A patch can be perfectly grounded, in scope, and well-typed and still not move the score. This is where we find out.",
+    without: "We'd accept patches that look right on paper but don't actually improve answers. Score gets stuck for cycles, and the team blames the optimizer instead of the gates.",
+    examples: [
+      { v: "note", text: "Re-eval is identical to the baseline pass. Same <span class='mono'>predict_fn</span>, same <span class='mono'>mlflow.genai.evaluate</span>, same scorers. Only the <span class='mono'>serialized_space</span> changes." }
+    ],
+    file: "optimization/harness.py · evaluate_with_arbiter"
+  },
+  accept: {
+    tag: "Accepted", tagClass: "fd-tag-accept",
+    name: "Accepted & snapshotted",
+    subtitle: "Post-arbiter accuracy ≥ baseline + min_gain_pp → patch is applied for real.",
+    what: "The acceptance policy compares post-arbiter accuracy against the current baseline. If the gain meets <span class='mono'>min_gain_pp</span>, the working <span class='mono'>serialized_space</span> is updated, snapshotted to MLflow, and a reflection entry is written.",
+    why: "A single quantitative bar prevents subjective drift. \"It looks better\" doesn't ship — measurable gain ships.",
+    without: "Endless debate over whether each patch is good enough. Marginal changes accumulate. Eventually you can't tell which patch caused which regression.",
+    examples: [
+      { v: "pass", text: "Baseline 0.62. <span class='mono'>min_gain_pp = 0.01</span>. Post-patch 0.64 → <b>+2pp ≥ floor</b> → accept." },
+      { v: "fail", text: "Same baseline. Post-patch 0.625 → <b>+0.5pp &lt; floor</b> → rejected (under gain floor)." }
+    ],
+    file: "optimization/optimizer.py · accept_patch"
+  },
+  reject: {
+    tag: "Rolled back", tagClass: "fd-tag-reject",
+    name: "Rolled back & recorded",
+    subtitle: "The space reverts; the attempt and reasons are written to memory so the optimizer doesn't loop.",
+    what: "The working space is restored from the previous snapshot. The full attempt — proposal, gate verdicts, post-eval scores — is appended to <span class='mono'>memory.jsonl</span> and surfaced to the next cycle's strategist.",
+    why: "Free experimentation requires real rollback. And without memory, the optimizer would happily re-propose the exact patch it just rejected.",
+    without: "Either you stop trying risky patches (and stagnate), or you ship them anyway and corrupt the space. Worse, the next cycle re-tries the same losing idea because it forgot.",
+    examples: [
+      { v: "note", text: "Lever 6 (SQL shape) regressed twice in a row → memory adds <span class='mono'>cooldown(\"L6\", 3)</span>. The next 3 cycles' strategists won't pick Lever 6." }
+    ],
+    file: "optimization/optimizer.py · reject_patch, memory.update"
+  }
+};
+
+const FUNNEL_DEFAULT = "g1_causal";
+let activeFunnelGate = null;
+
+function renderFunnelDetail(id) {
+  const data = FUNNEL_GATES[id];
+  if (!data) return "";
+  const traces = (data.examples || []).map(ex => {
+    const cls = ex.v === "pass" ? "fd-pass" : ex.v === "fail" ? "fd-fail" : "fd-note";
+    const verdict = ex.v === "pass" ? "Pass" : ex.v === "fail" ? "Fail" : "Note";
+    return `<div class="fd-trace ${cls}"><span class="fd-verdict">${verdict}</span><p>${ex.text}</p></div>`;
+  }).join("");
+  return `
+    <div class="fd-head">
+      <span class="fd-tag ${data.tagClass}">${data.tag}</span>
+      <h3>${data.name}</h3>
+      <p class="fd-subtitle">${data.subtitle}</p>
+    </div>
+    <section class="fd-section">
+      <h4 class="fd-h">What this stage does</h4>
+      <p class="fd-body">${data.what}</p>
+    </section>
+    <section class="fd-section">
+      <h4 class="fd-h">Why we need it</h4>
+      <p class="fd-body">${data.why}</p>
+    </section>
+    <section class="fd-section fd-without">
+      <h4 class="fd-h"><span class="fd-mark">×</span> What happens without it</h4>
+      <p class="fd-body">${data.without}</p>
+    </section>
+    <section class="fd-section fd-journey">
+      <h4 class="fd-h">Example journey</h4>
+      <div class="fd-traces">${traces}</div>
+    </section>
+    ${data.file ? `<div class="fd-hint">Source · <span class="mono">${data.file}</span></div>` : ""}
+  `;
+}
+
+function setActiveFunnelGate(id) {
+  if (!FUNNEL_GATES[id]) return;
+  activeFunnelGate = id;
+  document.querySelectorAll('#funnel [data-gate]').forEach(el => {
+    const on = el.dataset.gate === id;
+    el.classList.toggle('is-active', on);
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  const panel = document.getElementById('funnelDetail');
+  if (panel) panel.innerHTML = renderFunnelDetail(id);
+}
+
+function initFunnel() {
+  const items = document.querySelectorAll('#funnel [data-gate]');
+  items.forEach(el => {
+    el.addEventListener('click', () => setActiveFunnelGate(el.dataset.gate));
+  });
+  setActiveFunnelGate(FUNNEL_DEFAULT);
+}
+
+// ============================================================
 // INIT
 // ============================================================
 function init() {
@@ -3331,6 +3706,7 @@ function init() {
   setActiveLever("L2");
   renderEvidence();
   initMap();
+  initFunnel();
   setupStoryRail();
 }
 document.addEventListener("DOMContentLoaded", init);
