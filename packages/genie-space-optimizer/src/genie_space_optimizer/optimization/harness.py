@@ -1744,6 +1744,51 @@ def _run_narrow_l6_replacement_loop(
     return survivors
 
 
+def _capture_doa_fingerprints_on_rollback(
+    *,
+    buffer,  # DoaFingerprintBuffer | None
+    decision,  # ControlPlaneAcceptance
+    ag_id: str,
+    applied_patches,
+) -> int:
+    """Cycle 9 W4 — when the post-eval acceptance decision rejects an
+    AG AND reports any ``target_still_hard_qids``, capture every
+    applied patch into the DOA fingerprint buffer keyed by ``ag_id``.
+
+    Returns the number of patches captured (0 when the flag is off,
+    when the buffer is None, when the AG was accepted, or when no
+    target qids remain hard).
+
+    "target_still_hard" is not a value of any ``rollback_class``
+    field; it is purely a property of the post-eval decision. The
+    capture rule combines ``not decision.accepted`` with non-empty
+    ``decision.target_still_hard_qids`` to mean "the patch family
+    didn't move the targets".
+    """
+    from genie_space_optimizer.common.config import (
+        doa_fingerprint_block_reproposal_enabled,
+    )
+    if buffer is None or not doa_fingerprint_block_reproposal_enabled():
+        return 0
+    if getattr(decision, "accepted", True):
+        return 0
+    if not getattr(decision, "target_still_hard_qids", ()):
+        return 0
+    n = 0
+    for patch in (applied_patches or ()):
+        if not patch:
+            continue
+        try:
+            buffer.add(ag_id=str(ag_id), patch=patch)
+            n += 1
+        except Exception:
+            logger.debug(
+                "Cycle 9 W4: DOA fingerprint capture failed (non-fatal)",
+                exc_info=True,
+            )
+    return n
+
+
 def _emit_diagnostic_ag_trunk_events(
     *,
     journey_emit,
@@ -11670,6 +11715,24 @@ def _run_gate_checks(
             "regressions": regressions,
             "_t4_verdict": _t4_verdict,
             "_suppressed_qids": _suppressed_qids,
+            # Cycle 9 W4 — surface the post-eval decision so the
+            # lever-loop's DOA-fingerprint capture can read
+            # ``target_still_hard_qids`` without re-deriving it from
+            # ``regressions[0]``. Mirrors the accept-path return above.
+            "acceptance_decision": {
+                "accepted": False,
+                "reason": _control_plane_decision.reason_code,
+                "target_qids": list(_control_plane_decision.target_qids),
+                "target_fixed_qids": list(
+                    _control_plane_decision.target_fixed_qids
+                ),
+                "target_still_hard_qids": list(
+                    _control_plane_decision.target_still_hard_qids
+                ),
+                "out_of_target_regressed_qids": list(
+                    _control_plane_decision.out_of_target_regressed_qids
+                ),
+            },
         }
 
     # ── PASSED ────────────────────────────────────────────────────────
@@ -12707,6 +12770,15 @@ def _run_lever_loop(
     noise_floor = min(100.0 / max(len(benchmarks), 1), MAX_NOISE_FLOOR)
 
     reflection_buffer: list[dict] = resume_state.get("reflection_buffer", [])
+    # Cycle 9 W4 — per-run, per-AG fingerprint buffer for patches
+    # rolled back when ``_control_plane_decision.target_still_hard_qids``
+    # is non-empty. The strategist preprocessing prunes any candidate
+    # whose ``patch_retry_signature`` is in this buffer. Lifecycle
+    # matches reflection_buffer (per-run, accumulated across iterations).
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer as _DoaFingerprintBuffer,
+    )
+    _doa_fingerprint_buffer = _DoaFingerprintBuffer()
     skill_exemplars: list[dict] = resume_state.get("skill_exemplars", [])
     tried_patches: set[tuple[str, str]] = resume_state.get("tried_patches", set())
     tried_root_causes: set[tuple[str, str]] = resume_state.get("tried_root_causes", set())
@@ -19318,6 +19390,36 @@ def _run_lever_loop(
                 spark, run_id, iteration_counter, reason, catalog, schema,
             )
             ags_rolled_back.append(ag_id)
+            # Cycle 9 W4 — capture every applied patch from this AG into
+            # the per-run DOA fingerprint buffer when the post-eval
+            # acceptance decision still reports unresolved target qids.
+            # The buffer is later read by the strategist preprocessing
+            # step (commit 3) to prune any candidate whose retry
+            # signature is already known dead-on-arrival in this run.
+            try:
+                from types import SimpleNamespace as _DoaDecisionAdapter
+                _accept_dict = gate_result.get("acceptance_decision") or {}
+                _doa_decision = _DoaDecisionAdapter(
+                    accepted=bool(_accept_dict.get("accepted", False)),
+                    target_still_hard_qids=tuple(
+                        _accept_dict.get("target_still_hard_qids") or ()
+                    ),
+                )
+                _capture_doa_fingerprints_on_rollback(
+                    buffer=_doa_fingerprint_buffer,
+                    decision=_doa_decision,
+                    ag_id=str(ag_id),
+                    applied_patches=[
+                        (e.get("patch") or {})
+                        for e in (apply_log.get("applied") or [])
+                    ],
+                )
+            except Exception:
+                logger.debug(
+                    "Cycle 9 W4: DOA fingerprint capture wiring failed "
+                    "(non-fatal)",
+                    exc_info=True,
+                )
             # Phase 1.3: drop the AG buffer when an AG rolls back.  The
             # buffered AGs were produced from the same strategist call
             # and tend to share the same flawed root-cause hypothesis;

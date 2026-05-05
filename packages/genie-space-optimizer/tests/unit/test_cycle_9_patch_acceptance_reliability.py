@@ -395,3 +395,149 @@ def test_w3_wiring_returns_empty_when_flag_off(
         ag_root_cause="missing_filter",
     )
     assert survivors == []
+
+
+# ── W4 wiring — capture target_still_hard rollbacks into DOA buffer ──
+
+
+class _DoaDecisionStub:
+    """Minimal stand-in for ControlPlaneAcceptance — only the two
+    attributes the helper reads via getattr."""
+
+    def __init__(self, *, accepted: bool, target_still_hard_qids):
+        self.accepted = accepted
+        self.target_still_hard_qids = tuple(target_still_hard_qids or ())
+
+
+def _w4_patch(*, ptype: str, table: str, column: str, body: str) -> dict:
+    return {
+        "patch_type": ptype,
+        "target_table": table,
+        "target_column": column,
+        "new_text": body,
+    }
+
+
+def test_w4_capture_skips_when_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    decision = _DoaDecisionStub(accepted=True, target_still_hard_qids=("gs_009",))
+    n = _harness._capture_doa_fingerprints_on_rollback(
+        buffer=buf,
+        decision=decision,
+        ag_id="ag_1",
+        applied_patches=[_w4_patch(
+            ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+        )],
+    )
+    assert n == 0
+    assert buf.signatures_for("ag_1") == ()
+
+
+def test_w4_capture_skips_when_target_still_hard_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    decision = _DoaDecisionStub(accepted=False, target_still_hard_qids=())
+    n = _harness._capture_doa_fingerprints_on_rollback(
+        buffer=buf,
+        decision=decision,
+        ag_id="ag_1",
+        applied_patches=[_w4_patch(
+            ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+        )],
+    )
+    assert n == 0
+    assert buf.signatures_for("ag_1") == ()
+
+
+def test_w4_capture_fires_on_rollback_with_target_still_hard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    decision = _DoaDecisionStub(
+        accepted=False, target_still_hard_qids=("gs_009", "gs_013"),
+    )
+    patches = [
+        _w4_patch(
+            ptype="add_sql_snippet_filter", table="t", column="c1", body="b1",
+        ),
+        _w4_patch(
+            ptype="update_instruction_section", table="", column="", body="b2",
+        ),
+    ]
+    n = _harness._capture_doa_fingerprints_on_rollback(
+        buffer=buf,
+        decision=decision,
+        ag_id="ag_42",
+        applied_patches=patches,
+    )
+    assert n == 2
+    sigs = buf.signatures_for("ag_42")
+    assert len(sigs) == 2
+    # Buffer is keyed per-AG — different AG sees no signatures.
+    assert buf.signatures_for("ag_other") == ()
+
+
+def test_w4_capture_returns_zero_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", "0")
+    from genie_space_optimizer.optimization import harness as _harness
+    from genie_space_optimizer.optimization.reflection_retry import (
+        DoaFingerprintBuffer,
+    )
+
+    buf = DoaFingerprintBuffer()
+    decision = _DoaDecisionStub(
+        accepted=False, target_still_hard_qids=("gs_009",),
+    )
+    n = _harness._capture_doa_fingerprints_on_rollback(
+        buffer=buf,
+        decision=decision,
+        ag_id="ag_1",
+        applied_patches=[_w4_patch(
+            ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+        )],
+    )
+    assert n == 0
+    assert buf.signatures_for("ag_1") == ()
+
+
+def test_w4_capture_no_op_when_buffer_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL", raising=False)
+    from genie_space_optimizer.optimization import harness as _harness
+
+    decision = _DoaDecisionStub(
+        accepted=False, target_still_hard_qids=("gs_009",),
+    )
+    n = _harness._capture_doa_fingerprints_on_rollback(
+        buffer=None,
+        decision=decision,
+        ag_id="ag_1",
+        applied_patches=[_w4_patch(
+            ptype="add_sql_snippet_filter", table="t", column="c", body="x",
+        )],
+    )
+    assert n == 0
