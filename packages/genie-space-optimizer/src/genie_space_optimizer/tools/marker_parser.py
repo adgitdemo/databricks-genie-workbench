@@ -228,3 +228,71 @@ def parse_lever6_forced_marker(line: str) -> dict:
             str(p) for p in (payload.get("existing_patch_types") or [])
         ],
     }
+
+
+def parse_lever6_force_llm_declined_marker(line: str) -> dict:
+    """Parse ``GSO_LEVER6_FORCE_LLM_DECLINED_V1 {json}`` (Cycle 10 W3).
+
+    Returns ``{"run_id", "iteration", "ag_id", "cluster_id",
+    "root_cause"}``.
+    """
+    payload = _parse_named_marker(line, "GSO_LEVER6_FORCE_LLM_DECLINED_V1")
+    return {
+        "run_id": str(payload.get("run_id") or ""),
+        "iteration": int(payload.get("iteration") or 0),
+        "ag_id": str(payload.get("ag_id") or ""),
+        "cluster_id": str(payload.get("cluster_id") or ""),
+        "root_cause": str(payload.get("root_cause") or ""),
+    }
+
+
+def parse_lever6_force_raised_marker(line: str) -> dict:
+    """Parse ``GSO_LEVER6_FORCE_RAISED_V1 {json}`` (Cycle 10 W3).
+
+    Returns ``{"run_id", "iteration", "ag_id", "cluster_id",
+    "root_cause", "exception_repr"}``.
+    """
+    payload = _parse_named_marker(line, "GSO_LEVER6_FORCE_RAISED_V1")
+    return {
+        "run_id": str(payload.get("run_id") or ""),
+        "iteration": int(payload.get("iteration") or 0),
+        "ag_id": str(payload.get("ag_id") or ""),
+        "cluster_id": str(payload.get("cluster_id") or ""),
+        "root_cause": str(payload.get("root_cause") or ""),
+        "exception_repr": str(payload.get("exception_repr") or ""),
+    }
+
+
+def parse_narrow_not_applicable_marker(line: str) -> dict:
+    """Parse ``GSO_NARROW_NOT_APPLICABLE_V1 {json}`` (Cycle 10 W4).
+
+    Returns ``{"run_id", "iteration", "ag_id", "cluster_id",
+    "root_cause", "original_patch_type", "reason"}``.
+    """
+    payload = _parse_named_marker(line, "GSO_NARROW_NOT_APPLICABLE_V1")
+    return {
+        "run_id": str(payload.get("run_id") or ""),
+        "iteration": int(payload.get("iteration") or 0),
+        "ag_id": str(payload.get("ag_id") or ""),
+        "cluster_id": str(payload.get("cluster_id") or ""),
+        "root_cause": str(payload.get("root_cause") or ""),
+        "original_patch_type": str(payload.get("original_patch_type") or ""),
+        "reason": str(payload.get("reason") or ""),
+    }
+
+
+def parse_ag_levers_unioned_marker(line: str) -> dict:
+    """Parse ``GSO_AG_LEVERS_UNIONED_V1 {json}`` (Cycle 10 W8).
+
+    Returns ``{"run_id", "iteration", "ag_id", "cluster_id",
+    "levers_before", "levers_after"}``.
+    """
+    payload = _parse_named_marker(line, "GSO_AG_LEVERS_UNIONED_V1")
+    return {
+        "run_id": str(payload.get("run_id") or ""),
+        "iteration": int(payload.get("iteration") or 0),
+        "ag_id": str(payload.get("ag_id") or ""),
+        "cluster_id": str(payload.get("cluster_id") or ""),
+        "levers_before": [str(l) for l in (payload.get("levers_before") or [])],
+        "levers_after": [str(l) for l in (payload.get("levers_after") or [])],
+    }

@@ -102,3 +102,88 @@ def lever6_forced_marker(
         "existing_patch_types": [str(p) for p in existing_patch_types],
     }
     return "GSO_LEVER6_FORCED_V1 " + json.dumps(payload, sort_keys=True)
+
+
+def lever6_force_llm_declined_marker(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+) -> str:
+    """Cycle 10 W3 — Cycle 7 N3 force-L6 LLM returned no candidate."""
+    payload = {
+        "run_id": str(run_id),
+        "iteration": int(iteration),
+        "ag_id": str(ag_id),
+        "cluster_id": str(cluster_id),
+        "root_cause": str(root_cause),
+    }
+    return "GSO_LEVER6_FORCE_LLM_DECLINED_V1 " + json.dumps(payload, sort_keys=True)
+
+
+def lever6_force_raised_marker(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    exception_repr: str,
+) -> str:
+    """Cycle 10 W3 — Cycle 7 N3 force-L6 raised an exception."""
+    payload = {
+        "run_id": str(run_id),
+        "iteration": int(iteration),
+        "ag_id": str(ag_id),
+        "cluster_id": str(cluster_id),
+        "root_cause": str(root_cause),
+        "exception_repr": str(exception_repr)[:512],
+    }
+    return "GSO_LEVER6_FORCE_RAISED_V1 " + json.dumps(payload, sort_keys=True)
+
+
+def narrow_not_applicable_marker(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    original_patch_type: str,
+    reason: str,
+) -> str:
+    """Cycle 10 W4 — narrow-L6 replacement does not apply for this
+    patch_type / cluster combination."""
+    payload = {
+        "run_id": str(run_id),
+        "iteration": int(iteration),
+        "ag_id": str(ag_id),
+        "cluster_id": str(cluster_id),
+        "root_cause": str(root_cause),
+        "original_patch_type": str(original_patch_type),
+        "reason": str(reason),
+    }
+    return "GSO_NARROW_NOT_APPLICABLE_V1 " + json.dumps(payload, sort_keys=True)
+
+
+def ag_levers_unioned_marker(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    levers_before: tuple,
+    levers_after: tuple,
+) -> str:
+    """Cycle 10 W8 — AG had levers added by Cycle 10 W2 union."""
+    payload = {
+        "run_id": str(run_id),
+        "iteration": int(iteration),
+        "ag_id": str(ag_id),
+        "cluster_id": str(cluster_id),
+        "levers_before": [str(l) for l in (levers_before or ())],
+        "levers_after": [str(l) for l in (levers_after or ())],
+    }
+    return "GSO_AG_LEVERS_UNIONED_V1 " + json.dumps(payload, sort_keys=True)

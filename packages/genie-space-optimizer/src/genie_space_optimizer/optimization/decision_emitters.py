@@ -1835,3 +1835,217 @@ def non_canonical_judge_row_record(
         ),
         metrics={"judge": str(judge), "detail": str(detail)},
     )
+
+
+# ---------------------------------------------------------------------------
+# Cycle 10 W3 — typed outcomes for the Cycle 7 N3 force-Lever-6 silent path
+# ---------------------------------------------------------------------------
+
+
+def lever6_force_llm_declined_record(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    target_qids: tuple = (),
+) -> DecisionRecord:
+    """Cycle 10 W3 — Cycle 7 N3 force-L6 path: ``_generate_lever6_proposal``
+    returned ``None`` (LLM declined / no synthesizable archetype).
+
+    Decision type ``PROPOSAL_GENERATED`` with reason_code
+    ``lever6_force_llm_declined``.
+    """
+    qids = tuple(str(q) for q in (target_qids or ()) if str(q))
+    evidence_refs = tuple(
+        v for v in (
+            f"ag:{ag_id}" if ag_id else "",
+            f"cluster:{cluster_id}" if cluster_id else "",
+        ) if v
+    )
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.PROPOSAL_GENERATED,
+        outcome=DecisionOutcome.UNRESOLVED,
+        reason_code=ReasonCode.LEVER6_FORCE_LLM_DECLINED,
+        ag_id=str(ag_id),
+        cluster_id=str(cluster_id),
+        root_cause=str(root_cause),
+        evidence_refs=evidence_refs,
+        affected_qids=qids,
+        target_qids=qids,
+        source_cluster_ids=(cluster_id,) if cluster_id else (),
+        gate="proposal_generation",
+        expected_effect=(
+            "Forced Lever-6 candidate would close the SQL-shape "
+            "hard failure for the AG."
+        ),
+        observed_effect=(
+            "_generate_lever6_proposal returned no candidate; "
+            "the AG retains the strategist's slate (which lacks "
+            "an L6 add_sql_snippet_*)."
+        ),
+        next_action=(
+            "Inspect the LLM transcript for this AG to confirm the "
+            "decline rationale; consider widening the synthesizer "
+            "archetype list."
+        ),
+    )
+
+
+def lever6_force_raised_record(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    exception_repr: str,
+) -> DecisionRecord:
+    """Cycle 10 W3 — Cycle 7 N3 force-L6 path: ``_generate_lever6_proposal``
+    raised. Captures ``repr(exc)[:512]`` as the diagnostic.
+    """
+    evidence_refs = tuple(
+        v for v in (
+            f"ag:{ag_id}" if ag_id else "",
+            f"cluster:{cluster_id}" if cluster_id else "",
+        ) if v
+    )
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.PROPOSAL_GENERATED,
+        outcome=DecisionOutcome.UNRESOLVED,
+        reason_code=ReasonCode.LEVER6_FORCE_RAISED,
+        ag_id=str(ag_id),
+        cluster_id=str(cluster_id),
+        root_cause=str(root_cause),
+        evidence_refs=evidence_refs,
+        source_cluster_ids=(cluster_id,) if cluster_id else (),
+        gate="proposal_generation",
+        reason_detail=str(exception_repr)[:512],
+        expected_effect=(
+            "Forced Lever-6 candidate would close the SQL-shape "
+            "hard failure for the AG."
+        ),
+        observed_effect=(
+            "_generate_lever6_proposal raised an exception; the AG "
+            "retains the strategist's slate."
+        ),
+        next_action=(
+            "Inspect the harness logs for the exception traceback; "
+            "if recurring, file a P3 against the synthesizer."
+        ),
+        metrics={"exception_repr": str(exception_repr)[:512]},
+    )
+
+
+def narrow_not_applicable_record(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    original_patch_type: str,
+    reason: str,
+) -> DecisionRecord:
+    """Cycle 10 W4 — narrow-L6 replacement does not apply for the
+    given patch_type. Decision type ``PROPOSAL_GENERATED`` with
+    reason_code ``narrow_not_applicable``.
+    """
+    evidence_refs = tuple(
+        v for v in (
+            f"ag:{ag_id}" if ag_id else "",
+            f"cluster:{cluster_id}" if cluster_id else "",
+        ) if v
+    )
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.PROPOSAL_GENERATED,
+        outcome=DecisionOutcome.UNRESOLVED,
+        reason_code=ReasonCode.NARROW_NOT_APPLICABLE,
+        ag_id=str(ag_id),
+        cluster_id=str(cluster_id),
+        root_cause=str(root_cause),
+        evidence_refs=evidence_refs,
+        source_cluster_ids=(cluster_id,) if cluster_id else (),
+        gate="proposal_generation",
+        reason_detail=(
+            f"original_patch_type={original_patch_type}; reason={reason}"
+        ),
+        expected_effect=(
+            "Narrowed Lever-6 variant would replace a parent dropped "
+            "at high_collateral_risk_flagged."
+        ),
+        observed_effect=(
+            "Builder declined to produce a narrowed variant; harness "
+            "falls back to L5 example_sql synthesis."
+        ),
+        next_action=(
+            "Surface this AG to the L5 example_sql path; if recurring, "
+            "expand the narrow-L6 builder archetype list."
+        ),
+        metrics={
+            "original_patch_type": str(original_patch_type),
+            "reason": str(reason),
+        },
+    )
+
+
+def ag_levers_unioned_record(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    levers_before: tuple,
+    levers_after: tuple,
+) -> DecisionRecord:
+    """Cycle 10 W8 — Cycle 10 W2 union widened the AG's levers.
+
+    Decision type ``STRATEGIST_AG_EMITTED`` with reason_code
+    ``ag_levers_unioned``.
+    """
+    before = tuple(str(l) for l in (levers_before or ()))
+    after = tuple(str(l) for l in (levers_after or ()))
+    evidence_refs = tuple(
+        v for v in (
+            f"ag:{ag_id}" if ag_id else "",
+            f"cluster:{cluster_id}" if cluster_id else "",
+        ) if v
+    )
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.STRATEGIST_AG_EMITTED,
+        outcome=DecisionOutcome.RESOLVED,
+        reason_code=ReasonCode.AG_LEVERS_UNIONED,
+        ag_id=str(ag_id),
+        cluster_id=str(cluster_id),
+        evidence_refs=evidence_refs,
+        source_cluster_ids=(cluster_id,) if cluster_id else (),
+        reason_detail=(
+            f"levers_before={list(before)}; levers_after={list(after)}"
+        ),
+        expected_effect=(
+            "AG carries every lever in cluster.recommended_levers; "
+            "the strategist sees the wider lever set on the next "
+            "AG-emit pass."
+        ),
+        observed_effect=(
+            "union_ag_levers_with_recommended widened the AG's "
+            "lever_directives to satisfy the cluster recommendation."
+        ),
+        next_action=(
+            "If the wider set is consistently rejected at proposal-"
+            "generation, audit the cluster.recommended_levers heuristic."
+        ),
+        metrics={
+            "levers_before": list(before),
+            "levers_after": list(after),
+        },
+    )

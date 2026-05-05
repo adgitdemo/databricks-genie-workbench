@@ -130,3 +130,67 @@ def test_bundle_assembly_failed_absent_when_no_marker() -> None:
 
     markers = parse_markers("hello world")
     assert markers.bundle_assembly_failed == ()
+
+
+# Cycle 10 — parser entries
+def test_marker_parser_recognizes_lever6_force_llm_declined():
+    from genie_space_optimizer.tools.marker_parser import (
+        parse_lever6_force_llm_declined_marker,
+    )
+    line = (
+        'GSO_LEVER6_FORCE_LLM_DECLINED_V1 {"ag_id": "AG_X", '
+        '"cluster_id": "H004", "iteration": 2, "root_cause": '
+        '"missing_filter", "run_id": "r1"}'
+    )
+    out = parse_lever6_force_llm_declined_marker(line)
+    assert out["ag_id"] == "AG_X"
+    assert out["cluster_id"] == "H004"
+    assert out["iteration"] == 2
+    assert out["root_cause"] == "missing_filter"
+    assert out["run_id"] == "r1"
+
+
+def test_marker_parser_recognizes_lever6_force_raised():
+    from genie_space_optimizer.tools.marker_parser import (
+        parse_lever6_force_raised_marker,
+    )
+    line = (
+        'GSO_LEVER6_FORCE_RAISED_V1 {"ag_id": "AG_X", "cluster_id": '
+        '"H004", "exception_repr": "ValueError(\'boom\')", '
+        '"iteration": 2, "root_cause": "missing_filter", "run_id": "r1"}'
+    )
+    out = parse_lever6_force_raised_marker(line)
+    assert out["ag_id"] == "AG_X"
+    assert out["exception_repr"].startswith("ValueError")
+
+
+def test_marker_parser_recognizes_narrow_not_applicable():
+    from genie_space_optimizer.tools.marker_parser import (
+        parse_narrow_not_applicable_marker,
+    )
+    line = (
+        'GSO_NARROW_NOT_APPLICABLE_V1 {"ag_id": "AG_X", "cluster_id": '
+        '"H001", "iteration": 3, "original_patch_type": '
+        '"add_sql_snippet_measure", "reason": '
+        '"patch_type_lacks_where_predicate", "root_cause": '
+        '"missing_filter", "run_id": "r1"}'
+    )
+    out = parse_narrow_not_applicable_marker(line)
+    assert out["ag_id"] == "AG_X"
+    assert out["original_patch_type"] == "add_sql_snippet_measure"
+    assert out["reason"] == "patch_type_lacks_where_predicate"
+
+
+def test_marker_parser_recognizes_ag_levers_unioned():
+    from genie_space_optimizer.tools.marker_parser import (
+        parse_ag_levers_unioned_marker,
+    )
+    line = (
+        'GSO_AG_LEVERS_UNIONED_V1 {"ag_id": "AG_X", "cluster_id": '
+        '"H001", "iteration": 2, "levers_after": ["3", "5", "6"], '
+        '"levers_before": ["5"], "run_id": "r1"}'
+    )
+    out = parse_ag_levers_unioned_marker(line)
+    assert out["ag_id"] == "AG_X"
+    assert out["levers_before"] == ["5"]
+    assert out["levers_after"] == ["3", "5", "6"]

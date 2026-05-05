@@ -593,3 +593,59 @@ def test_non_canonical_judge_row_record_has_typed_fields() -> None:
     assert rec.gate == "result_correctness"
     assert rec.reason_code.value == "non_canonical_judge_row"
     assert "missing rationale" in (rec.reason_detail or "")
+
+
+# Cycle 10 W3/W4/W8 — typed emitters
+def test_lever6_force_llm_declined_record_shape():
+    from genie_space_optimizer.optimization.decision_emitters import (
+        lever6_force_llm_declined_record,
+    )
+    rec = lever6_force_llm_declined_record(
+        run_id="r1", iteration=2, ag_id="AG_DECOMPOSED_H004",
+        cluster_id="H004", root_cause="missing_filter",
+        target_qids=("gs_024",),
+    )
+    d = rec.to_dict()
+    assert d["reason_code"] == "lever6_force_llm_declined"
+    assert d["decision_type"] in {"proposal_generated", "strategist_ag_emitted"}
+
+
+def test_lever6_force_raised_record_shape():
+    from genie_space_optimizer.optimization.decision_emitters import (
+        lever6_force_raised_record,
+    )
+    rec = lever6_force_raised_record(
+        run_id="r1", iteration=2, ag_id="AG_DECOMPOSED_H004",
+        cluster_id="H004", root_cause="missing_filter",
+        exception_repr="ValueError('synthesis failed')",
+    )
+    d = rec.to_dict()
+    assert d["reason_code"] == "lever6_force_raised"
+
+
+def test_narrow_not_applicable_record_shape():
+    from genie_space_optimizer.optimization.decision_emitters import (
+        narrow_not_applicable_record,
+    )
+    rec = narrow_not_applicable_record(
+        run_id="r1", iteration=3, ag_id="AG_X",
+        cluster_id="H001", root_cause="missing_filter",
+        original_patch_type="add_sql_snippet_measure",
+        reason="patch_type_lacks_where_predicate",
+    )
+    d = rec.to_dict()
+    assert d["reason_code"] == "narrow_not_applicable"
+
+
+def test_ag_levers_unioned_record_shape():
+    from genie_space_optimizer.optimization.decision_emitters import (
+        ag_levers_unioned_record,
+    )
+    rec = ag_levers_unioned_record(
+        run_id="r1", iteration=2, ag_id="AG_DECOMPOSED_H001",
+        cluster_id="H001",
+        levers_before=("5",),
+        levers_after=("3", "5", "6"),
+    )
+    d = rec.to_dict()
+    assert d["reason_code"] == "ag_levers_unioned"

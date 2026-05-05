@@ -60,3 +60,51 @@ def test_phase_b_artifact_marker_emits_decision_and_transcript_paths() -> None:
     assert payload["decision_trace_path"] == "phase_b/decision_trace/iter_4.json"
     assert payload["operator_transcript_path"] == "phase_b/operator_transcript/iter_4.txt"
     assert payload["success"] is True
+
+
+# Cycle 10 — markers
+def test_lever6_force_llm_declined_marker_shape():
+    from genie_space_optimizer.common.mlflow_markers import (
+        lever6_force_llm_declined_marker,
+    )
+    s = lever6_force_llm_declined_marker(
+        run_id="r1", iteration=2, ag_id="AG_X",
+        cluster_id="H004", root_cause="missing_filter",
+    )
+    assert s.startswith("GSO_LEVER6_FORCE_LLM_DECLINED_V1 ")
+
+
+def test_lever6_force_raised_marker_shape():
+    from genie_space_optimizer.common.mlflow_markers import (
+        lever6_force_raised_marker,
+    )
+    s = lever6_force_raised_marker(
+        run_id="r1", iteration=2, ag_id="AG_X",
+        cluster_id="H004", root_cause="missing_filter",
+        exception_repr="ValueError('boom')",
+    )
+    assert s.startswith("GSO_LEVER6_FORCE_RAISED_V1 ")
+
+
+def test_narrow_not_applicable_marker_shape():
+    from genie_space_optimizer.common.mlflow_markers import (
+        narrow_not_applicable_marker,
+    )
+    s = narrow_not_applicable_marker(
+        run_id="r1", iteration=3, ag_id="AG_X",
+        cluster_id="H001", root_cause="missing_filter",
+        original_patch_type="add_sql_snippet_measure",
+        reason="patch_type_lacks_where_predicate",
+    )
+    assert s.startswith("GSO_NARROW_NOT_APPLICABLE_V1 ")
+
+
+def test_ag_levers_unioned_marker_shape():
+    from genie_space_optimizer.common.mlflow_markers import (
+        ag_levers_unioned_marker,
+    )
+    s = ag_levers_unioned_marker(
+        run_id="r1", iteration=2, ag_id="AG_X", cluster_id="H001",
+        levers_before=("5",), levers_after=("3", "5", "6"),
+    )
+    assert s.startswith("GSO_AG_LEVERS_UNIONED_V1 ")
