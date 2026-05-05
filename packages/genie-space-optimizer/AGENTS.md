@@ -267,3 +267,19 @@ break the delta view.
   the widget itself is a frontend deliverable).
 - Repo-root `docs/` audit and the fate of `docs/06-fix-agent.md`.
 - End-to-end validation in `tests/test_e2e_deployed.py`.
+
+### Evaluation hang defense (default ON)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GENIE_SPACE_OPTIMIZER_EVAL_LLM_TIMEOUT_SECONDS` | `600` | Per-request HTTP timeout passed to OpenAI judge calls. |
+| `GENIE_SPACE_OPTIMIZER_EVAL_ADAPTIVE_CONCURRENCY` | `true` | Enables the per-attempt concurrency tier ladder (8 → 3 → 1 scorer workers). |
+| `GENIE_SPACE_OPTIMIZER_EVAL_SCORER_WORKERS_ATTEMPT_{1,2,3}` | `8`, `3`, `1` | Override individual tiers if needed. |
+| `GENIE_SPACE_OPTIMIZER_EVAL_DATA_WORKERS_ATTEMPT_{1,2,3}` | `1`, `1`, `1` | Override per-attempt data workers. |
+| `GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_ENABLED` | `true` | Wraps `mlflow.genai.evaluate` in a deadline watchdog. |
+| `GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_PER_CALL_BUDGET_SECONDS` | `90` | Per row × scorer budget feeding the deadline computation. |
+| `GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_FLOOR_SECONDS` | `600` | Minimum watchdog deadline (10 minutes). |
+| `GENIE_SPACE_OPTIMIZER_EVAL_WATCHDOG_CAP_SECONDS` | `7200` | Maximum watchdog deadline (2 hours). |
+| `GENIE_SPACE_OPTIMIZER_EVAL_DISABLE_LITELLM_RETRIES` | `true` | Sets `LITELLM_NUM_RETRIES=0` during eval to prevent stacking on top of MLflow retries. |
+
+All defaults are production-on. Disable individually only when reproducing or debugging a specific issue locally.
