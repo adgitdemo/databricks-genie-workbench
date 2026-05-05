@@ -1688,8 +1688,13 @@ def _run_narrow_l6_replacement_loop(
     blast_dropped: list[dict],
     blast_target_qids: tuple[str, ...],
     ag_root_cause: str,
+    run_id: str = "",
+    iteration: int = 0,
+    ag_id: str = "",
+    cluster_id: str = "",
+    iter_inputs: dict | None = None,
 ) -> list[dict]:
-    """Cycle 9 W3 — for each L6 patch dropped at HCRF
+    """Cycle 9 W3 / Cycle 10 W4 — for each L6 patch dropped at HCRF
     (``high_collateral_risk_flagged``), build a narrow-scope variant
     and re-test it via ``patch_blast_radius_is_safe``. Returns the
     list of survivors so the harness caller can extend ``_blast_kept``.
@@ -1698,6 +1703,12 @@ def _run_narrow_l6_replacement_loop(
     flag-off path returns ``[]`` immediately so replay byte-stability
     holds against the airline canonical fixture which predates this
     behaviour.
+
+    Cycle 10 W4 — when the patch-aware flag is on AND the call site
+    supplies ``run_id`` / ``iteration`` / ``ag_id`` / ``iter_inputs``,
+    every drop whose builder declined produces a typed
+    ``narrow_not_applicable`` decision record + marker so dashboards
+    can audit the fallback to L5 example_sql synthesis.
 
     Closes the variance source observed in run 1099b152 where three
     iterations dropped the same ``add_sql_snippet_*`` patch with no
@@ -1710,6 +1721,7 @@ def _run_narrow_l6_replacement_loop(
         return []
     from genie_space_optimizer.optimization.cluster_driven_synthesis import (
         build_narrow_l6_replacement,
+        narrow_replacement_diagnosis,
     )
     from genie_space_optimizer.optimization.proposal_grounding import (
         patch_blast_radius_is_safe,
@@ -1725,6 +1737,68 @@ def _run_narrow_l6_replacement_loop(
             root_cause=str(ag_root_cause or ""),
         )
         if narrow is None:
+            # Cycle 10 W4.4 — emit a typed NARROW_NOT_APPLICABLE
+            # record + marker so the harness's L5 fallback decision
+            # is observable in the trace.
+            if iter_inputs is not None:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        l6_narrow_replacement_patch_aware_enabled,
+                    )
+                    if l6_narrow_replacement_patch_aware_enabled():
+                        diag = narrow_replacement_diagnosis(
+                            original_patch=original,
+                            ag_target_qids=tuple(blast_target_qids or ()),
+                            root_cause=str(ag_root_cause or ""),
+                        )
+                        if not diag["applicable"]:
+                            from genie_space_optimizer.optimization.decision_emitters import (
+                                narrow_not_applicable_record,
+                            )
+                            from genie_space_optimizer.common.mlflow_markers import (
+                                narrow_not_applicable_marker,
+                            )
+                            _nna = narrow_not_applicable_record(
+                                run_id=str(run_id),
+                                iteration=int(iteration),
+                                ag_id=str(ag_id),
+                                cluster_id=str(cluster_id),
+                                root_cause=str(ag_root_cause or ""),
+                                original_patch_type=str(
+                                    diag["original_patch_type"]
+                                ),
+                                reason=str(diag["reason"]),
+                            )
+                            iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_nna.to_dict())
+                            try:
+                                _marker = narrow_not_applicable_marker(
+                                    run_id=str(run_id),
+                                    iteration=int(iteration),
+                                    ag_id=str(ag_id),
+                                    cluster_id=str(cluster_id),
+                                    root_cause=str(ag_root_cause or ""),
+                                    original_patch_type=str(
+                                        diag["original_patch_type"]
+                                    ),
+                                    reason=str(diag["reason"]),
+                                )
+                                iter_inputs.setdefault(
+                                    "markers", []
+                                ).append(_marker)
+                            except Exception:
+                                logger.debug(
+                                    "Cycle 10 W4.4: narrow_not_applicable "
+                                    "marker emit failed (non-fatal)",
+                                    exc_info=True,
+                                )
+                except Exception:
+                    logger.debug(
+                        "Cycle 10 W4.4: narrow_not_applicable emit "
+                        "failed (non-fatal)",
+                        exc_info=True,
+                    )
             continue
         try:
             retest = patch_blast_radius_is_safe(
@@ -17765,13 +17839,23 @@ def _run_lever_loop(
                     })
                     continue
                 _blast_kept.append(_candidate)
-            # Cycle 9 W3: synthesize narrow-scope variants for any L6
-            # patches dropped at HCRF and re-test through the same
-            # gate; appending survivors back to _blast_kept.
+            # Cycle 9 W3 / Cycle 10 W4.4: synthesize narrow-scope
+            # variants for any L6 patches dropped at HCRF and re-test
+            # through the same gate; appending survivors back to
+            # _blast_kept. When the builder declines, emit a typed
+            # NARROW_NOT_APPLICABLE record so the L5-fallback path is
+            # observable in the trace.
             _narrow_kept = _run_narrow_l6_replacement_loop(
                 blast_dropped=_blast_dropped,
                 blast_target_qids=tuple(_blast_target_qids),
                 ag_root_cause=str(ag.get("root_cause") or ""),
+                run_id=str(run_id),
+                iteration=int(iteration_counter),
+                ag_id=str(ag_id),
+                cluster_id=str(
+                    (ag.get("source_cluster_ids") or ["?"])[0]
+                ),
+                iter_inputs=_current_iter_inputs,
             )
             if _narrow_kept:
                 _blast_kept = list(_blast_kept) + _narrow_kept
@@ -17960,13 +18044,20 @@ def _run_lever_loop(
                         # narrow-replacement loop has the full dict.
                         "original_patch": _candidate,
                     })
-            # Cycle 9 W3: same narrow-replacement pass as Site A but
-            # for the import-fallback path (when
+            # Cycle 9 W3 / Cycle 10 W4.4: same narrow-replacement pass
+            # as Site A but for the import-fallback path (when
             # ``instruction_patch_scope_is_safe`` import fails).
             _narrow_kept = _run_narrow_l6_replacement_loop(
                 blast_dropped=_blast_dropped,
                 blast_target_qids=tuple(_blast_target_qids),
                 ag_root_cause=str(ag.get("root_cause") or ""),
+                run_id=str(run_id),
+                iteration=int(iteration_counter),
+                ag_id=str(ag_id),
+                cluster_id=str(
+                    (ag.get("source_cluster_ids") or ["?"])[0]
+                ),
+                iter_inputs=_current_iter_inputs,
             )
             if _narrow_kept:
                 _blast_kept = list(_blast_kept) + _narrow_kept
