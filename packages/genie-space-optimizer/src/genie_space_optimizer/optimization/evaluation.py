@@ -6761,7 +6761,11 @@ _JUDGE_ORDER = [
 ]
 
 
-def _build_summary_row(row_dict: dict) -> list[dict]:
+def _build_summary_row(
+    row_dict: dict,
+    *,
+    on_violation=None,
+) -> list[dict]:
     """Return a canonical per-judge view used by :func:`_print_eval_summary`.
 
     Each element has shape::
@@ -6793,9 +6797,37 @@ def _build_summary_row(row_dict: dict) -> list[dict]:
         if not isinstance(rationale, str):
             rationale = str(rationale) if rationale is not None else ""
         if assert_canonical and val_str and not rationale:
-            raise AssertionError(
-                f"Non-canonical summary row: judge={judge!r} value={val_str!r} "
-                f"but rationale is empty; _merge_row_sources likely not called."
+            # Plan N4 — route the loud assertion through the policy
+            # module. Strict mode (``GSO_INVARIANT_STRICT=1``) still
+            # raises; lenient mode invokes the callback (or logs at
+            # warning level by default) and continues.
+            from genie_space_optimizer.optimization.invariant_policy import (
+                InvariantViolation,
+                handle_invariant_violation,
+                is_invariant_strict_mode,
+            )
+
+            violation = InvariantViolation(
+                name="non_canonical_judge_row",
+                payload={"judge": judge, "value": val_str},
+                message=(
+                    f"Non-canonical summary row: judge={judge!r} "
+                    f"value={val_str!r} but rationale is empty; "
+                    f"_merge_row_sources likely not called."
+                ),
+            )
+
+            def _default_log_only(_v) -> None:
+                logger.warning(
+                    "Non-canonical judge row (lenient): judge=%s "
+                    "value=%s rationale=empty",
+                    judge, val_str,
+                )
+
+            handle_invariant_violation(
+                violation,
+                strict=is_invariant_strict_mode(),
+                lenient_callback=on_violation or _default_log_only,
             )
         out.append({"judge": judge, "value": val_str, "rationale": rationale})
     return out
