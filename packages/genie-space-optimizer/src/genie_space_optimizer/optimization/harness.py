@@ -14271,6 +14271,29 @@ def _run_lever_loop(
                 [r.to_dict() for r in _eval_records]
             )
         except Exception as _exc_eval:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="eval_classification",
+                        ag_id="",
+                        exception=_exc_eval,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for eval_classification",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["eval_classification"] += 1
             _phase_b_producer_exceptions["eval_classification"] = (
                 _phase_b_producer_exceptions.get("eval_classification", 0) + 1
@@ -14319,7 +14342,30 @@ def _run_lever_loop(
             _current_iter_inputs.setdefault("decision_records", []).extend(
                 [r.to_dict() for r in _hard_cluster_records]
             )
-        except Exception:
+        except Exception as _cluster_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="cluster",
+                        ag_id="",
+                        exception=_cluster_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for cluster",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["cluster"] += 1
             _phase_b_producer_exceptions["cluster"] = (
                 _phase_b_producer_exceptions.get("cluster", 0) + 1
@@ -14349,7 +14395,30 @@ def _run_lever_loop(
             _current_iter_inputs.setdefault("decision_records", []).extend(
                 [r.to_dict() for r in _rca_formed]
             )
-        except Exception:
+        except Exception as _rca_formed_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="rca_formed",
+                        ag_id="",
+                        exception=_rca_formed_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for rca_formed",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["rca_formed"] += 1
             _phase_b_producer_exceptions["rca_formed"] = (
                 _phase_b_producer_exceptions.get("rca_formed", 0) + 1
@@ -14377,7 +14446,30 @@ def _run_lever_loop(
             _current_iter_inputs.setdefault("decision_records", []).extend(
                 [r.to_dict() for r in _unresolved_records]
             )
-        except Exception:
+        except Exception as _unresolved_rca_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="unresolved_rca",
+                        ag_id="",
+                        exception=_unresolved_rca_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for unresolved_rca",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["unresolved_rca"] = (
                 _phase_b_producer_exceptions.get("unresolved_rca", 0) + 1
             )
@@ -16623,7 +16715,30 @@ def _run_lever_loop(
                     )
                     if _phase_b_strict_mode():
                         raise
-        except Exception:
+        except Exception as _lever5_structural_gate_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="lever5_structural_gate",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_lever5_structural_gate_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for lever5_structural_gate",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["lever5_structural_gate"] = (
                 _phase_b_producer_exceptions.get("lever5_structural_gate", 0) + 1
             )
@@ -16711,6 +16826,29 @@ def _run_lever_loop(
                 except Exception as _force_exc:
                     _force_outcome = "raised"
                     _force_exception_repr = repr(_force_exc)[:512]
+                    try:
+                        from genie_space_optimizer.common.config import (
+                            phase_b_producer_typed_exceptions_enabled as _typed_on,
+                        )
+                        if _typed_on():
+                            from genie_space_optimizer.optimization.decision_emitters import (
+                                producer_exception_record as _producer_exception_record,
+                            )
+                            _pe_rec = _producer_exception_record(
+                                run_id=run_id,
+                                iteration=iteration_counter,
+                                producer="forced_lever6_n3",
+                                ag_id=str((ag or {}).get("id") or ""),
+                                exception=_force_exc,
+                            )
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_pe_rec.to_dict())
+                    except Exception:
+                        logger.debug(
+                            "Phase B: producer_exception_record emission failed for forced_lever6_n3",
+                            exc_info=True,
+                        )
                     _phase_b_producer_exceptions["forced_lever6_n3"] = (
                         _phase_b_producer_exceptions.get(
                             "forced_lever6_n3", 0
@@ -16780,7 +16918,30 @@ def _run_lever_loop(
                         exception_repr=_force_exception_repr,
                         iter_inputs=_current_iter_inputs,
                     )
-        except Exception:
+        except Exception as _forced_lever6_n3_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="forced_lever6_n3",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_forced_lever6_n3_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for forced_lever6_n3",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["forced_lever6_n3"] = (
                 _phase_b_producer_exceptions.get(
                     "forced_lever6_n3", 0
@@ -17617,7 +17778,30 @@ def _run_lever_loop(
             # lost). TODO follow-up: extend ActionGroupSlate with a
             # records tuple OR re-derive from _current_iter_inputs[
             # "decision_records"] tail.
-        except Exception:
+        except Exception as _strategist_ag_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="strategist_ag",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_strategist_ag_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for strategist_ag",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["strategist_ag"] += 1
             _phase_b_producer_exceptions["strategist_ag"] = (
                 _phase_b_producer_exceptions.get("strategist_ag", 0) + 1
@@ -17674,7 +17858,30 @@ def _run_lever_loop(
                 _current_iter_inputs.setdefault(
                     "decision_records", []
                 ).extend([r.to_dict() for r in _gate_records_ag])
-        except Exception:
+        except Exception as _groundedness_ag_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="groundedness_ag",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_groundedness_ag_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for groundedness_ag",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["groundedness_ag"] = (
                 _phase_b_producer_exceptions.get("groundedness_ag", 0) + 1
             )
@@ -17809,7 +18016,30 @@ def _run_lever_loop(
             # when wired. Until F6 lands, the harness's all_proposals
             # (already fingerprinted by :14311) is the canonical input
             # to downstream gates — DO NOT replace.
-        except Exception:
+        except Exception as _proposal_generated_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="proposal_generated",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_proposal_generated_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for proposal_generated",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["proposal_generated"] += 1
             _phase_b_producer_exceptions["proposal_generated"] = (
                 _phase_b_producer_exceptions.get("proposal_generated", 0) + 1
@@ -17863,7 +18093,30 @@ def _run_lever_loop(
                 _current_iter_inputs.setdefault(
                     "decision_records", []
                 ).extend([r.to_dict() for r in _gate_records_p])
-        except Exception:
+        except Exception as _groundedness_proposal_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="groundedness_proposal",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_groundedness_proposal_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for groundedness_proposal",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["groundedness_proposal"] = (
                 _phase_b_producer_exceptions.get("groundedness_proposal", 0) + 1
             )
@@ -18425,7 +18678,30 @@ def _run_lever_loop(
                     _current_iter_inputs.setdefault(
                         "decision_records", []
                     ).extend([r.to_dict() for r in _br_records])
-                except Exception:
+                except Exception as _blast_radius_exc:
+                    try:
+                        from genie_space_optimizer.common.config import (
+                            phase_b_producer_typed_exceptions_enabled as _typed_on,
+                        )
+                        if _typed_on():
+                            from genie_space_optimizer.optimization.decision_emitters import (
+                                producer_exception_record as _producer_exception_record,
+                            )
+                            _pe_rec = _producer_exception_record(
+                                run_id=run_id,
+                                iteration=iteration_counter,
+                                producer="blast_radius",
+                                ag_id=str((ag or {}).get("id") or ""),
+                                exception=_blast_radius_exc,
+                            )
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_pe_rec.to_dict())
+                    except Exception:
+                        logger.debug(
+                            "Phase B: producer_exception_record emission failed for blast_radius",
+                            exc_info=True,
+                        )
                     _phase_b_producer_exceptions["blast_radius"] = (
                         _phase_b_producer_exceptions.get("blast_radius", 0)
                         + 1
@@ -19425,7 +19701,30 @@ def _run_lever_loop(
                     _current_iter_inputs.setdefault(
                         "decision_records", []
                     ).extend([r.to_dict() for r in _doa_records])
-                except Exception:
+                except Exception as _dead_on_arrival_exc:
+                    try:
+                        from genie_space_optimizer.common.config import (
+                            phase_b_producer_typed_exceptions_enabled as _typed_on,
+                        )
+                        if _typed_on():
+                            from genie_space_optimizer.optimization.decision_emitters import (
+                                producer_exception_record as _producer_exception_record,
+                            )
+                            _pe_rec = _producer_exception_record(
+                                run_id=run_id,
+                                iteration=iteration_counter,
+                                producer="dead_on_arrival",
+                                ag_id=str((ag or {}).get("id") or ""),
+                                exception=_dead_on_arrival_exc,
+                            )
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_pe_rec.to_dict())
+                    except Exception:
+                        logger.debug(
+                            "Phase B: producer_exception_record emission failed for dead_on_arrival",
+                            exc_info=True,
+                        )
                     _phase_b_producer_exceptions["dead_on_arrival"] = (
                         _phase_b_producer_exceptions.get(
                             "dead_on_arrival", 0
@@ -19740,7 +20039,30 @@ def _run_lever_loop(
             # _applied_set.applied is tuple[AppliedPatch, ...]; available
             # for downstream stages (F8 acceptance, F9 learning) when
             # those wire-ups land.
-        except Exception:
+        except Exception as _patch_applied_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="patch_applied",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_patch_applied_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for patch_applied",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["patch_applied"] += 1
             _phase_b_producer_exceptions["patch_applied"] = (
                 _phase_b_producer_exceptions.get("patch_applied", 0) + 1
@@ -20759,7 +21081,30 @@ def _run_lever_loop(
                     for e in _observed
                 ]
             )
-        except Exception:
+        except Exception as _observed_effect_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="observed_effect",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_observed_effect_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for observed_effect",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["observed_effect"] = (
                 _phase_b_producer_exceptions.get("observed_effect", 0) + 1
             )
@@ -21472,7 +21817,30 @@ def _run_lever_loop(
             _current_iter_inputs.setdefault("decision_records", []).extend(
                 [r.to_dict() for r in _orphan_records]
             )
-        except Exception:
+        except Exception as _orphan_rca_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="orphan_rca",
+                        ag_id="",
+                        exception=_orphan_rca_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase B: producer_exception_record emission failed for orphan_rca",
+                    exc_info=True,
+                )
             _phase_b_producer_exceptions["orphan_rca"] = (
                 _phase_b_producer_exceptions.get("orphan_rca", 0) + 1
             )
