@@ -102,3 +102,49 @@ def test_phase_b_emit_ag_outcome_skips_typed_record_when_flag_off(monkeypatch) -
     _emit_ag_outcome({"id": "AG_X"}, "rolled_back")
     assert iter_exc["ag_outcome"] == 1
     assert decision_records == []  # flag off → no typed record
+
+
+def test_phase_f_h_a5_acceptance_stage_appends_typed_exception_record(monkeypatch) -> None:
+    """Cycle 11 — Site 2 wiring contract for the acceptance-stage A5
+    wrap. Mirrors the Site 1 closure shape but uses the outer ``ag``
+    in scope. The actual harness site is at harness.py:~20192.
+    """
+    monkeypatch.delenv("GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS", raising=False)
+
+    from genie_space_optimizer.optimization import decision_emitters as _de
+
+    decision_records: list[dict] = []
+    iter_exc: dict[str, int] = {"ag_outcome": 0}
+
+    def _accept_stage_run(ag):
+        # Mirror the except body in harness.py at the Phase F+H A5 site.
+        try:
+            raise RuntimeError("synthetic acceptance-stage failure")
+        except Exception as _accept_stage_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled,
+                )
+                if phase_b_producer_typed_exceptions_enabled():
+                    rec = _de.producer_exception_record(
+                        run_id="run-a5",
+                        iteration=3,
+                        producer="ag_outcome",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_accept_stage_exc,
+                    )
+                    decision_records.append(rec.to_dict())
+            except Exception:
+                pass
+            iter_exc["ag_outcome"] += 1
+
+    _accept_stage_run({"id": "AG_DECOMPOSED_H002"})
+
+    assert iter_exc["ag_outcome"] == 1
+    assert len(decision_records) == 1
+    rec = decision_records[0]
+    assert rec["decision_type"] == "producer_exception"
+    assert rec["ag_id"] == "AG_DECOMPOSED_H002"
+    assert rec["metrics"]["producer"] == "ag_outcome"
+    assert rec["metrics"]["exception_class"] == "RuntimeError"
+    assert rec["iteration"] == 3

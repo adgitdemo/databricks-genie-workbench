@@ -13734,7 +13734,7 @@ def _run_lever_loop(
                             run_id=run_id,
                             iteration=iteration_counter,
                             producer="ag_retired",
-                            ag_id=str((ag or {}).get("id") or ""),
+                            ag_id="",  # plateau path: no single AG in scope
                             exception=_learning_stage_exc,
                         )
                         _current_iter_inputs.setdefault(
