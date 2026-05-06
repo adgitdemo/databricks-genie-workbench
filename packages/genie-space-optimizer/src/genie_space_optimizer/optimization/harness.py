@@ -78,6 +78,7 @@ from genie_space_optimizer.common.config import (
     MAX_BENCHMARK_COUNT,
     MAX_ITERATIONS,
     MAX_NOISE_FLOOR,
+    MIN_POST_ARBITER_GAIN_PP,
     NEITHER_CORRECT_QUARANTINE_THRESHOLD,
     NEITHER_CORRECT_REPAIR_THRESHOLD,
     PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
@@ -2162,6 +2163,35 @@ def _candidate_pre_arbiter_from_gate(gate_result) -> float:
     """
     val = (gate_result or {}).get("full_pre_arbiter_accuracy")
     return float(val if val is not None else 0.0)
+
+
+def _baseline_rows_for_acceptance_input(
+    *, accepted_baseline_rows: list[dict] | None
+) -> tuple[dict, ...]:
+    """Source ``pre_rows`` for the rollback-side ``AcceptanceInput``
+    from ``_run_lever_loop``'s own
+    ``_accepted_baseline_rows_for_control_plane`` rather than from
+    the gate's inner-scope ``_baseline_rows_for_control_plane``.
+
+    Closes Bug C — the cross-scope ``NameError`` that Cycle 11's
+    typed ``PRODUCER_EXCEPTION`` decision record surfaced in run
+    ``476499410793687`` (7now, parent run
+    ``3b050ec5-4032-457f-a785-2d1a3942a097``):
+
+        NameError("name '_baseline_rows_for_control_plane' is not defined")
+
+    ``_baseline_rows_for_control_plane`` is assigned ONLY inside
+    ``_run_gate_checks`` (a sibling module-level function); reading
+    it inside ``_run_lever_loop`` is a free-variable lookup that
+    fails LEGB. ``_run_lever_loop`` already owns the architecturally
+    correct source as ``_accepted_baseline_rows_for_control_plane``
+    and already passes that value into the gate.
+
+    Pure: no I/O, no scope leakage. Mirrors the
+    ``_candidate_pre_arbiter_from_gate`` (Bug A) and
+    ``_f9_accuracy_delta_safe`` (Bug B) helpers.
+    """
+    return tuple(accepted_baseline_rows or [])
 
 
 def _f9_accuracy_delta_safe(gate_result, best_accuracy) -> float:
@@ -17787,22 +17817,29 @@ def _run_lever_loop(
                             sorted({str(d.get("reason")) for d in _rca_shape_drops}),
                         )
                         for _drop in _rca_shape_drops:
-                            _audit_emit(
-                                stage_letter="G",
-                                gate_name="rca_column_shape_normalization",
-                                decision="reject",
-                                reason_code="rca_theme_shape_dropped",
-                                reason_detail=(
-                                    f"proposal_id={_drop.get('proposal_id')} "
-                                    f"reason={_drop.get('reason')}"
-                                ),
-                                affected_qids=[],
-                                metrics={
-                                    "proposal_id": _drop.get("proposal_id"),
-                                    "patch_type": _drop.get("patch_type"),
-                                    "reason": _drop.get("reason"),
-                                    "output_count": _drop.get("output_count"),
-                                },
+                            # TODO(cycle-13): re-wire to an audit emitter
+                            # exposed by ``_run_gate_checks`` (or a new
+                            # module-level audit helper). The previous
+                            # ``_audit_emit(...)`` here referenced
+                            # ``_run_gate_checks``'s inner closure — a
+                            # cross-scope leak in the same family as
+                            # Bug A/B/C/D. The Cycle 11 typed
+                            # PRODUCER_EXCEPTION instrumentation never
+                            # fired because the surrounding ``try`` at
+                            # :17837 swallowed the NameError, silently
+                            # losing the audit trail. Logged here for
+                            # observability until the audit emitter is
+                            # rehomed.
+                            logger.debug(
+                                "[%s] rca_theme_shape_dropped audit "
+                                "(stage=G gate=rca_column_shape_normalization "
+                                "reason=%s proposal_id=%s patch_type=%s "
+                                "output_count=%s)",
+                                ag_id,
+                                _drop.get("reason"),
+                                _drop.get("proposal_id"),
+                                _drop.get("patch_type"),
+                                _drop.get("output_count"),
                             )
             except Exception:
                 logger.debug(
@@ -19390,12 +19427,28 @@ def _run_lever_loop(
                             "gates; halting AG before patch_cap",
                             ag.get("id") or ag.get("ag_id"),
                         )
-                        _audit_emit(
-                            stage_letter="L",
-                            gate_name="patch_cap",
-                            decision="skipped",
-                            reason_code="no_causal_applyable_patch",
-                            metrics={"input_count": len(_before_cap)},
+                        # TODO(cycle-13): re-wire to an audit emitter
+                        # exposed by ``_run_gate_checks`` (or a new
+                        # module-level helper). The previous
+                        # ``_audit_emit(...)`` here referenced
+                        # ``_run_gate_checks``'s inner closure — a
+                        # cross-scope leak in the same family as
+                        # Bug A/B/C/D, undefended on this code path
+                        # (would NameError every time the
+                        # ``no_causal_applyable_patch`` branch was
+                        # taken). The Cycle 11 typed
+                        # PRODUCER_EXCEPTION instrumentation would
+                        # have caught it; the surrounding outer
+                        # ``try/finally`` (commit 7f538a4) would
+                        # then finalize with
+                        # ``exit_path="exception"`` and lose the
+                        # iteration. Logged here for observability
+                        # until the audit emitter is rehomed.
+                        logger.debug(
+                            "[%s] no_causal_applyable_patch audit "
+                            "(stage=L gate=patch_cap input_count=%d)",
+                            ag.get("id") or ag.get("ag_id"),
+                            len(_before_cap),
                         )
                         patches = []
                         _patch_cap_decisions = []
@@ -20743,7 +20796,9 @@ def _run_lever_loop(
                         candidate_accuracy=_accept_candidate_accuracy,
                         baseline_pre_arbiter_accuracy=float(_iter_best_pre_arbiter),
                         candidate_pre_arbiter_accuracy=_accept_candidate_pre_arbiter,
-                        pre_rows=tuple(_baseline_rows_for_control_plane or []),
+                        pre_rows=_baseline_rows_for_acceptance_input(
+                            accepted_baseline_rows=_accepted_baseline_rows_for_control_plane,
+                        ),
                         post_rows=tuple(_accept_post_rows),
                         protected_qids=(),
                         min_gain_pp=float(MIN_POST_ARBITER_GAIN_PP),

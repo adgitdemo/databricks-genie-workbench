@@ -50,6 +50,22 @@ FIXTURES = {
         / "fixtures"
         / "run_40405156883710_airline_pre_bugb_fix.json"
     ),
+    # Run 476499410793687 — captured WITH Cycle 11 instrumentation
+    # active in production AND with the Bug A NameError absent
+    # (post-Bug-A-fix), exposing the third sibling: a NameError on
+    # ``_baseline_rows_for_control_plane`` at the rollback-side
+    # ``AcceptanceInput`` call site (``harness.py:20746``).
+    # Committed as a pre-Bug-C-fix regression marker. The
+    # accompanying assertion
+    # (``test_no_baseline_rows_for_control_plane_nameerror_in_committed_fixtures``)
+    # skips this fixture so the bug-on-disk does not block merge of
+    # the fix; it asserts against every other fixture so any fresh
+    # run that re-introduces the same NameError fails CI.
+    "476499410793687_7now_pre_bugc_fix": (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "run_476499410793687_7now_pre_bugc_fix.json"
+    ),
 }
 
 # Fixtures that pre-date the harness.py:_run_lever_loop cross-scope
@@ -70,6 +86,15 @@ _PRE_NAMEERROR_FIX_FIXTURES = frozenset({
 # exempted from the post-Bug-B-fix assertion.
 _PRE_BUGB_FIX_FIXTURES = frozenset({
     "40405156883710_airline_pre_bugb_fix",
+})
+
+# Fixtures that pre-date the harness.py:_run_lever_loop Bug C
+# (``NameError`` on ``_baseline_rows_for_control_plane`` at the
+# rollback-side ``AcceptanceInput`` call site, ``:20746``). Kept on
+# disk for regression provenance and exempted from the post-Bug-C-fix
+# assertion.
+_PRE_BUGC_FIX_FIXTURES = frozenset({
+    "476499410793687_7now_pre_bugc_fix",
 })
 
 
@@ -386,4 +411,58 @@ def test_no_full_accuracy_unbound_local_error_in_committed_fixtures(
                 f"UnboundLocalError reproduced in fixture "
                 f"{fixture_id} — the harness.py:_run_lever_loop F9 "
                 f"plateau-termination fix has regressed. Record: {rec}"
+            )
+
+
+def test_no_baseline_rows_for_control_plane_nameerror_in_committed_fixtures(
+    fixture, request
+):
+    """Regression — once the harness.py:20746 fix lands, no fixture
+    should carry a ``producer_exception`` decision record naming
+    ``_baseline_rows_for_control_plane`` as the missing name with a
+    ``NameError``.
+
+    Closes Bug C surfaced by Cycle 11's typed
+    ``PRODUCER_EXCEPTION`` record in run 476499410793687 (parent
+    run 3b050ec5-4032-457f-a785-2d1a3942a097, 7now). Same family as
+    Bug A (``full_pre_arbiter_accuracy``) and Bug B
+    (``full_accuracy``) — an inner-helper variable name leaked to
+    the outer ``_run_lever_loop`` scope. The
+    ``test_run_lever_loop_has_no_inner_helper_variable_leaks``
+    structural lint added in this commit prevents new family
+    members from regressing into ``_run_lever_loop``; this
+    fixture-driven assertion is the runtime/empirical complement.
+
+    Fixtures captured before the fix are kept on disk for
+    provenance (see ``_PRE_BUGC_FIX_FIXTURES``) and skipped by this
+    assertion. Every other fixture — including any future post-fix
+    capture — must be free of the
+    ``_baseline_rows_for_control_plane`` ``NameError``.
+    """
+    fixture_id = request.node.callspec.id
+    if fixture_id in _PRE_BUGC_FIX_FIXTURES:
+        pytest.skip(
+            f"fixture {fixture_id} pre-dates the harness.py "
+            "_run_lever_loop _baseline_rows_for_control_plane "
+            "NameError fix (Bug C) — kept on disk for regression "
+            "provenance"
+        )
+
+    for it in fixture.get("iterations") or []:
+        for rec in it.get("decision_records") or []:
+            if str(rec.get("decision_type") or "") != "producer_exception":
+                continue
+            metrics = rec.get("metrics") or {}
+            exception_class = str(metrics.get("exception_class") or "")
+            repr_text = str(metrics.get("exception_repr") or "")
+            traceback_head = str(metrics.get("traceback_head") or "")
+            blob = f"{repr_text}\n{traceback_head}"
+            if exception_class != "NameError":
+                continue
+            assert "_baseline_rows_for_control_plane" not in blob, (
+                f"iter {it.get('iteration')}: "
+                f"_baseline_rows_for_control_plane NameError "
+                f"reproduced in fixture {fixture_id} — the "
+                f"harness.py:_run_lever_loop rollback-side "
+                f"AcceptanceInput fix has regressed. Record: {rec}"
             )
