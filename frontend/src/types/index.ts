@@ -426,6 +426,7 @@ export interface GSOIterationResult {
   correct_count: number
   excluded_count?: number | null
   quarantined_benchmarks_json?: string | null
+  rolled_back?: boolean | null
   scores_json: string | Record<string, number>
   thresholds_met: boolean
   reflection_json?: string | Record<string, any> | null

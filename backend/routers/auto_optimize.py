@@ -47,7 +47,7 @@ _ITER_COLS = _ITER_COLS_V2 = (
     "iteration, eval_scope, overall_accuracy, total_questions, correct_count, "
     "evaluated_count, excluded_count, quarantined_benchmarks_json, "
     "scores_json, failures_json, thresholds_met, lever, repeatability_pct, "
-    "reflection_json, mlflow_run_id"
+    "reflection_json, mlflow_run_id, rolled_back"
 )
 _ITER_COLS_LEGACY = (
     "iteration, eval_scope, overall_accuracy, total_questions, correct_count, "
@@ -130,7 +130,7 @@ def _delta_table(name: str) -> str:
     return f"{config.catalog}.{config.schema_name}.{name}"
 
 
-# Bug #2 regression (April 2026): `_ITER_COLS_V2` requires three columns that
+# Bug #2 regression (April 2026): `_ITER_COLS_V2` requires columns that
 # only land on the Delta table when the GSO job's `_migrate_add_columns`
 # runs (see `packages/genie-space-optimizer/.../optimization/state.py`). If
 # the app wheel and the job wheel are on different deploy versions — e.g. the
@@ -163,7 +163,7 @@ def probe_iterations_schema() -> str:
     table = _delta_table("genie_opt_iterations")
     try:
         _delta_query(
-            f"SELECT evaluated_count, excluded_count, quarantined_benchmarks_json "
+            f"SELECT evaluated_count, excluded_count, quarantined_benchmarks_json, rolled_back "
             f"FROM {table} LIMIT 0",
             strict=True,
         )
@@ -174,7 +174,7 @@ def probe_iterations_schema() -> str:
                 "columns. The UI will fall back to stored overall_accuracy but "
                 "accuracy may appear stale until the GSO job bundle redeploys "
                 "and _migrate_add_columns adds evaluated_count / excluded_count "
-                "/ quarantined_benchmarks_json. err=%s",
+                "/ quarantined_benchmarks_json / rolled_back. err=%s",
                 table,
                 str(exc)[:200],
             )
@@ -183,7 +183,7 @@ def probe_iterations_schema() -> str:
         logger.warning("Schema probe failed: %s", str(exc)[:200])
         return "unreachable"
     _iterations_schema_legacy = False
-    logger.info("gso.runs.schema_ok %s has all Bug #2 denominator columns", table)
+    logger.info("gso.runs.schema_ok %s has all Bug #2 score-selection columns", table)
     return "ok"
 
 
@@ -193,6 +193,7 @@ _LEGACY_COL_ERROR_MARKERS = (
     "evaluated_count",
     "excluded_count",
     "quarantined_benchmarks_json",
+    "rolled_back",
 )
 
 
@@ -231,7 +232,7 @@ def _select_iterations_delta(run_id: str) -> list[dict]:
             return []
         logger.warning(
             "gso.runs.schema_drift genie_opt_iterations is missing Bug #2 columns "
-            "(evaluated_count / excluded_count / quarantined_benchmarks_json). "
+            "(evaluated_count / excluded_count / quarantined_benchmarks_json / rolled_back). "
             "Falling back to the legacy SELECT — scores render from stored "
             "overall_accuracy. Redeploy the GSO job bundle so "
             "_migrate_add_columns can ALTER TABLE ADD COLUMN. err=%s",
