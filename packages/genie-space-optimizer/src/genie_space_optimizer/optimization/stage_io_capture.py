@@ -315,6 +315,17 @@ def wrap_with_io_capture(
                 )
 
         if execute_exc is not None:
+            try:
+                record_capture_failure(
+                    stage_key=stage_key,
+                    artifact_path=paths["output"],
+                    error_class=type(execute_exc).__name__,
+                )
+            except Exception:
+                logger.debug(
+                    "stage_io_capture[%s]: record_capture_failure for execute_exc failed",
+                    stage_key, exc_info=True,
+                )
             raise execute_exc
         return out
     return wrapper
