@@ -264,3 +264,46 @@ def test_i6_green_when_paths_equal() -> None:
         "materialized_paths": ["a", "b"],
     }}
     assert check_i6_manifest_paths(evidence) == []
+
+
+def test_i7_red_when_open_cluster_has_no_rca_card_or_block_record() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i7_rca_grounding
+
+    evidence = {"iterations": [{
+        "iteration": 1,
+        "open_hard_cluster_ids": ["H001", "H003", "H004", "H005"],
+        "rca_cards_present": {"H001": False, "H003": False, "H004": False, "H005": False},
+        "decision_records": [],
+    }]}
+    violations = check_i7_rca_grounding(evidence)
+    ungrounded = {v.get("cluster_id") for v in violations if v["invariant_id"] == "I7"}
+    assert ungrounded == {"H001", "H003", "H004", "H005"}
+
+
+def test_i7_green_when_block_record_emitted() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i7_rca_grounding
+
+    evidence = {"iterations": [{
+        "iteration": 1,
+        "open_hard_cluster_ids": ["H001"],
+        "rca_cards_present": {"H001": False},
+        "decision_records": [
+            {
+                "decision_type": "cluster_blocked_no_rca",
+                "cluster_id": "H001",
+            }
+        ],
+    }]}
+    assert check_i7_rca_grounding(evidence) == []
+
+
+def test_i7_green_when_rca_card_present() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i7_rca_grounding
+
+    evidence = {"iterations": [{
+        "iteration": 1,
+        "open_hard_cluster_ids": ["H002"],
+        "rca_cards_present": {"H002": True},
+        "decision_records": [],
+    }]}
+    assert check_i7_rca_grounding(evidence) == []

@@ -310,8 +310,42 @@ def check_i6_manifest_paths(evidence: Mapping[str, Any]) -> list[dict]:
     )]
 
 
-# Stubs for I7..I8 — populated in subsequent tasks. The aggregator
-# tolerates missing checks so each can land in its own commit.
+def check_i7_rca_grounding(evidence: Mapping[str, Any]) -> list[dict]:
+    """I7 — every open hard cluster reaching AG-emit has either a fit
+    RCA card or a typed cluster_blocked_no_rca decision record. Closes
+    7NOW iter-1 where 4/5 hard clusters had no RCA card but the
+    strategist proceeded to AG-emit anyway."""
+    violations: list[dict] = []
+    for it in evidence.get("iterations") or []:
+        open_clusters = [str(c) for c in (it.get("open_hard_cluster_ids") or [])]
+        rca_present = {
+            str(k): bool(v) for k, v in (it.get("rca_cards_present") or {}).items()
+        }
+        blocked_clusters = {
+            str(r.get("cluster_id") or "")
+            for r in (it.get("decision_records") or [])
+            if str(r.get("decision_type") or "") == "cluster_blocked_no_rca"
+        }
+        for cid in open_clusters:
+            if rca_present.get(cid):
+                continue
+            if cid in blocked_clusters:
+                continue
+            violations.append(_violation(
+                invariant_id="I7",
+                title="open_cluster_ungrounded_at_ag_emit",
+                detail=(
+                    f"cluster {cid} reached AG-emit with no fit RCA card "
+                    f"and no cluster_blocked_no_rca record"
+                ),
+                iteration=int(it.get("iteration") or 0),
+                cluster_id=cid,
+            ))
+    return violations
+
+
+# Stub for I8 — populated in the next task. The aggregator tolerates
+# missing checks so each can land in its own commit.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
     """Aggregate every implemented invariant check; return all
@@ -324,6 +358,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
         check_i4_no_silent_retry,
         check_i5_replay_validity,
         check_i6_manifest_paths,
+        check_i7_rca_grounding,
     ):
         try:
             violations.extend(check(evidence))
