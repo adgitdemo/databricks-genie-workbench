@@ -189,6 +189,6 @@ def test_harness_captures_pre_ag_snapshot_failed_outcome() -> None:
     src = _read_harness_source()
     assert (
         '_current_iter_inputs["ag_outcomes"][str(ag_id)] = (\n'
-        '                    "skipped_pre_ag_snapshot_failed"\n'
-        "                )"
+        '                        "skipped_pre_ag_snapshot_failed"\n'
+        "                    )"
     ) in src

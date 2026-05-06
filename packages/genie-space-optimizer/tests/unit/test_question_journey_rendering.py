@@ -52,7 +52,11 @@ def test_render_question_journey_once_marks_rendered_when_empty(capsys) -> None:
 def test_run_lever_loop_calls_journey_render_before_rollback_continue() -> None:
     src = inspect.getsource(harness._run_lever_loop)
     rollback_idx = src.index('if not gate_result.get("passed")')
-    window = src[rollback_idx: rollback_idx + 900]
+    # Window expanded from 900 → 1200 chars to absorb the +4-space
+    # iteration body indentation introduced by the Bug B fix's
+    # ``try/finally`` wrap of the iteration loop body. Substring
+    # contract is unchanged.
+    window = src[rollback_idx: rollback_idx + 1200]
     assert "_render_current_journey()" in window, (
         "Rollback path must render the journey ledger before rollback reflection "
         "bookkeeping can continue to the next AG."

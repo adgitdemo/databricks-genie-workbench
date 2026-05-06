@@ -364,6 +364,96 @@ def _compute_iteration_counters(
     return (accepted, rolled_back, skipped, gate_drop)
 
 
+def _run_iteration_invariants_and_append_records(
+    *,
+    run_id: str,
+    iteration: int,
+    current_iter_inputs: dict[str, Any],
+    iter_producer_exceptions: dict | None = None,
+) -> None:
+    """Cycle 11 Task 12 — run the invariant suite and append typed
+    ``INVARIANT_VIOLATION`` decision records to
+    ``current_iter_inputs["decision_records"]``.
+
+    Crash-resilient by construction: this helper is invoked from
+    ``_finalize_iteration_summary``, which is in turn invoked from
+    every iteration-exit code path inside ``_run_lever_loop``
+    (``continue``, ``break``, normal end, and the
+    ``exit_path=exception`` fallback added in the Bug B fix).
+
+    Closes the structural gap surfaced by run ``40405156883710``
+    (airline, parent run ``1099b152-8655-4f1e-ab43-1240a9400280``)
+    where the previous wiring placed the runner *after*
+    ``_finalize_iteration_summary`` in the iteration's happy-path
+    body. When a producer exception fired earlier, the absorber
+    pushed control through a ``continue`` that called
+    ``_finalize_iteration_summary`` and skipped the invariant runner
+    entirely — i.e., the very iterations where invariants would
+    surface the most were the iterations where they didn't run.
+
+    Pure-by-default: silently no-ops when ``run_id`` is empty (so
+    callers that have not yet been migrated continue to work), and
+    swallows non-strict exceptions in the invariant runner / record
+    emitters via ``logger.debug``. Strict mode (``loop_invariants_strict()``)
+    re-raises ``AssertionError`` for CI/replay.
+    """
+    if not run_id:
+        return
+    try:
+        from genie_space_optimizer.common.config import (
+            loop_invariants_enabled as _inv_enabled,
+            loop_invariants_strict as _inv_strict,
+        )
+        if not _inv_enabled():
+            return
+        from genie_space_optimizer.optimization.invariants import (
+            run_invariants as _run_invariants,
+        )
+        from genie_space_optimizer.optimization.decision_emitters import (
+            invariant_violation_record as _invariant_violation_record,
+        )
+
+        _iter_evidence = {
+            "phase_b": {
+                "total_records": len(
+                    current_iter_inputs.get("decision_records") or []
+                ),
+                "producer_exceptions": dict(iter_producer_exceptions or {}),
+            },
+            "replay_fixture_records": 0,
+            "iterations": [],
+            "manifest": {"declared_paths": [], "materialized_paths": []},
+            "convergence": {},
+        }
+        _violations = _run_invariants(_iter_evidence)
+        if _violations and _inv_strict():
+            raise AssertionError(
+                f"INVARIANT_VIOLATION (strict): {_violations}"
+            )
+        for _v in _violations:
+            try:
+                _rec = _invariant_violation_record(
+                    run_id=run_id,
+                    iteration=iteration,
+                    violation=_v,
+                )
+                current_iter_inputs.setdefault(
+                    "decision_records", []
+                ).append(_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Cycle 11 Task 12: invariant_violation_record emission failed",
+                    exc_info=True,
+                )
+    except AssertionError:
+        raise
+    except Exception:
+        logger.debug(
+            "Cycle 11 Task 12: invariant suite execution failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 def _finalize_iteration_summary(
     *,
     iter_traces: dict[int, Any],
@@ -378,6 +468,8 @@ def _finalize_iteration_summary(
     gate_drop_count: int,
     iteration_accuracy_percent: float | None,
     exit_path: str,
+    run_id: str = "",
+    iter_producer_exceptions: dict | None = None,
 ) -> None:
     """Overwrite the iteration's pre-stamped stub with rich data.
 
@@ -387,7 +479,21 @@ def _finalize_iteration_summary(
     dropped silently so a partial / legacy record does not prevent the
     iteration from being finalised — the iteration still renders with
     its ``exit_path`` label.
+
+    Cycle 11 follow-up (Bug B fix): when ``run_id`` is non-empty, run
+    the invariant suite *before* materialising the trace/summary so
+    any emitted ``INVARIANT_VIOLATION`` records appear inside both
+    ``iter_traces[iteration]`` and the rendered
+    ``decision_record_count``. Skipped silently for legacy callers
+    that don't pass ``run_id``.
     """
+    _run_iteration_invariants_and_append_records(
+        run_id=run_id,
+        iteration=iteration,
+        current_iter_inputs=current_iter_inputs,
+        iter_producer_exceptions=iter_producer_exceptions,
+    )
+
     from genie_space_optimizer.optimization.rca_decision_trace import (
         DecisionRecord as _PhaseH_DecisionRecord,
         OptimizationTrace as _PhaseH_OptimizationTrace,
@@ -429,6 +535,15 @@ def _finalize_iteration_summary(
         iteration_accuracy_percent=iteration_accuracy_percent,
         exit_path=exit_path,
     )
+
+    # Cycle 11 Task 12 / Bug B fix — mark this iteration as finalized so
+    # the outer ``try/finally`` guard around the iteration body in
+    # ``_run_lever_loop`` does not double-finalize on a normal exit
+    # path. Stored on ``current_iter_inputs`` (the per-iteration dict)
+    # rather than as a module-level closure so multiple concurrent loops
+    # cannot collide. The flag is read once in the iteration's
+    # ``finally`` block and never persisted into the rendered fixture.
+    current_iter_inputs["_finalized_this_iter"] = True
 
 
 def _build_loop_out_with_pretty_print(
@@ -2047,6 +2162,34 @@ def _candidate_pre_arbiter_from_gate(gate_result) -> float:
     """
     val = (gate_result or {}).get("full_pre_arbiter_accuracy")
     return float(val if val is not None else 0.0)
+
+
+def _f9_accuracy_delta_safe(gate_result, best_accuracy) -> float:
+    """Source the F9 LearningInput's ``accuracy_delta`` from
+    ``gate_result.full_accuracy`` if available, falling back to ``0.0``
+    when no candidate was evaluated this iteration (the rollback-only
+    plateau path).
+
+    Closes Bug B — the cross-scope ``UnboundLocalError`` on
+    ``full_accuracy`` at the plateau-termination F9 call site
+    (``_run_lever_loop``). ``full_accuracy`` is assigned inside
+    ``_run_lever_loop`` exclusively in the acceptance branch, so on
+    runs where every iteration is rolled back the local is never
+    bound and the read raises. Cycle 11's typed
+    ``PRODUCER_EXCEPTION`` record from run ``40405156883710`` named
+    the bug.
+
+    Pure: no I/O, no scope leakage. Mirrors the
+    ``_candidate_pre_arbiter_from_gate`` shape from the Bug A commit.
+    """
+    candidate = (
+        gate_result.get("full_accuracy")
+        if isinstance(gate_result, dict)
+        else None
+    )
+    if candidate is None:
+        return 0.0
+    return float(candidate) - float(best_accuracy or 0.0)
 
 
 def compute_current_hard_qids(
@@ -13501,319 +13644,871 @@ def _run_lever_loop(
     _lever_loop_retired_ags: list[tuple[str, tuple[str, ...]]] = []
 
     for _iter_num in range(1, max_iterations + 1):
-        # ── Exit checks ──────────────────────────────────────────────
-        from genie_space_optimizer.optimization.acceptance_policy import (
-            arbiter_objective_complete_from_counts,
-        )
-
-        if arbiter_objective_complete_from_counts(
-            post_arbiter_accuracy=float(best_accuracy),
-            total_questions=_best_total_questions,
-            evaluated_count=_best_evaluated_count,
-            blocking_excluded_count=_best_blocking_excluded_count,
-        ):
-            logger.info(
-                "Post-arbiter objective reached: %.1f%% over %d/%d scored rows with no blocking exclusions. Stopping lever loop.",
-                float(best_accuracy),
-                int(_best_evaluated_count),
-                int(_best_total_questions),
+        try:
+            # ── Exit checks ──────────────────────────────────────────────
+            from genie_space_optimizer.optimization.acceptance_policy import (
+                arbiter_objective_complete_from_counts,
             )
-            break
-        if all_thresholds_met(best_scores, thresholds):
-            logger.info(
-                "Thresholds met before iteration %d, but lever-loop objective is not complete; continuing toward 100%% post-arbiter accuracy.",
-                _iter_num,
-            )
-        from genie_space_optimizer.optimization.rca_terminal import (
-            RcaTerminalDecision as _RcaTerminalDecision,
-            RcaTerminalStatus as _RcaTerminalStatus,
-            legacy_plateau_allows_stop,
-        )
 
-        _plateau_detected = _diminishing_returns(reflection_buffer)
-        _prev_terminal_state = metadata_snapshot.get("_rca_terminal_state") or {}
-        _prev_terminal_decision: _RcaTerminalDecision | None
-        if _prev_terminal_state:
-            try:
-                _prev_terminal_decision = _RcaTerminalDecision(
-                    status=_RcaTerminalStatus(
-                        _prev_terminal_state.get("status")
-                        or _RcaTerminalStatus.PATCHABLE_IN_PROGRESS.value
-                    ),
-                    should_continue=bool(
-                        _prev_terminal_state.get("should_continue", True)
-                    ),
-                    reason=str(_prev_terminal_state.get("reason") or ""),
+            if arbiter_objective_complete_from_counts(
+                post_arbiter_accuracy=float(best_accuracy),
+                total_questions=_best_total_questions,
+                evaluated_count=_best_evaluated_count,
+                blocking_excluded_count=_best_blocking_excluded_count,
+            ):
+                logger.info(
+                    "Post-arbiter objective reached: %.1f%% over %d/%d scored rows with no blocking exclusions. Stopping lever loop.",
+                    float(best_accuracy),
+                    int(_best_evaluated_count),
+                    int(_best_total_questions),
                 )
-            except Exception:
-                _prev_terminal_decision = None
-        else:
-            _prev_terminal_decision = None
-
-        if legacy_plateau_allows_stop(
-            plateau_detected=_plateau_detected,
-            terminal_decision=_prev_terminal_decision,
-        ):
-            logger.info(
-                "Diminishing returns confirmed by RCA terminal state at iteration %d",
-                _iter_num,
-            )
-            # Task 6 — replace the legacy unknown plateau label with a
-            # typed status that distinguishes "hard failures still
-            # quarantined", "open regression debt", and "clean plateau".
+                break
+            if all_thresholds_met(best_scores, thresholds):
+                logger.info(
+                    "Thresholds met before iteration %d, but lever-loop objective is not complete; continuing toward 100%% post-arbiter accuracy.",
+                    _iter_num,
+                )
             from genie_space_optimizer.optimization.rca_terminal import (
-                resolve_terminal_on_plateau,
-            )
-            from genie_space_optimizer.optimization.control_plane import (
-                hard_failure_qids as _hard_failure_qids_for_plateau,
+                RcaTerminalDecision as _RcaTerminalDecision,
+                RcaTerminalStatus as _RcaTerminalStatus,
+                legacy_plateau_allows_stop,
             )
 
-            # Task 20 — read the latest committed state iteration (fully
-            # accepts both 'full' and 'enrichment' eval scopes) so the
-            # plateau resolver sees the live row set rather than a stale
-            # ``full_result`` snapshot from before recent rollbacks.
-            _state_iter = load_latest_state_iteration(
-                spark, run_id, catalog, schema,
-            ) or {}
-            _plateau_rows: list[dict] = []
-            try:
-                _plateau_rows = list(_state_iter.get("rows") or [])
-            except Exception:
-                _plateau_rows = []
-            _current_hard_qids_raw = set(
-                _hard_failure_qids_for_plateau(_plateau_rows)
-            )
-            _regression_debt_qids = set(
-                _correction_state.get("regression_debt_qids", set()) or set()
-            )
-            _quarantined_qids = set(
-                _correction_state.get("quarantined_qids", set()) or set()
-            )
-            # Cycle 10 W6 — fold convergence-quarantined qids back into
-            # the still-hard set when the flag is on. Run 1099b152
-            # soft-skipped gs_009 / gs_024 into the quarantine bucket,
-            # which made ``_current_hard_qids`` empty at the plateau
-            # decision and bypassed the Cycle 9 W2 open-hard guard.
-            # Cycle 11 Task 15 — pick the right currently_failing source
-            # for the plateau decision. After a rollback, candidate-eval
-            # state may not reflect what the journey ledger considers
-            # still-hard. _state_iter (loaded above via
-            # load_latest_state_iteration) already gives us the COMMITTED
-            # baseline — i.e., the rollback-aware view — so on this
-            # codepath candidate_eval_failing is effectively the journey-
-            # ledger view today. We pass last_acceptance_was_rollback=False
-            # as the safe default; the helper is a no-op in that case
-            # but is now a stable contract for future cycles. A richer
-            # rollback-flag accumulator is a Cycle 12 follow-up.
-            _current_hard_qids = set(
-                compute_current_hard_qids(
-                    currently_failing=select_plateau_currently_failing(
-                        candidate_eval_failing=frozenset(_current_hard_qids_raw),
-                        journey_ledger_hard_qids=frozenset(_current_hard_qids_raw),
+            _plateau_detected = _diminishing_returns(reflection_buffer)
+            _prev_terminal_state = metadata_snapshot.get("_rca_terminal_state") or {}
+            _prev_terminal_decision: _RcaTerminalDecision | None
+            if _prev_terminal_state:
+                try:
+                    _prev_terminal_decision = _RcaTerminalDecision(
+                        status=_RcaTerminalStatus(
+                            _prev_terminal_state.get("status")
+                            or _RcaTerminalStatus.PATCHABLE_IN_PROGRESS.value
+                        ),
+                        should_continue=bool(
+                            _prev_terminal_state.get("should_continue", True)
+                        ),
+                        reason=str(_prev_terminal_state.get("reason") or ""),
+                    )
+                except Exception:
+                    _prev_terminal_decision = None
+            else:
+                _prev_terminal_decision = None
+
+            if legacy_plateau_allows_stop(
+                plateau_detected=_plateau_detected,
+                terminal_decision=_prev_terminal_decision,
+            ):
+                logger.info(
+                    "Diminishing returns confirmed by RCA terminal state at iteration %d",
+                    _iter_num,
+                )
+                # Task 6 — replace the legacy unknown plateau label with a
+                # typed status that distinguishes "hard failures still
+                # quarantined", "open regression debt", and "clean plateau".
+                from genie_space_optimizer.optimization.rca_terminal import (
+                    resolve_terminal_on_plateau,
+                )
+                from genie_space_optimizer.optimization.control_plane import (
+                    hard_failure_qids as _hard_failure_qids_for_plateau,
+                )
+
+                # Task 20 — read the latest committed state iteration (fully
+                # accepts both 'full' and 'enrichment' eval scopes) so the
+                # plateau resolver sees the live row set rather than a stale
+                # ``full_result`` snapshot from before recent rollbacks.
+                _state_iter = load_latest_state_iteration(
+                    spark, run_id, catalog, schema,
+                ) or {}
+                _plateau_rows: list[dict] = []
+                try:
+                    _plateau_rows = list(_state_iter.get("rows") or [])
+                except Exception:
+                    _plateau_rows = []
+                _current_hard_qids_raw = set(
+                    _hard_failure_qids_for_plateau(_plateau_rows)
+                )
+                _regression_debt_qids = set(
+                    _correction_state.get("regression_debt_qids", set()) or set()
+                )
+                _quarantined_qids = set(
+                    _correction_state.get("quarantined_qids", set()) or set()
+                )
+                # Cycle 10 W6 — fold convergence-quarantined qids back into
+                # the still-hard set when the flag is on. Run 1099b152
+                # soft-skipped gs_009 / gs_024 into the quarantine bucket,
+                # which made ``_current_hard_qids`` empty at the plateau
+                # decision and bypassed the Cycle 9 W2 open-hard guard.
+                # Cycle 11 Task 15 — pick the right currently_failing source
+                # for the plateau decision. After a rollback, candidate-eval
+                # state may not reflect what the journey ledger considers
+                # still-hard. _state_iter (loaded above via
+                # load_latest_state_iteration) already gives us the COMMITTED
+                # baseline — i.e., the rollback-aware view — so on this
+                # codepath candidate_eval_failing is effectively the journey-
+                # ledger view today. We pass last_acceptance_was_rollback=False
+                # as the safe default; the helper is a no-op in that case
+                # but is now a stable contract for future cycles. A richer
+                # rollback-flag accumulator is a Cycle 12 follow-up.
+                _current_hard_qids = set(
+                    compute_current_hard_qids(
+                        currently_failing=select_plateau_currently_failing(
+                            candidate_eval_failing=frozenset(_current_hard_qids_raw),
+                            journey_ledger_hard_qids=frozenset(_current_hard_qids_raw),
+                            last_acceptance_was_rollback=False,
+                        ),
+                        convergence_quarantined=frozenset(_quarantined_qids),
+                        retired_by_sql_delta=frozenset(),
+                        debt=frozenset(_regression_debt_qids),
+                    )
+                )
+                # Cycle 11 Task 15 — emit the plateau-input source marker.
+                try:
+                    from genie_space_optimizer.common.mlflow_markers import (
+                        plateau_input_source_marker as _plateau_marker,
+                    )
+                    _msg = _plateau_marker(
+                        optimization_run_id=run_id,
+                        iteration=_iter_num,
+                        source="candidate_eval",  # safe default; richer wiring is Cycle 12
+                        qids_count=len(_current_hard_qids_raw),
                         last_acceptance_was_rollback=False,
-                    ),
-                    convergence_quarantined=frozenset(_quarantined_qids),
-                    retired_by_sql_delta=frozenset(),
-                    debt=frozenset(_regression_debt_qids),
+                    )
+                    logger.info(_msg)
+                except Exception:
+                    logger.debug(
+                        "Cycle 11 Task 15: plateau_input_source_marker emission failed (non-fatal)",
+                        exc_info=True,
+                    )
+                # Task 20 — collect target qids for which any rejected AG
+                # produced an SQL-shape delta. The resolver routes these to
+                # UNRESOLVED_HARD_FAILURE_WITH_UNTRIED_SQL_DELTA so the loop
+                # keeps iterating instead of declaring a clean plateau.
+                _sql_delta_qids: set[str] = set()
+                for _rb in reflection_buffer:
+                    for _delta in _rb.get("sql_shape_deltas", []) or []:
+                        _qid = str(_delta.get("target_qid") or "")
+                        if _qid and (_delta.get("remaining") or _delta.get("improved")):
+                            _sql_delta_qids.add(_qid)
+
+                # Track G — combine the buffered + diagnostic queues so the
+                # plateau resolver can refuse to terminate while either
+                # queue still covers a live hard qid.
+                _pending_diag_ags_for_plateau = (
+                    list(pending_action_groups) + list(diagnostic_action_queue)
                 )
+                _resolved = resolve_terminal_on_plateau(
+                    quarantined_qids=_quarantined_qids,
+                    current_hard_qids=_current_hard_qids,
+                    regression_debt_qids=_regression_debt_qids,
+                    sql_delta_qids=_sql_delta_qids,
+                    pending_diagnostic_ags=_pending_diag_ags_for_plateau,
+                )
+                logger.info(
+                    "Plateau terminal at iter %d: status=%s reason=%s "
+                    "(hard=%d quarantined=%d debt=%d sql_delta=%d)",
+                    _iter_num, _resolved.status.value, _resolved.reason,
+                    len(_current_hard_qids), len(_quarantined_qids),
+                    len(_regression_debt_qids), len(_sql_delta_qids),
+                )
+                if _resolved.should_continue:
+                    logger.info(
+                        "Plateau suppressed because RCA terminal status is %s "
+                        "(reason=%s)",
+                        _resolved.status.value,
+                        _resolved.reason,
+                    )
+                    continue
+                # PR-B2: capture the resolver decision so the convergence marker
+                # at the bottom of the function reports the same typed status
+                # the human-readable print below shows. Also accumulate retired
+                # AGs (Task 5 emits one DecisionRecord per entry).
+                _lever_loop_plateau_decision = _resolved
+                _lever_loop_retired_ags.extend(_resolved.retired_ags)
+                print(
+                    _section("LEVER LOOP — TERMINATION: plateau", "!") + "\n"
+                    + _kv("Reason", _resolved.reason) + "\n"
+                    + _kv("RCA terminal status", _resolved.status.value) + "\n"
+                    + _kv("Iteration", _iteration_label(_iter_num)) + "\n"
+                    + _kv("Retired AGs", str(len(_resolved.retired_ags))) + "\n"
+                    + _bar("!")
+                )
+                # Phase F+H A6 (v2): F9 learning — post-stage observability
+                # with atomic dedup. resolve_terminal_on_plateau at
+                # harness.py:11856 STAYS inline; this stage call emits
+                # AG_RETIRED records via _emit_ag_retired_records
+                # (stages/learning.py:114-142), replacing the inline
+                # AG_RETIRED list-comp + extend block (formerly here).
+                #
+                # F9.update() also re-calls resolve_terminal_on_plateau
+                # internally. PURE — verified by grep of rca_terminal.py
+                # for mlflow./spark./global; zero matches. Per-iteration
+                # re-call is byte-stable.
+                #
+                # The stage emits AG_RETIRED records with the same field
+                # shape as the deleted inline block (run_id, iteration,
+                # decision_type=AG_RETIRED, outcome=RETIRED, reason_code=
+                # AG_TARGET_NO_LONGER_HARD, ag_id, target_qids,
+                # affected_qids, reason_detail) — see stages/learning.py:
+                # 114-142 for the producer body.
+                #
+                # iteration: the inline emit used _iter_num (the outer
+                # loop variable). v2 uses _iter_num too (NOT
+                # iteration_counter — they align at this site but
+                # _iter_num is the literal source-of-truth the inline
+                # emit referenced).
+                #
+                # Verified against: stages/learning.py:38-51 (Input),
+                # 142-217 (update body), 54-62 (LearningUpdate),
+                # 114-142 (_emit_ag_retired_records).
+                try:
+                    from genie_space_optimizer.optimization.stages import (
+                        StageContext as _StageCtx,
+                    )
+                    from genie_space_optimizer.optimization.stages import (
+                        learning as _lrn_stage,
+                    )
+
+                    _stage_ctx_a6 = _StageCtx(
+                        run_id=str(run_id),
+                        iteration=int(_iter_num),
+                        space_id=str(space_id),
+                        domain=str(domain),
+                        catalog=str(catalog),
+                        schema=str(schema),
+                        apply_mode=str(apply_mode),
+                        journey_emit=_journey_emit,
+                        decision_emit=_decision_emit,
+                        mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
+                        feature_flags={},
+                    )
+
+                    # Source do_not_retry / rolled_back from
+                    # metadata_snapshot per the harness's existing
+                    # thread-through pattern.
+                    _prior_do_not_retry = set(
+                        metadata_snapshot.get("_do_not_retry_signatures") or set()
+                    )
+                    _prior_rolled_back = set(
+                        metadata_snapshot.get(
+                            "_rolled_back_content_fingerprints"
+                        ) or set()
+                    )
+
+                    # Build AG-outcomes-by-id from F8's _ag_outcome (A5).
+                    # If A5 hasn't landed, _ag_outcome is undefined here;
+                    # fall back to {} so F9.update() emits AG_RETIRED
+                    # records based purely on _resolved.retired_ags
+                    # (which matches the deleted inline block's behavior).
+                    try:
+                        _f9_ag_outcomes_by_id = {
+                            ag_id: {
+                                "outcome": rec.outcome,
+                                "reason_code": rec.reason_code,
+                                "content_fingerprint": ";".join(
+                                    rec.content_fingerprints
+                                ),
+                                "target_qids": list(rec.target_qids),
+                            }
+                            for ag_id, rec in _ag_outcome.outcomes_by_ag.items()
+                        }
+                    except NameError:
+                        _f9_ag_outcomes_by_id = {}
+
+                    _lrn_inp = _lrn_stage.LearningInput(
+                        prior_reflection_buffer=tuple(reflection_buffer),
+                        prior_do_not_retry=_prior_do_not_retry,
+                        prior_rolled_back_content_fingerprints=_prior_rolled_back,
+                        ag_outcomes_by_id=_f9_ag_outcomes_by_id,
+                        applied_signature="",
+                        accuracy_delta=_f9_accuracy_delta_safe(
+                            locals().get("gate_result"), best_accuracy
+                        ),
+                        # ✅ FIX (audit Section 4 A6 #2): current_hard_
+                        # failure_qids is the LIVE hard qid set, sourced
+                        # from harness.py:11830-11832, NOT
+                        # _resolved.retired_ags (different concept).
+                        current_hard_failure_qids=tuple(_current_hard_qids),
+                        regression_debt_qids=set(_regression_debt_qids),
+                        quarantined_qids=set(_quarantined_qids),
+                        sql_delta_qids=set(_sql_delta_qids),
+                        pending_buffered_ags=tuple(pending_action_groups),
+                        diagnostic_action_queue=tuple(diagnostic_action_queue),
+                    )
+                    # Phase F+H Commit B16: wrap F9 with stage_io_capture
+                    # decorator. Replay-byte-stable — wrap_with_io_capture
+                    # returns the stage output unchanged; MLflow log_text
+                    # calls are no-ops while mlflow_anchor_run_id is None
+                    # (C17 wires the anchor on real runs).
+                    from genie_space_optimizer.optimization.stage_io_capture import (
+                        wrap_with_io_capture as _wrap_with_io_capture_a6,
+                    )
+                    _lrn_wrapped = _wrap_with_io_capture_a6(
+                        execute=_lrn_stage.execute,
+                        stage_key="learning_next_action",
+                    )
+                    _lrn_update = _lrn_wrapped(_stage_ctx_a6, _lrn_inp)
+                    # _lrn_update.retired_ags / .ag_retired_records are
+                    # observability surfaces; the AG_RETIRED records were
+                    # emitted inside update() via ctx.decision_emit which
+                    # routes through _decision_emit to
+                    # _current_iter_inputs["decision_records"].
+                    #
+                    # _lrn_update.new_reflection_buffer /
+                    # new_do_not_retry / new_rolled_back_content_
+                    # fingerprints are observability-only here: the
+                    # harness's existing reflection-buffer / do-not-retry
+                    # update path is unchanged and remains the canonical
+                    # mutation point.
+                except Exception as _learning_stage_exc:
+                    try:
+                        from genie_space_optimizer.common.config import (
+                            phase_b_producer_typed_exceptions_enabled as _typed_on,
+                        )
+                        if _typed_on():
+                            from genie_space_optimizer.optimization.decision_emitters import (
+                                producer_exception_record as _producer_exception_record,
+                            )
+                            _pe_rec = _producer_exception_record(
+                                run_id=run_id,
+                                iteration=iteration_counter,
+                                producer="ag_retired",
+                                ag_id="",  # plateau path: no single AG in scope
+                                exception=_learning_stage_exc,
+                            )
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_pe_rec.to_dict())
+                    except Exception:
+                        logger.debug(
+                            "Phase F+H A6: producer_exception_record emission failed",
+                            exc_info=True,
+                        )
+                    _iter_producer_exceptions.setdefault("ag_retired", 0)
+                    _iter_producer_exceptions["ag_retired"] += 1
+                    _phase_b_producer_exceptions["ag_retired"] = (
+                        _phase_b_producer_exceptions.get("ag_retired", 0) + 1
+                    )
+                    logger.debug(
+                        "Phase F+H A6 v2: learning stage failed (non-fatal)",
+                        exc_info=True,
+                    )
+                break
+            if (
+                _plateau_detected
+                and _prev_terminal_decision is not None
+                and _prev_terminal_decision.should_continue
+            ):
+                logger.info(
+                    "Legacy plateau suppressed at iteration %d because RCA terminal state is %s",
+                    _iter_num,
+                    _prev_terminal_decision.status.value,
+                )
+                print(
+                    _section("LEGACY PLATEAU SUPPRESSED", "-") + "\n"
+                    + _kv("RCA terminal status", _prev_terminal_decision.status.value) + "\n"
+                    + _kv("Reason", _prev_terminal_decision.reason) + "\n"
+                    + _kv("Contract", "continue until 100% post-arbiter accuracy or max_iterations") + "\n"
+                    + _bar("-")
+                )
+            _diverging, _div_rationale = _detect_divergence(reflection_buffer)
+            if _diverging:
+                logger.info(
+                    "Divergence detected at iteration %d: %s",
+                    _iter_num, _div_rationale,
+                )
+                # PR-B2: capture the divergence label so the convergence marker
+                # at the bottom of the function reports the typed reason.
+                _lever_loop_divergence_label = f"divergence_{_div_rationale}"
+                print(
+                    _section("LEVER LOOP — TERMINATION: divergence", "!") + "\n"
+                    + _kv("Reason", _div_rationale) + "\n"
+                    + _kv("Iteration", _iteration_label(_iter_num)) + "\n"
+                    + _bar("!")
+                )
+                break
+            # Phase C3: only CONTENT_REGRESSION rollbacks count toward the
+            # consecutive-rollback limit. INFRA / SCHEMA / escalation / OTHER
+            # rollbacks carry no content signal and have their own handling
+            # (infra retry budget, schema fatal exit, escalation_handled).
+            from genie_space_optimizer.optimization.rollback_class import (
+                RollbackClass as _RC,
             )
-            # Cycle 11 Task 15 — emit the plateau-input source marker.
+            _consecutive_rb = 0
+            for _rb_entry in reversed(reflection_buffer):
+                if _rb_entry.get("escalation_handled"):
+                    continue
+                if _rb_entry.get("accepted"):
+                    break
+                if _rb_entry.get("rollback_class") == _RC.CONTENT_REGRESSION.value:
+                    _consecutive_rb += 1
+                else:
+                    # Non-content rollback (infra/schema/other). Skip without
+                    # counting; don't break, so we can still see a
+                    # CONTENT_REGRESSION further back in the buffer.
+                    continue
+            if _consecutive_rb >= CONSECUTIVE_ROLLBACK_LIMIT:
+                logger.info(
+                    "Consecutive content-rollback limit (%d) reached — stopping at iteration %d",
+                    CONSECUTIVE_ROLLBACK_LIMIT, _iter_num,
+                )
+                break
+
+            _consecutive_esc = 0
+            _last_esc_type: str | None = None
+            for _esc_entry in reversed(reflection_buffer):
+                if not _esc_entry.get("escalation_handled"):
+                    break
+                _esc_reason = _esc_entry.get("rollback_reason", "")
+                if _last_esc_type is None:
+                    _last_esc_type = _esc_reason
+                if _esc_reason == _last_esc_type:
+                    _consecutive_esc += 1
+                else:
+                    break
+            if _consecutive_esc >= CONSECUTIVE_ESCALATION_LIMIT:
+                logger.info(
+                    "Consecutive escalation limit (%d) reached for '%s' — "
+                    "stopping at iteration %d",
+                    CONSECUTIVE_ESCALATION_LIMIT, _last_esc_type, _iter_num,
+                )
+                write_stage(
+                    spark, run_id, "LEVER_LOOP_ESCALATION_EXIT", "COMPLETE",
+                    task_key="lever_loop", iteration=iteration_counter,
+                    detail={
+                        "consecutive_escalations": _consecutive_esc,
+                        "escalation_type": _last_esc_type,
+                    },
+                    catalog=catalog, schema=schema,
+                )
+                break
+
+            iteration_counter += 1
+
+            # Phase H iteration content completeness — pre-stamp the trace /
+            # summary entries so any subsequent ``continue`` / ``break``
+            # leaves a renderable iteration in the operator transcript. The
+            # rich data is written in by ``_finalize_iteration_summary`` at
+            # every iteration-body-level exit and at the end-of-body block.
+            _stamp_iteration_stub(
+                iter_traces=_iter_traces,
+                iter_summaries=_iter_summaries,
+                iteration=iteration_counter,
+            )
+
+            # Phase A — append-on-begin: allocate the per-iteration snapshot
+            # AND register it in ``_replay_fixture_iterations`` immediately,
+            # so any subsequent ``continue`` / ``break`` (rollback paths,
+            # cap drops, diagnostic-AG paths, plateau exits, etc.) cannot
+            # silently drop this iteration from the replay fixture.
+            # Subsequent code mutates this dict in place; the list entry is
+            # the same reference, so mutations are reflected automatically.
+            from genie_space_optimizer.optimization.journey_fixture_exporter import (
+                begin_iteration_capture as _begin_iteration_capture,
+            )
+            _current_iter_inputs: dict = _begin_iteration_capture(
+                iterations_data=_replay_fixture_iterations,
+                iteration=iteration_counter,
+            )
+
+            # Cycle 5 T1 — productive-iteration budget accounting locals.
+            # All three are populated unconditionally because their cost is
+            # negligible; they are READ only when
+            # ``productive_iteration_budget_enabled()`` is true (Option A:
+            # gate emission, not capture). With the flag off the locals are
+            # set but never consumed → zero behaviour change, zero new
+            # decision records, byte-stable replay. The most-recent typed
+            # P4 reason at the SKIPPING / NO_APPLIED sites is sourced from
+            # ``_current_iter_inputs["decision_records"]`` which the harness
+            # already accumulates per iteration.
+            _iter_consumed: bool = True
+            _iter_no_op_cause: str = ""
+            _iter_applied_count: int = 0
+
+            # Cycle 5 T2 — per-iteration accumulator for gate-drops carrying
+            # a causal-target patch. Populated unconditionally at the
+            # blast-radius drop site (capture is cheap memory; no behaviour
+            # change). Consumed at iteration end to refresh the outer-scope
+            # ``_prior_iteration_dropped_causal_patches`` list, which the
+            # next iteration's ``ActionGroupsInput`` reads — gated by
+            # ``GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST`` so byte-stability
+            # holds with the flag off.
+            _iter_dropped_causal: list = []
+
+            # Cycle 6 F-1 — per-iteration emit-dedup set for Cycle 5 records
+            # (iteration_budget_decision, soft_cluster_drift_recovered,
+            # rca_regeneration_*). Each Cycle 5 emit site checks
+            # ``_emit_idempotency_key(rec)`` against this set before
+            # emitting and skips on hit. Reset at every iteration body
+            # entry so cross-iteration repeats (intentional) still flow.
+            _iter_emitted_keys: set[tuple] = set()
+
+            # P3 task 4 — drain any structural-synthesis proposals queued
+            # at the prior iteration's lever-5 drop site. Same-iteration
+            # injection (below at the drop site) is the active path, so
+            # this list is empty in steady state; the drain runs each
+            # iteration for hygiene and to surface anything carried over
+            # for replay observability.
+            _forced_synthesis_proposals_carryover = (
+                _consume_structural_synthesis_buffer(_structural_synthesis_buffer)
+            )
+            if _forced_synthesis_proposals_carryover:
+                logger.info(
+                    "P3: drained %d carry-over structural-synthesis proposal(s) "
+                    "from prior iteration",
+                    len(_forced_synthesis_proposals_carryover),
+                )
+                _current_iter_inputs.setdefault(
+                    "carryover_structural_proposals", []
+                ).extend(_forced_synthesis_proposals_carryover)
+
+            # ── Per-question journey ledger accumulator (Task 13) ────────
+            # Stamp every stage that touches a question so the end-of-
+            # iteration ledger can reconstruct each qid's full timeline.
+            from genie_space_optimizer.optimization.question_journey import (
+                QuestionJourneyEvent as _JourneyEvent,
+                build_question_journey_ledger as _build_journey_ledger,
+                render_question_journey_once as _render_journey_once,
+            )
+            _journey_events: list[_JourneyEvent] = []
+            _journey_render_state: dict[str, bool] = {"rendered": False}
+
+            def _journey_emit(stage: str, **fields):
+                """Append journey event(s); fail-safe for any caller."""
+                try:
+                    qids = fields.pop("question_ids", None)
+                    qid = fields.pop("question_id", None)
+                    target_qids = list(qids) if qids else (
+                        [qid] if qid else []
+                    )
+                    for q in target_qids:
+                        qstr = str(q).strip()
+                        if not qstr:
+                            continue
+                        _journey_events.append(_JourneyEvent(
+                            question_id=qstr, stage=stage, **fields,
+                        ))
+                except Exception:
+                    logger.debug(
+                        "journey_emit failed (non-fatal) stage=%s", stage,
+                        exc_info=True,
+                    )
+
+            def _decision_emit(record):
+                """v2 Pre-Task 0.5: pin the iteration-body decision-emit closure.
+
+                The harness historically appends decision records via direct
+                calls to ``_current_iter_inputs.setdefault("decision_records",
+                []).append(record.to_dict())`` (~17 sites in this iteration
+                body). v2 introduces this closure with the SAME shape so every
+                Phase A wire-up routes ``ctx.decision_emit(record)`` through
+                one place.
+
+                Contract: ``record`` is a typed DecisionRecord (has
+                .to_dict()) OR a plain dict. On exception: log debug + swallow
+                (matches _journey_emit shape).
+                """
+                try:
+                    rec_dict = (
+                        record.to_dict() if hasattr(record, "to_dict")
+                        else dict(record)
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(rec_dict)
+                except Exception:
+                    logger.debug(
+                        "decision_emit failed (non-fatal)", exc_info=True,
+                    )
+
+            def _render_current_journey() -> None:
+                """Render this AG iteration's journey ledger exactly once."""
+                try:
+                    _render_journey_once(
+                        events=_journey_events,
+                        iteration=iteration_counter,
+                        render_state=_journey_render_state,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Task 13: journey ledger render failed (non-fatal)",
+                        exc_info=True,
+                    )
+
+            # ── 3B.1b: Per-iteration arbiter corrections ─────────────────
+            _iter_corr = _run_arbiter_corrections(
+                w, spark, run_id, catalog, schema, domain,
+                already_corrected=_correction_state["corrected_qids"],
+                already_repaired=_correction_state["repaired_qids"],
+                quarantined_qids=_correction_state["quarantined_qids"],
+                data_profile=metadata_snapshot.get("_data_profile"),
+            )
+            _correction_state["corrected_qids"] = _iter_corr["corrected_qids"]
+            _correction_state["quarantined_qids"] = _iter_corr["quarantined_qids"]
+
+            metadata_snapshot["_regression_rca_findings"] = []
+            metadata_snapshot["_regression_mining_hints"] = ""
             try:
-                from genie_space_optimizer.common.mlflow_markers import (
-                    plateau_input_source_marker as _plateau_marker,
-                )
-                _msg = _plateau_marker(
-                    optimization_run_id=run_id,
-                    iteration=_iter_num,
-                    source="candidate_eval",  # safe default; richer wiring is Cycle 12
-                    qids_count=len(_current_hard_qids_raw),
-                    last_acceptance_was_rollback=False,
-                )
-                logger.info(_msg)
+                if reflection_buffer:
+                    _mining_context = _collect_regression_mining_iteration_context(
+                        reflection_buffer,
+                        enable_rca_ledger=ENABLE_REGRESSION_MINING_RCA_LEDGER,
+                        enable_strategist_hints=ENABLE_REGRESSION_MINING_STRATEGIST,
+                        min_confidence=REGRESSION_MINING_STRATEGIST_MIN_CONFIDENCE,
+                    )
+                    metadata_snapshot["_regression_rca_findings"] = (
+                        _mining_context["rca_findings"]
+                    )
+                    metadata_snapshot["_regression_mining_hints"] = (
+                        _mining_context["strategist_hints"]
+                    )
             except Exception:
                 logger.debug(
-                    "Cycle 11 Task 15: plateau_input_source_marker emission failed (non-fatal)",
+                    "Failed to convert regression-mining insights to RCA findings",
                     exc_info=True,
                 )
-            # Task 20 — collect target qids for which any rejected AG
-            # produced an SQL-shape delta. The resolver routes these to
-            # UNRESOLVED_HARD_FAILURE_WITH_UNTRIED_SQL_DELTA so the loop
-            # keeps iterating instead of declaring a clean plateau.
-            _sql_delta_qids: set[str] = set()
-            for _rb in reflection_buffer:
-                for _delta in _rb.get("sql_shape_deltas", []) or []:
-                    _qid = str(_delta.get("target_qid") or "")
-                    if _qid and (_delta.get("remaining") or _delta.get("improved")):
-                        _sql_delta_qids.add(_qid)
 
-            # Track G — combine the buffered + diagnostic queues so the
-            # plateau resolver can refuse to terminate while either
-            # queue still covers a live hard qid.
-            _pending_diag_ags_for_plateau = (
-                list(pending_action_groups) + list(diagnostic_action_queue)
+            # ── 3B.2: Re-cluster from latest eval ────────────────────────
+            _analysis = _analyze_and_distribute(
+                spark, run_id, catalog, schema, metadata_snapshot,
+                iteration_counter - 1, lever_label=0,
+                quarantined_qids=_correction_state["quarantined_qids"],
+                exclude_qids=escalated_gt_repair_qids,
+                phase_h_anchor_run_id=_phase_h_anchor_run_id,
             )
-            _resolved = resolve_terminal_on_plateau(
-                quarantined_qids=_quarantined_qids,
-                current_hard_qids=_current_hard_qids,
-                regression_debt_qids=_regression_debt_qids,
-                sql_delta_qids=_sql_delta_qids,
-                pending_diagnostic_ags=_pending_diag_ags_for_plateau,
-            )
-            logger.info(
-                "Plateau terminal at iter %d: status=%s reason=%s "
-                "(hard=%d quarantined=%d debt=%d sql_delta=%d)",
-                _iter_num, _resolved.status.value, _resolved.reason,
-                len(_current_hard_qids), len(_quarantined_qids),
-                len(_regression_debt_qids), len(_sql_delta_qids),
-            )
-            if _resolved.should_continue:
-                logger.info(
-                    "Plateau suppressed because RCA terminal status is %s "
-                    "(reason=%s)",
-                    _resolved.status.value,
-                    _resolved.reason,
-                )
-                continue
-            # PR-B2: capture the resolver decision so the convergence marker
-            # at the bottom of the function reports the same typed status
-            # the human-readable print below shows. Also accumulate retired
-            # AGs (Task 5 emits one DecisionRecord per entry).
-            _lever_loop_plateau_decision = _resolved
-            _lever_loop_retired_ags.extend(_resolved.retired_ags)
-            print(
-                _section("LEVER LOOP — TERMINATION: plateau", "!") + "\n"
-                + _kv("Reason", _resolved.reason) + "\n"
-                + _kv("RCA terminal status", _resolved.status.value) + "\n"
-                + _kv("Iteration", _iteration_label(_iter_num)) + "\n"
-                + _kv("Retired AGs", str(len(_resolved.retired_ags))) + "\n"
-                + _bar("!")
-            )
-            # Phase F+H A6 (v2): F9 learning — post-stage observability
-            # with atomic dedup. resolve_terminal_on_plateau at
-            # harness.py:11856 STAYS inline; this stage call emits
-            # AG_RETIRED records via _emit_ag_retired_records
-            # (stages/learning.py:114-142), replacing the inline
-            # AG_RETIRED list-comp + extend block (formerly here).
-            #
-            # F9.update() also re-calls resolve_terminal_on_plateau
-            # internally. PURE — verified by grep of rca_terminal.py
-            # for mlflow./spark./global; zero matches. Per-iteration
-            # re-call is byte-stable.
-            #
-            # The stage emits AG_RETIRED records with the same field
-            # shape as the deleted inline block (run_id, iteration,
-            # decision_type=AG_RETIRED, outcome=RETIRED, reason_code=
-            # AG_TARGET_NO_LONGER_HARD, ag_id, target_qids,
-            # affected_qids, reason_detail) — see stages/learning.py:
-            # 114-142 for the producer body.
-            #
-            # iteration: the inline emit used _iter_num (the outer
-            # loop variable). v2 uses _iter_num too (NOT
-            # iteration_counter — they align at this site but
-            # _iter_num is the literal source-of-truth the inline
-            # emit referenced).
-            #
-            # Verified against: stages/learning.py:38-51 (Input),
-            # 142-217 (update body), 54-62 (LearningUpdate),
-            # 114-142 (_emit_ag_retired_records).
-            try:
-                from genie_space_optimizer.optimization.stages import (
-                    StageContext as _StageCtx,
-                )
-                from genie_space_optimizer.optimization.stages import (
-                    learning as _lrn_stage,
-                )
+            clusters = _analysis["all_clusters"]
+            soft_signal_clusters = _analysis["soft_signal_clusters"]
+            rca_ledger = _analysis.get("rca_ledger") or {}
+            # Track H — same row source the soft pile was built from. Pinned
+            # to the analyze-distribute return so the soft-cluster currency
+            # check sees the exact rows the clusterer saw.
+            _analysis_failure_rows = _analysis.get("failure_rows") or []
 
-                _stage_ctx_a6 = _StageCtx(
-                    run_id=str(run_id),
-                    iteration=int(_iter_num),
-                    space_id=str(space_id),
-                    domain=str(domain),
-                    catalog=str(catalog),
-                    schema=str(schema),
-                    apply_mode=str(apply_mode),
-                    journey_emit=_journey_emit,
-                    decision_emit=_decision_emit,
-                    mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
-                    feature_flags={},
-                )
-
-                # Source do_not_retry / rolled_back from
-                # metadata_snapshot per the harness's existing
-                # thread-through pattern.
-                _prior_do_not_retry = set(
-                    metadata_snapshot.get("_do_not_retry_signatures") or set()
-                )
-                _prior_rolled_back = set(
-                    metadata_snapshot.get(
-                        "_rolled_back_content_fingerprints"
-                    ) or set()
-                )
-
-                # Build AG-outcomes-by-id from F8's _ag_outcome (A5).
-                # If A5 hasn't landed, _ag_outcome is undefined here;
-                # fall back to {} so F9.update() emits AG_RETIRED
-                # records based purely on _resolved.retired_ags
-                # (which matches the deleted inline block's behavior).
+            # Phase A — Defensive carrier seed at iteration start. The
+            # primary seed (lever-loop pre-loop block) populates
+            # `_latest_eval_result` from `baseline_iter`, and the per-gate
+            # refresh (`_extract_eval_result_from_gate`) keeps it fresh on
+            # every accept/rollback. But two skip-eval `continue` paths
+            # bypass the gate entirely:
+            #   * applier blast-radius gate dropped all patches
+            #     ("deterministic_no_applied_patches" → SKIP EVAL: NO
+            #     APPLIED PATCHES)
+            #   * dead-on-arrival AG retry blocked (same selected patch
+            #     IDs already produced no applied patches)
+            # When every iteration in a run takes one of those paths, the
+            # carrier never refreshes and — if the seed silently produced
+            # 0 qids — the replay fixture's `eval_rows` end up empty for
+            # every iteration. Lazy-seed here as a last line of defence so
+            # the snapshot below always has at least the baseline state.
+            if not (_latest_eval_result or {}).get("question_ids"):
                 try:
-                    _f9_ag_outcomes_by_id = {
-                        ag_id: {
-                            "outcome": rec.outcome,
-                            "reason_code": rec.reason_code,
-                            "content_fingerprint": ";".join(
-                                rec.content_fingerprints
-                            ),
-                            "target_qids": list(rec.target_qids),
-                        }
-                        for ag_id, rec in _ag_outcome.outcomes_by_ag.items()
-                    }
-                except NameError:
-                    _f9_ag_outcomes_by_id = {}
+                    _lazy_seed = _seed_eval_result_from_baseline_iter(
+                        baseline_iter
+                    )
+                    if _lazy_seed:
+                        _latest_eval_result = _lazy_seed
+                        logger.warning(
+                            "Phase A: lazy-seeded _latest_eval_result from "
+                            "baseline at iteration_counter=%d (carrier was "
+                            "empty — primary seed produced 0 qids and no "
+                            "gate result has refreshed it yet). %d qids, "
+                            "%d failures.",
+                            iteration_counter,
+                            len(_lazy_seed.get("question_ids") or []),
+                            len(_lazy_seed.get("failure_question_ids") or []),
+                        )
+                except Exception:
+                    logger.debug(
+                        "Phase A: lazy baseline seed failed (non-fatal)",
+                        exc_info=True,
+                    )
 
-                _lrn_inp = _lrn_stage.LearningInput(
-                    prior_reflection_buffer=tuple(reflection_buffer),
-                    prior_do_not_retry=_prior_do_not_retry,
-                    prior_rolled_back_content_fingerprints=_prior_rolled_back,
-                    ag_outcomes_by_id=_f9_ag_outcomes_by_id,
-                    applied_signature="",
-                    accuracy_delta=float(full_accuracy - best_accuracy),
-                    # ✅ FIX (audit Section 4 A6 #2): current_hard_
-                    # failure_qids is the LIVE hard qid set, sourced
-                    # from harness.py:11830-11832, NOT
-                    # _resolved.retired_ags (different concept).
-                    current_hard_failure_qids=tuple(_current_hard_qids),
-                    regression_debt_qids=set(_regression_debt_qids),
-                    quarantined_qids=set(_quarantined_qids),
-                    sql_delta_qids=set(_sql_delta_qids),
-                    pending_buffered_ags=tuple(pending_action_groups),
-                    diagnostic_action_queue=tuple(diagnostic_action_queue),
+            # Phase A — Lossless contract: stamp the eval-entry events for
+            # every qid that entered this iteration's eval. This eliminates
+            # the validator's missing_qid violations (one per qid) and the
+            # illegal-transition violations that would otherwise arise from
+            # qids that begin their journey at 'clustered' or 'soft_signal'
+            # without a preceding 'evaluated' event.
+            try:
+                _eval_qids_for_entry = list(
+                    (_latest_eval_result or {}).get("question_ids") or []
                 )
-                # Phase F+H Commit B16: wrap F9 with stage_io_capture
-                # decorator. Replay-byte-stable — wrap_with_io_capture
-                # returns the stage output unchanged; MLflow log_text
-                # calls are no-ops while mlflow_anchor_run_id is None
-                # (C17 wires the anchor on real runs).
-                from genie_space_optimizer.optimization.stage_io_capture import (
-                    wrap_with_io_capture as _wrap_with_io_capture_a6,
+                _hard_qid_set = {
+                    str(q)
+                    for c in (clusters or [])
+                    for q in (c.get("question_ids") or [])
+                    if q
+                }
+                _soft_qid_set = {
+                    str(q)
+                    for c in (soft_signal_clusters or [])
+                    for q in (c.get("question_ids") or [])
+                    if q
+                } - _hard_qid_set
+                _gt_corr_qid_set = {
+                    str(c.get("question_id") or "")
+                    for c in (_analysis.get("gt_correction_candidates") or [])
+                    if c.get("question_id")
+                }
+                _all_classified = _hard_qid_set | _soft_qid_set | _gt_corr_qid_set
+                _already_passing_set = (
+                    {str(q) for q in _eval_qids_for_entry if q}
+                    - _all_classified
                 )
-                _lrn_wrapped = _wrap_with_io_capture_a6(
-                    execute=_lrn_stage.execute,
-                    stage_key="learning_next_action",
+                _emit_eval_entry_journey(
+                    emit=_journey_emit,
+                    eval_qids=_eval_qids_for_entry,
+                    already_passing_qids=sorted(_already_passing_set),
+                    hard_qids=sorted(_hard_qid_set),
+                    soft_qids=sorted(_soft_qid_set),
+                    gt_correction_qids=sorted(_gt_corr_qid_set),
                 )
-                _lrn_update = _lrn_wrapped(_stage_ctx_a6, _lrn_inp)
-                # _lrn_update.retired_ags / .ag_retired_records are
-                # observability surfaces; the AG_RETIRED records were
-                # emitted inside update() via ctx.decision_emit which
-                # routes through _decision_emit to
-                # _current_iter_inputs["decision_records"].
-                #
-                # _lrn_update.new_reflection_buffer /
-                # new_do_not_retry / new_rolled_back_content_
-                # fingerprints are observability-only here: the
-                # harness's existing reflection-buffer / do-not-retry
-                # update path is unchanged and remains the canonical
-                # mutation point.
-            except Exception as _learning_stage_exc:
+            except Exception:
+                logger.debug(
+                    "Phase A: eval-entry journey emit failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Phase B observability follow-up — initialize per-iteration
+            # producer-exception counter and shared lookup maps used by the
+            # 5 typed-record producers wired below.
+            _iter_producer_exceptions: dict[str, int] = {
+                "eval_classification": 0,
+                "cluster": 0,
+                "rca_formed": 0,
+                "strategist_ag": 0,
+                "ag_outcome": 0,
+                "post_eval_resolution": 0,
+                "proposal_generated": 0,
+                "patch_applied": 0,
+            }
+            _iter_classification: dict[str, str] = {}
+            for _q in _already_passing_set:
+                _iter_classification[str(_q)] = "already_passing"
+            for _q in _hard_qid_set:
+                _iter_classification[str(_q)] = "hard"
+            for _q in _soft_qid_set:
+                _iter_classification[str(_q)] = "soft"
+            for _q in _gt_corr_qid_set:
+                _iter_classification[str(_q)] = "gt_correction"
+            _iter_cluster_by_qid: dict[str, str] = {}
+            _iter_source_clusters_by_id: dict[str, dict] = {}
+            for _c in (clusters or []):
+                _cid = str(_c.get("cluster_id") or "")
+                if _cid:
+                    _iter_source_clusters_by_id[_cid] = _c
+                for _q in (_c.get("question_ids") or []):
+                    _qstr = str(_q)
+                    if _qstr and _cid:
+                        _iter_cluster_by_qid[_qstr] = _cid
+            # Phase B delta Task 1: derive {cluster_id: rca_id} from the
+            # iteration's RCA findings so every producer (cluster_records,
+            # strategist_ag_records, ag_outcome_decision_record,
+            # post_eval_resolution_records, blast_radius_decision_records,
+            # dead_on_arrival_decision_records) stamps a real rca_id on
+            # every record. Empty when no findings overlap a cluster's
+            # question_ids; the validator's per-decision_type rules treat
+            # missing rca_id as a violation, which is the desired loud
+            # signal for that case.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    rca_id_by_cluster_from_findings,
+                )
+                from genie_space_optimizer.optimization.rca import (
+                    rca_findings_from_clusters,
+                )
+                _iter_rca_id_by_cluster: dict[str, str] = (
+                    rca_id_by_cluster_from_findings(
+                        clusters=clusters or [],
+                        findings=rca_findings_from_clusters(clusters or []),
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "Phase B delta Task 1: rca_id_by_cluster derivation failed (non-fatal)",
+                    exc_info=True,
+                )
+                _iter_rca_id_by_cluster = {}
+
+            # Phase B observability follow-up — closure that builds an
+            # ACCEPTANCE_DECIDED record from an AG and outcome string and
+            # stashes it on the iteration snapshot. Captures the iteration
+            # scope (clusters, lookups, exception counter) so the 5 outcome
+            # sites in the harness can call it inline with one line each.
+            def _phase_b_emit_ag_outcome_record(_ag_obj, _outcome_str):
+                try:
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        ag_outcome_decision_record as _ag_outcome_decision_record,
+                        is_strict_mode as _phase_b_strict_mode_inner,
+                    )
+
+                    _ag_rec = _ag_outcome_decision_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        ag=_ag_obj,
+                        outcome=str(_outcome_str or ""),
+                        source_clusters_by_id=_iter_source_clusters_by_id,
+                        rca_id_by_cluster=_iter_rca_id_by_cluster,
+                    )
+                    if _ag_rec is not None:
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_ag_rec.to_dict())
+                except Exception as _ag_outcome_exc:
+                    try:
+                        from genie_space_optimizer.common.config import (
+                            phase_b_producer_typed_exceptions_enabled as _typed_on,
+                        )
+                        if _typed_on():
+                            from genie_space_optimizer.optimization.decision_emitters import (
+                                producer_exception_record as _producer_exception_record,
+                            )
+                            _pe_rec = _producer_exception_record(
+                                run_id=run_id,
+                                iteration=iteration_counter,
+                                producer="ag_outcome",
+                                ag_id=str((_ag_obj or {}).get("id") or ""),
+                                exception=_ag_outcome_exc,
+                            )
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(_pe_rec.to_dict())
+                    except Exception:
+                        logger.debug(
+                            "Phase B: producer_exception_record emission failed",
+                            exc_info=True,
+                        )
+                    _iter_producer_exceptions["ag_outcome"] += 1
+                    _phase_b_producer_exceptions["ag_outcome"] = (
+                        _phase_b_producer_exceptions.get("ag_outcome", 0) + 1
+                    )
+                    logger.debug(
+                        "Phase B: ag_outcome_decision_record failed (non-fatal)",
+                        exc_info=True,
+                    )
+                    if _phase_b_strict_mode_inner():
+                        raise
+
+            # Phase B observability follow-up — emit EVAL_CLASSIFIED records
+            # (one per qid). Even when no patches reach the cap this
+            # iteration, this gives the analyzer 24+ records per iter so
+            # ``decision_records_total > 0`` and the trace is observable.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    eval_classification_records as _eval_classification_records,
+                    is_strict_mode as _phase_b_strict_mode,
+                )
+
+                _eval_records = _eval_classification_records(
+                    run_id=run_id,
+                    iteration=iteration_counter,
+                    eval_qids=_eval_qids_for_entry,
+                    classification=_iter_classification,
+                    cluster_by_qid=_iter_cluster_by_qid,
+                )
+                _current_iter_inputs.setdefault("decision_records", []).extend(
+                    [r.to_dict() for r in _eval_records]
+                )
+            except Exception as _exc_eval:
                 try:
                     from genie_space_optimizer.common.config import (
                         phase_b_producer_typed_exceptions_enabled as _typed_on,
@@ -13825,489 +14520,6272 @@ def _run_lever_loop(
                         _pe_rec = _producer_exception_record(
                             run_id=run_id,
                             iteration=iteration_counter,
-                            producer="ag_retired",
-                            ag_id="",  # plateau path: no single AG in scope
-                            exception=_learning_stage_exc,
+                            producer="eval_classification",
+                            ag_id="",
+                            exception=_exc_eval,
                         )
                         _current_iter_inputs.setdefault(
                             "decision_records", []
                         ).append(_pe_rec.to_dict())
                 except Exception:
                     logger.debug(
-                        "Phase F+H A6: producer_exception_record emission failed",
+                        "Phase B: producer_exception_record emission failed for eval_classification",
                         exc_info=True,
                     )
-                _iter_producer_exceptions.setdefault("ag_retired", 0)
-                _iter_producer_exceptions["ag_retired"] += 1
-                _phase_b_producer_exceptions["ag_retired"] = (
-                    _phase_b_producer_exceptions.get("ag_retired", 0) + 1
+                _iter_producer_exceptions["eval_classification"] += 1
+                _phase_b_producer_exceptions["eval_classification"] = (
+                    _phase_b_producer_exceptions.get("eval_classification", 0) + 1
                 )
                 logger.debug(
-                    "Phase F+H A6 v2: learning stage failed (non-fatal)",
+                    "Phase B: eval_classification_records failed (non-fatal)",
                     exc_info=True,
                 )
-            break
-        if (
-            _plateau_detected
-            and _prev_terminal_decision is not None
-            and _prev_terminal_decision.should_continue
-        ):
-            logger.info(
-                "Legacy plateau suppressed at iteration %d because RCA terminal state is %s",
-                _iter_num,
-                _prev_terminal_decision.status.value,
-            )
-            print(
-                _section("LEGACY PLATEAU SUPPRESSED", "-") + "\n"
-                + _kv("RCA terminal status", _prev_terminal_decision.status.value) + "\n"
-                + _kv("Reason", _prev_terminal_decision.reason) + "\n"
-                + _kv("Contract", "continue until 100% post-arbiter accuracy or max_iterations") + "\n"
-                + _bar("-")
-            )
-        _diverging, _div_rationale = _detect_divergence(reflection_buffer)
-        if _diverging:
-            logger.info(
-                "Divergence detected at iteration %d: %s",
-                _iter_num, _div_rationale,
-            )
-            # PR-B2: capture the divergence label so the convergence marker
-            # at the bottom of the function reports the typed reason.
-            _lever_loop_divergence_label = f"divergence_{_div_rationale}"
-            print(
-                _section("LEVER LOOP — TERMINATION: divergence", "!") + "\n"
-                + _kv("Reason", _div_rationale) + "\n"
-                + _kv("Iteration", _iteration_label(_iter_num)) + "\n"
-                + _bar("!")
-            )
-            break
-        # Phase C3: only CONTENT_REGRESSION rollbacks count toward the
-        # consecutive-rollback limit. INFRA / SCHEMA / escalation / OTHER
-        # rollbacks carry no content signal and have their own handling
-        # (infra retry budget, schema fatal exit, escalation_handled).
-        from genie_space_optimizer.optimization.rollback_class import (
-            RollbackClass as _RC,
-        )
-        _consecutive_rb = 0
-        for _rb_entry in reversed(reflection_buffer):
-            if _rb_entry.get("escalation_handled"):
-                continue
-            if _rb_entry.get("accepted"):
-                break
-            if _rb_entry.get("rollback_class") == _RC.CONTENT_REGRESSION.value:
-                _consecutive_rb += 1
-            else:
-                # Non-content rollback (infra/schema/other). Skip without
-                # counting; don't break, so we can still see a
-                # CONTENT_REGRESSION further back in the buffer.
-                continue
-        if _consecutive_rb >= CONSECUTIVE_ROLLBACK_LIMIT:
-            logger.info(
-                "Consecutive content-rollback limit (%d) reached — stopping at iteration %d",
-                CONSECUTIVE_ROLLBACK_LIMIT, _iter_num,
-            )
-            break
+                if _phase_b_strict_mode():
+                    raise
 
-        _consecutive_esc = 0
-        _last_esc_type: str | None = None
-        for _esc_entry in reversed(reflection_buffer):
-            if not _esc_entry.get("escalation_handled"):
-                break
-            _esc_reason = _esc_entry.get("rollback_reason", "")
-            if _last_esc_type is None:
-                _last_esc_type = _esc_reason
-            if _esc_reason == _last_esc_type:
-                _consecutive_esc += 1
-            else:
-                break
-        if _consecutive_esc >= CONSECUTIVE_ESCALATION_LIMIT:
-            logger.info(
-                "Consecutive escalation limit (%d) reached for '%s' — "
-                "stopping at iteration %d",
-                CONSECUTIVE_ESCALATION_LIMIT, _last_esc_type, _iter_num,
+            # Phase B observability follow-up — emit CLUSTER_SELECTED
+            # records (one per hard cluster). Note: clusters list at this
+            # site is the hard-cluster list; soft clusters are captured
+            # separately via the journey ``soft_signal`` events.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    cluster_records as _cluster_records,
+                )
+
+                # Phase D.5 Task 5: capture cluster alternatives.
+                # ``clusters`` is the hard-only list at this site; without a
+                # local ``candidate_clusters`` collection, the fallback below
+                # produces empty alternatives (byte-stable). When a future
+                # cycle wires the candidate list (demoted + hard) into a
+                # local, pass it as ``candidate_clusters`` here.
+                _candidate_clusters_for_alts = (
+                    _candidate_clusters_for_decision_trace
+                    if "_candidate_clusters_for_decision_trace" in locals()
+                    else (clusters or [])
+                )
+                _cluster_alts_by_id = _build_cluster_alternatives_by_id(
+                    candidate_clusters=_candidate_clusters_for_alts,
+                    promoted_cluster_ids=[
+                        str(c.get("cluster_id") or "")
+                        for c in (clusters or [])
+                    ],
+                )
+                _hard_cluster_records = _cluster_records(
+                    run_id=run_id,
+                    iteration=iteration_counter,
+                    clusters=clusters or [],
+                    rca_id_by_cluster=_iter_rca_id_by_cluster,
+                    cluster_alternatives_by_id=_cluster_alts_by_id,
+                )
+                _current_iter_inputs.setdefault("decision_records", []).extend(
+                    [r.to_dict() for r in _hard_cluster_records]
+                )
+            except Exception as _cluster_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="cluster",
+                            ag_id="",
+                            exception=_cluster_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for cluster",
+                        exc_info=True,
+                    )
+                _iter_producer_exceptions["cluster"] += 1
+                _phase_b_producer_exceptions["cluster"] = (
+                    _phase_b_producer_exceptions.get("cluster", 0) + 1
+                )
+                logger.debug(
+                    "Phase B: cluster_records failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Phase B delta Task 3 — emit RCA_FORMED records (one per
+            # cluster routed to an RCA card). Closes the gap between
+            # CLUSTER_SELECTED and STRATEGIST_AG_EMITTED in the decision
+            # trace.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    rca_formed_records as _rca_formed_records,
+                )
+
+                _rca_formed = _rca_formed_records(
+                    run_id=run_id,
+                    iteration=iteration_counter,
+                    clusters=clusters or [],
+                    rca_id_by_cluster=_iter_rca_id_by_cluster,
+                )
+                _current_iter_inputs.setdefault("decision_records", []).extend(
+                    [r.to_dict() for r in _rca_formed]
+                )
+            except Exception as _rca_formed_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="rca_formed",
+                            ag_id="",
+                            exception=_rca_formed_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for rca_formed",
+                        exc_info=True,
+                    )
+                _iter_producer_exceptions["rca_formed"] += 1
+                _phase_b_producer_exceptions["rca_formed"] = (
+                    _phase_b_producer_exceptions.get("rca_formed", 0) + 1
+                )
+                logger.debug(
+                    "Phase B: rca_formed_records failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Phase C Task 7 — emit RCA_FORMED+UNRESOLVED+RCA_UNGROUNDED
+            # for clusters with hard failures but no matching RCA finding.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    unresolved_rca_records as _unresolved_rca_records,
+                )
+
+                _unresolved_records = _unresolved_rca_records(
+                    run_id=run_id,
+                    iteration=iteration_counter,
+                    clusters=clusters or [],
+                    rca_id_by_cluster=_iter_rca_id_by_cluster,
+                )
+                _current_iter_inputs.setdefault("decision_records", []).extend(
+                    [r.to_dict() for r in _unresolved_records]
+                )
+            except Exception as _unresolved_rca_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="unresolved_rca",
+                            ag_id="",
+                            exception=_unresolved_rca_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for unresolved_rca",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["unresolved_rca"] = (
+                    _phase_b_producer_exceptions.get("unresolved_rca", 0) + 1
+                )
+                logger.debug(
+                    "Phase C: unresolved_rca_records failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Phase A — populate replay-fixture iteration snapshot fields
+            # eval_rows / clusters / soft_clusters from the analysis result.
+            try:
+                _fr = _latest_eval_result or {}
+                _scores = _fr.get("scores") or {}
+                _arbiter_map = _fr.get("arbiter_verdicts") or {}
+                _failure_set = {str(q) for q in (_fr.get("failure_question_ids") or [])}
+                _fixture_eval_rows: list[dict] = []
+                for _qid in (_eval_qids_for_entry or []):
+                    _qstr = str(_qid)
+                    _correctness: str
+                    if isinstance(_scores, dict) and _qstr in _scores:
+                        _v = _scores[_qstr]
+                        _correctness = "yes" if str(_v).lower() in ("yes", "true", "1", "pass") else "no"
+                    else:
+                        _correctness = "no" if _qstr in _failure_set else "yes"
+                    _row: dict = {"question_id": _qstr, "result_correctness": _correctness}
+                    if isinstance(_arbiter_map, dict) and _qstr in _arbiter_map:
+                        _row["arbiter"] = str(_arbiter_map[_qstr])
+                    _fixture_eval_rows.append(_row)
+                _current_iter_inputs["eval_rows"] = _fixture_eval_rows
+                _current_iter_inputs["clusters"] = [
+                    {
+                        "cluster_id": str(c.get("cluster_id") or ""),
+                        "root_cause": str(c.get("root_cause") or ""),
+                        "question_ids": [str(q) for q in (c.get("question_ids") or []) if q],
+                    }
+                    for c in (clusters or [])
+                ]
+                _current_iter_inputs["soft_clusters"] = [
+                    {
+                        "cluster_id": str(c.get("cluster_id") or ""),
+                        "root_cause": str(c.get("root_cause") or ""),
+                        "question_ids": [str(q) for q in (c.get("question_ids") or []) if q],
+                    }
+                    for c in (soft_signal_clusters or [])
+                ]
+            except Exception:
+                logger.debug(
+                    "Phase A: replay-fixture iteration capture failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Task 16 — scale max_iterations by initial hard cluster count.
+            # Computed once on the first iteration (when ``clusters`` first
+            # binds) and held for the rest of the run.
+            if _iter_num == 1:
+                _scaled_max_iterations = compute_iteration_budget(
+                    hard_cluster_count=len(clusters or []),
+                    requested_max_iterations=max_iterations or MAX_ITERATIONS,
+                )
+                if _scaled_max_iterations != max_iterations:
+                    logger.info(
+                        "Iteration budget set to %d (hard_clusters=%d, requested=%d)",
+                        _scaled_max_iterations,
+                        len(clusters or []),
+                        int(max_iterations or MAX_ITERATIONS),
+                    )
+                else:
+                    logger.info(
+                        "Iteration budget set to %d (hard_clusters=%d)",
+                        _scaled_max_iterations,
+                        len(clusters or []),
+                    )
+                max_iterations = _scaled_max_iterations
+
+            # Task 13 — emit ``clustered`` events per qid in each hard cluster
+            # and ``soft_signal`` events for soft clusters.
+            # Plan N1 Task 2 — delegate to ``emit_cluster_membership_events``
+            # so a qid that appears in multiple clusters produces exactly
+            # one event per stage. Multi-cluster membership is preserved on
+            # ``extra.additional_cluster_ids``. Closes the trunk-repeat
+            # ``soft_signal -> soft_signal`` defect on 2afb0be2 retry
+            # attempt 993610879088298.
+            try:
+                from genie_space_optimizer.optimization.question_journey import (
+                    emit_cluster_membership_events,
+                )
+                emit_cluster_membership_events(
+                    journey_emit=_journey_emit,
+                    hard_clusters=list(clusters or []),
+                    soft_clusters=list(soft_signal_clusters or []),
+                )
+            except Exception:
+                logger.debug(
+                    "Task 13: cluster journey emit failed (non-fatal)",
+                    exc_info=True,
+                )
+            metadata_snapshot["_rca_ledger"] = rca_ledger
+            try:
+                from genie_space_optimizer.optimization.rca import (
+                    themes_for_strategy_context,
+                )
+
+                metadata_snapshot["_rca_themes"] = themes_for_strategy_context(
+                    list(rca_ledger.get("themes") or []),
+                    enable_selection=ENABLE_RCA_THEME_SELECTION,
+                    max_themes=RCA_MAX_THEMES_PER_ITERATION,
+                    max_patches=RCA_MAX_THEME_PATCHES_PER_ITERATION,
+                )
+            except Exception:
+                logger.debug(
+                    "RCA theme selection failed; falling back to all themes",
+                    exc_info=True,
+                )
+                metadata_snapshot["_rca_themes"] = rca_ledger.get("themes") or []
+            metadata_snapshot["_rca_theme_conflicts"] = (
+                rca_ledger.get("conflicts") or []
             )
+
+            try:
+                from genie_space_optimizer.optimization.rca_execution import (
+                    build_rca_execution_plans,
+                )
+
+                metadata_snapshot["_rca_execution_plans"] = build_rca_execution_plans(
+                    metadata_snapshot.get("_rca_themes") or []
+                )
+            except Exception:
+                logger.debug(
+                    "RCA execution plan construction failed; continuing without forced RCA levers",
+                    exc_info=True,
+                )
+                metadata_snapshot["_rca_execution_plans"] = []
+
+            try:
+                from genie_space_optimizer.optimization.rca_terminal import (
+                    classify_terminal_state,
+                )
+
+                _terminal_decision = classify_terminal_state(
+                    post_arbiter_accuracy=float(best_accuracy),
+                    max_iterations=int(max_iterations),
+                    iteration_counter=int(iteration_counter),
+                    actionable_plan_count=len(
+                        metadata_snapshot.get("_rca_execution_plans") or []
+                    ),
+                    repeated_failure_count=sum(
+                        1 for r in reflection_buffer
+                        if not r.get("accepted")
+                    ),
+                    judge_failure_count=sum(
+                        1 for r in reflection_buffer
+                        if r.get("rollback_reason") == "judge_unreliable"
+                    ),
+                    benchmark_issue_count=sum(
+                        1 for r in reflection_buffer
+                        if r.get("rollback_reason") == "benchmark_broken"
+                    ),
+                    unpatchable_count=sum(
+                        1 for r in reflection_buffer
+                        if r.get("rollback_reason") == "unpatchable_with_six_levers"
+                    ),
+                )
+                metadata_snapshot["_rca_terminal_state"] = {
+                    "status": _terminal_decision.status.value,
+                    "should_continue": _terminal_decision.should_continue,
+                    "reason": _terminal_decision.reason,
+                }
+            except Exception:
+                logger.debug("RCA terminal-state classification failed", exc_info=True)
+
+            try:
+                write_asi_results(spark, run_id, iteration_counter - 1, _analysis["asi_rows"], catalog, schema, mlflow_run_id=_last_full_mlflow_run_id)
+            except Exception:
+                logger.debug("Failed to write ASI results", exc_info=True)
+            try:
+                write_provenance(spark, run_id, iteration_counter - 1, 0, _analysis["prov_rows"], catalog, schema)
+            except Exception:
+                logger.debug("Failed to write provenance rows", exc_info=True)
+            try:
+                # Task 1: persist GT correction queue payloads. Empty list
+                # is a no-op inside the helper.
+                write_gt_correction_candidates(
+                    spark,
+                    _analysis.get("gt_correction_candidates") or [],
+                    catalog=catalog,
+                    schema=schema,
+                )
+            except Exception:
+                logger.debug("Failed to write GT correction candidates", exc_info=True)
+
+            # Task 8: detect cluster signatures that have hit the
+            # persistent-failure threshold across this run's reflection
+            # buffer, persist them, and exclude them from the strategist's
+            # input. Pure helper — fail-open on any error so escalation
+            # bookkeeping never blocks the loop.
+            try:
+                from genie_space_optimizer.optimization.persistent_failure_escalation import (
+                    case_to_delta_row as _t8_to_row,
+                    compute_human_required_escalations as _t8_compute,
+                )
+
+                _t8_cases, _t8_new_sigs = _t8_compute(
+                    reflection_buffer,
+                    run_id=run_id,
+                    already_escalated_signatures=human_required_signatures,
+                )
+                if _t8_cases:
+                    # Persist + emit a per-case audit row (Task 3 stage O).
+                    try:
+                        from genie_space_optimizer.optimization.state import (
+                            write_human_required_escalations as _t8_write,
+                            write_lever_loop_decisions as _t8_audit,
+                        )
+                        _t8_write(
+                            spark,
+                            [_t8_to_row(c) for c in _t8_cases],
+                            catalog=catalog,
+                            schema=schema,
+                        )
+                        _t8_audit_rows = []
+                        for _idx, _c in enumerate(_t8_cases, start=1):
+                            _t8_audit_rows.append({
+                                "run_id": run_id,
+                                "iteration": iteration_counter,
+                                "ag_id": None,
+                                "decision_order": _idx,
+                                "stage_letter": "O",
+                                "gate_name": "persistent_failure_escalation",
+                                "decision": "escalated",
+                                "reason_code": _c.reason_code,
+                                "reason_detail": (
+                                    f"signature={_c.cluster_signature} "
+                                    f"attempts={_c.attempt_count} "
+                                    f"qid={_c.question_id or '(sentinel)'}"
+                                )[:2000],
+                                "affected_qids": (
+                                    [_c.question_id] if _c.question_id else []
+                                ),
+                                "source_cluster_ids": [_c.cluster_signature],
+                                "metrics": {
+                                    "attempt_count": _c.attempt_count,
+                                    "last_iteration": _c.last_iteration,
+                                    "root_cause": _c.root_cause,
+                                    **(_c.evidence or {}),
+                                },
+                            })
+                        if _t8_audit_rows:
+                            _t8_audit(
+                                spark, _t8_audit_rows,
+                                catalog=catalog, schema=schema,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Task 8 persistence failed (non-fatal)",
+                            exc_info=True,
+                        )
+                    logger.info(
+                        "Task 8: escalated %d cluster signature(s) to "
+                        "human review: %s",
+                        len(_t8_new_sigs),
+                        ", ".join(sorted(_t8_new_sigs)),
+                    )
+                human_required_signatures |= _t8_new_sigs
+            except Exception:
+                logger.debug(
+                    "Task 8 escalation computation failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Drop clusters whose signature is in the human-required set
+            # so the strategist does not see them. Symmetric to the
+            # ``_filter_tried_clusters`` exclusion.
+            if human_required_signatures:
+                _pre_hard = len(clusters)
+                _pre_soft = len(soft_signal_clusters)
+                clusters = [
+                    c for c in clusters
+                    if not (
+                        c.get("cluster_signature")
+                        and c["cluster_signature"] in human_required_signatures
+                    )
+                ]
+                soft_signal_clusters = [
+                    c for c in soft_signal_clusters
+                    if not (
+                        c.get("cluster_signature")
+                        and c["cluster_signature"] in human_required_signatures
+                    )
+                ]
+                _dropped_hard = _pre_hard - len(clusters)
+                _dropped_soft = _pre_soft - len(soft_signal_clusters)
+                if _dropped_hard or _dropped_soft:
+                    logger.info(
+                        "Task 8: dropped %d hard + %d soft cluster(s) whose "
+                        "signature is in the human-required set",
+                        _dropped_hard, _dropped_soft,
+                    )
+
+            clusters = _filter_tried_clusters(clusters, tried_root_causes)
+            if not clusters and not soft_signal_clusters:
+                logger.info("No actionable clusters remain — stopping at iteration %d", _iter_num)
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="no_actionable_clusters",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=no_actionable_clusters skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                break
+
+            # Track H — quarantine attribution audit. The strategist must
+            # never receive a quarantine that includes a currently-passing
+            # qid (attribution drift) or a singleton-hard qid (the only
+            # remaining target). Both invariants raise on violation so the
+            # loop stops with a clear traceback rather than silently
+            # soft-skipping the wrong qid.
+            _all_eval_qids_for_audit = {
+                str(q)
+                for q in (_latest_eval_result or {}).get("question_ids") or []
+                if str(q)
+            }
+            # Hard clusters list every currently-failing qid; the complement
+            # against the universe is the currently-passing set.
+            _live_hard_for_audit = {
+                str(q)
+                for cluster in (clusters or [])
+                for q in cluster.get("question_ids") or []
+                if str(q)
+            }
+            _live_passing_for_audit = _all_eval_qids_for_audit - _live_hard_for_audit
+
+            # Plan N4 — lenient quarantine attribution.
+            # Default behaviour: drift releases recovered qids,
+            # singleton-hard releases the lone target, both emit typed
+            # records + ``GSO_INVARIANT_VIOLATION_V1`` markers, and the
+            # loop continues. ``GSO_INVARIANT_STRICT=1`` (or
+            # ``GSO_DECISION_EMITTER_STRICT=1`` for replay) flips back to
+            # the legacy ``AssertionError`` path so CI still fails loud.
+            _enforce_quarantine_attribution_invariant(
+                correction_state=_correction_state,
+                currently_passing_qids=_live_passing_for_audit,
+                currently_hard_qids=_live_hard_for_audit,
+                run_id=run_id,
+                iteration=iteration_counter,
+                emit_record=lambda r: _decision_emit(r),
+                emit_marker=lambda m: print(m, flush=True),
+            )
+
+            # ── Cluster-driven synthesis iteration-scoped state ──────────
+            # Stamp clusters on the snapshot so
+            # ``_resolve_source_cluster_for_ag`` (optimizer.py) can look up
+            # source clusters by id for Lever 5 intercept. Reset the shared
+            # per-iteration budget counter + stamp the active space_id so
+            # the P2 arbiter gate can call Genie (both per Bug #4 Phase 3
+            # Invariants B and C).
+            metadata_snapshot["_failure_clusters"] = clusters
+            metadata_snapshot["_cluster_synthesis_count"] = 0
+            metadata_snapshot["_space_id"] = space_id
+
+            if metadata_snapshot.get("_regression_mining_hints"):
+                logger.info(
+                    "Regression-mining strategist hints active for iter %d",
+                    iteration_counter,
+                )
+
+            # ── 3B.3: Priority scoring ───────────────────────────────────
+            _scan_levers = (
+                set(iq_scan_recommended_levers)
+                if iq_scan_recommended_levers and _iq_scan_strategist_enabled()
+                else None
+            )
+            # Tier 2.3: include soft clusters in ranking. cluster_impact applies a
+            # 0.5 dampen for signal_type=="soft" so hard clusters still win at
+            # equal q_count, while large soft clusters (the response_quality=63%
+            # case) can out-rank tiny hard clusters and earn strategist attention.
+            for _sc in soft_signal_clusters or []:
+                if isinstance(_sc, dict):
+                    _sc.setdefault("signal_type", "soft")
+            from genie_space_optimizer.optimization.control_plane import (
+                clusters_for_strategy,
+            )
+
+            _strategy_hard_clusters, _strategy_soft_clusters = clusters_for_strategy(
+                list(clusters or []),
+                list(soft_signal_clusters or []),
+            )
+
+            # Track H — soft-cluster currency invariant. Every qid emitted in
+            # any soft cluster must, on the *same* rows the clusterer saw,
+            # exhibit at least one row where ``has_individual_judge_failure``
+            # returns ``True``. If a soft-cluster qid has no such row, the
+            # clusterer is reading stale ASI / cached rows that no longer
+            # reflect the latest eval. Grounded against
+            # ``_analysis["failure_rows"]`` so the assertion sees the exact
+            # rows the soft pile was built from (no Delta re-read skew).
+            #
+            # Cycle 5 T5 — survival fix: instead of raising and aborting
+            # the run on drift, drop the drifted qids (or the entire
+            # cluster if every qid drifted) and emit a typed
+            # SOFT_CLUSTER_DRIFT_RECOVERED decision record. The recovery
+            # helper is pure; it returns the cleaned slate plus an audit
+            # trail. Closes the run-aborting AssertionError that hit two
+            # early task attempts of run 2423b960-16e8-41d4-a0cb-74c563378e05.
+            from genie_space_optimizer.optimization.cluster_formation_recovery import (
+                recover_from_soft_cluster_drift,
+            )
+            from genie_space_optimizer.optimization.control_plane import (
+                has_individual_judge_failure as _t5_has_jf,
+            )
+
+            try:
+                _t5_judge_failing = {
+                    str(_row.get("question_id") or "")
+                    for _row in (_analysis_failure_rows or [])
+                    if isinstance(_row, dict)
+                    and _row.get("question_id")
+                    and _t5_has_jf(_row)
+                }
+                _t5_recovery = recover_from_soft_cluster_drift(
+                    soft_clusters=_strategy_soft_clusters or [],
+                    judge_failing_qids=_t5_judge_failing,
+                )
+                if (
+                    _t5_recovery.drifted_qids_by_cluster
+                    or _t5_recovery.dropped_cluster_ids
+                ):
+                    # Refresh the soft slate with the cleaned clusters.
+                    _strategy_soft_clusters = _t5_recovery.recovered_clusters
+                    # Emit one decision record per affected cluster.
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        soft_cluster_drift_recovered_record,
+                    )
+                    _t5_dropped = set(_t5_recovery.dropped_cluster_ids)
+                    for _cid, _drifted in (
+                        _t5_recovery.drifted_qids_by_cluster.items()
+                    ):
+                        _t5_rec = soft_cluster_drift_recovered_record(
+                            run_id=str(run_id),
+                            iteration=int(iteration_counter),
+                            cluster_id=str(_cid),
+                            drifted_qids=_drifted,
+                            cluster_dropped=(_cid in _t5_dropped),
+                        )
+                        # Cycle 6 F-1 — skip duplicate emits within an iteration.
+                        _t5_key = _emit_idempotency_key(_t5_rec.to_dict())
+                        if _t5_key in _iter_emitted_keys:
+                            continue
+                        _iter_emitted_keys.add(_t5_key)
+                        _decision_emit(_t5_rec)
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_t5_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Cycle 5 T5: soft-cluster drift recovery failed "
+                    "(non-fatal); proceeding with original soft slate",
+                    exc_info=True,
+                )
+
+            ranked = rank_clusters(
+                list(_strategy_hard_clusters) + list(_strategy_soft_clusters),
+                recommended_levers=_scan_levers,
+                # T2.1: pass reflection buffer so each cluster gains a
+                # ``history`` block with prior attempts against its
+                # iteration-independent ``cluster_signature``. The
+                # strategist can then reason about "we've tried this
+                # cluster twice and rolled back both times; consider
+                # escalating or picking a different lever".
+                reflection_buffer=reflection_buffer,
+            )
+
+            # Cycle 2 Task 4 closeout — stamp per-cluster recommended_levers
+            # so the strategist's ranking_text surfaces the per-cluster
+            # lever hint in the LLM prompt. The IQ-scan space-wide override
+            # (``_scan_levers`` passed to ``rank_clusters``) remains the
+            # authoritative tiebreaker; this stamp is the per-cluster
+            # baseline recommendation single-question shape RCAs depend on.
+            from genie_space_optimizer.optimization.stages.action_groups import (
+                stamp_recommended_levers_on_clusters,
+            )
+            ranked = stamp_recommended_levers_on_clusters(ranked)
+
+            # ── 3B.4: Adaptive strategist (1 LLM call → 1 AG) ───────────
+            print(_section(f"ADAPTIVE STRATEGIST — Iteration ({_iteration_label(iteration_counter)})", "="))
+
+            _verdict_history = _build_verdict_history(spark, run_id, catalog, schema)
+
+            # ── 3B.3b: Hard-quarantine exhausted questions ────────────────
+            if reflection_buffer:
+                _, _persist_data = _build_question_persistence_summary(
+                    _verdict_history, reflection_buffer,
+                )
+                if not _rollback_state_trusted_for_quarantine:
+                    logger.warning(
+                        "Skipping convergence quarantine because live state is untrusted; "
+                        "hard failures must remain visible until rollback verification passes."
+                    )
+                    _quarantine_qids: set[str] = set()
+                    _soft_skip_qids: set[str] = set()
+                    _persist_data = {}
+                _quarantine_qids: set[str] = set()
+                # T4.3: temporary quarantine for stuck/worsening questions
+                # that haven't hit the hard-quarantine threshold yet. These
+                # are excluded from cluster formation for the *current*
+                # iteration only — they re-enter next iteration automatically.
+                # Prevents a couple of stuck questions from dominating every
+                # cluster and blinding the loop to patchable failures.
+                _soft_skip_qids: set[str] = set()
+                for _pq_id, _pq_info in _persist_data.items():
+                    _pq_class = _pq_info.get("classification", "")
+                    _pq_consec = _pq_info.get("max_consecutive", 0)
+                    _pq_conv = _pq_info.get("convergence_state", "")
+                    if _pq_class == "ADDITIVE_LEVERS_EXHAUSTED" or (
+                        _pq_class == "PERSISTENT" and _pq_consec >= 3
+                    ):
+                        _quarantine_qids.add(_pq_id)
+                    elif _pq_conv in ("stuck", "worsening") and _pq_consec >= 2:
+                        # Not bad enough for hard-quarantine, but bad enough
+                        # to not dominate cluster-formation this pass.
+                        _soft_skip_qids.add(_pq_id)
+
+                # Iteration-local skip set used ONLY for this pass's
+                # cluster-formation call. Hard quarantine persists via
+                # ``_quarantine_qids``; soft-skip qids re-enter next iteration.
+                _iter_local_skip_qids = _quarantine_qids | _soft_skip_qids
+                if _soft_skip_qids:
+                    logger.info(
+                        "T4.3: soft-skipping %d stuck/worsening question(s) "
+                        "from this iteration's cluster formation: %s",
+                        len(_soft_skip_qids), sorted(_soft_skip_qids),
+                    )
+                    print(
+                        _section(
+                            f"T4.3 CONVERGENCE QUARANTINE — "
+                            f"{len(_soft_skip_qids)} qid(s) soft-skipped",
+                            "-",
+                        ) + "\n"
+                        + _kv(
+                            "Questions",
+                            ", ".join(sorted(_soft_skip_qids))[:200],
+                        ) + "\n"
+                        + _kv(
+                            "Rationale",
+                            "iteration-local; not persisted into hard quarantine",
+                        ) + "\n"
+                        + _bar("-")
+                    )
+                    # Task 1 — iteration-local soft skip is consumed by the
+                    # next ``cluster_failures(...)`` call only. The hard
+                    # quarantine store ``_correction_state["quarantined_qids"]``
+                    # below MUST NOT see soft-skip qids: a transiently stuck
+                    # question that was already fixed by a prior accepted AG
+                    # would otherwise become permanently quarantined and
+                    # invisible to the next iteration's failure analysis.
+                    # Bug observed in production: an AG fixing a question
+                    # with several percentage-points of accuracy gain was
+                    # masked when the next iteration soft-skipped the same
+                    # question and then hard-quarantined it, hiding the
+                    # fact that the acceptance gate had already taken
+                    # credit for the fix.
+                    logger.debug(
+                        "Soft-skip qids %s are iteration-local; only "
+                        "_quarantine_qids %s flow into the persistent hard "
+                        "quarantine state below.",
+                        sorted(_soft_skip_qids),
+                        sorted(_quarantine_qids),
+                    )
+                if _quarantine_qids:
+                    _newly_quarantined = _quarantine_qids - _correction_state["quarantined_qids"]
+                    if _newly_quarantined:
+                        logger.info(
+                            "Hard-quarantining %d exhausted question(s): %s",
+                            len(_newly_quarantined), _newly_quarantined,
+                        )
+                        _correction_state["quarantined_qids"] |= _newly_quarantined
+                        try:
+                            from genie_space_optimizer.optimization.labeling import flag_for_human_review
+                            _flag_items = []
+                            for _hq_id in sorted(_newly_quarantined):
+                                _hq_info = _persist_data[_hq_id]
+                                _tried_str = "; ".join(
+                                    f"iter{it}: {pt}" for it, pt in _hq_info.get("patches_tried", [])
+                                )
+                                _flag_items.append({
+                                    "question_id": _hq_id,
+                                    "question_text": _hq_info.get("question_text", ""),
+                                    "reason": (
+                                        f"{_hq_info['classification']}: "
+                                        f"failed {_hq_info['fail_count']}/{_hq_info['total_evals']} evals, "
+                                        f"{_hq_info['max_consecutive']} consecutive"
+                                    ),
+                                    "iterations_failed": _hq_info.get("fail_count", 0),
+                                    "patches_tried": _tried_str,
+                                })
+                            if _flag_items:
+                                _flagged = flag_for_human_review(
+                                    spark, run_id, catalog, schema, domain, _flag_items,
+                                )
+                                print(
+                                    _section("PERSISTENCE QUARANTINE", "!") + "\n"
+                                    + _kv("Questions quarantined", len(_newly_quarantined)) + "\n"
+                                    + _kv("Flagged for human review", _flagged) + "\n"
+                                    + _bar("!")
+                                )
+                        except Exception:
+                            logger.warning("Failed to flag quarantined questions for human review", exc_info=True)
+                    # B3.3 — prune both hard and soft clusters using the
+                    # shared base-qid helper so a quarantined ``_002``
+                    # excludes ``_002:v2`` / ``_002:v3`` from S001 too.
+                    # Soft clusters were previously left untouched, which
+                    # is what let iter-2's S001 still contain the suffixed
+                    # variants of quarantined base qids.
+                    _pre_prune_hard_clusters = list(clusters or [])
+                    for c in list(clusters) + list(soft_signal_clusters or []):
+                        c_qids = c.get("question_ids", [])
+                        c["question_ids"] = [
+                            q for q in c_qids
+                            if not _is_quarantined_qid(q, _quarantine_qids)
+                        ]
+                    clusters = [c for c in clusters if c.get("question_ids")]
+                    soft_signal_clusters = [
+                        c for c in (soft_signal_clusters or [])
+                        if c.get("question_ids")
+                    ]
+                    # Task 5A — quarantine must not silently remove unresolved
+                    # patchable hard failures and let the loop pivot to soft
+                    # clusters. Stop for human review when no hard clusters
+                    # remain; otherwise carry the qids in a diagnostic lane.
+                    try:
+                        from genie_space_optimizer.optimization.control_plane import (
+                            decide_quarantine_continuation,
+                        )
+
+                        _pre_prune_hard_qids = {
+                            str(q)
+                            for _c in _pre_prune_hard_clusters
+                            for q in (_c.get("question_ids", []) or [])
+                            if str(q)
+                        }
+                        _q_decision = decide_quarantine_continuation(
+                            quarantined_qids=set(_quarantine_qids),
+                            unresolved_patchable_qids=_pre_prune_hard_qids,
+                            hard_cluster_count_after_prune=len(clusters),
+                            soft_cluster_count_after_prune=len(soft_signal_clusters or []),
+                        )
+                        if _q_decision["action"] == "stop_for_human_review":
+                            print(
+                                _section("QUARANTINE STOP — PATCHABLE HARD FAILURES", "!") + "\n"
+                                + _kv("Blocking QIDs", ", ".join(_q_decision["blocking_qids"])) + "\n"
+                                + "|  Quarantine removed unresolved hard failures. Stopping instead of pivoting to soft signals.\n"
+                                + _bar("!")
+                            )
+                            logger.warning(
+                                "Stopping lever loop because quarantine removed unresolved patchable hard failures: %s",
+                                _q_decision["blocking_qids"],
+                            )
+                            break
+                        if _q_decision["action"] == "diagnostic_lane":
+                            logger.warning(
+                                "Quarantined patchable hard qids remain in diagnostic lane: %s",
+                                _q_decision["blocking_qids"],
+                            )
+                    except Exception:
+                        logger.debug(
+                            "decide_quarantine_continuation failed (non-fatal)",
+                            exc_info=True,
+                        )
+                    if not clusters and not soft_signal_clusters:
+                        logger.info("All clusters emptied after quarantine — stopping at iteration %d", _iter_num)
+                        break
+
+            _total_q = len(benchmarks)
+            # Tier 2.4: include soft-cluster questions in the "failing" set when
+            # computing passing_q. Previously this only subtracted hard-cluster
+            # qids, so the success-summary line fed to the strategist read
+            # "N of M pass all judges" while the prompt's own soft_signal_clusters
+            # block showed judge failures — the two statements contradicted each
+            # other and the strategist would under-prioritise soft-cluster work.
+            _hard_qids = {
+                q for c in clusters for q in c.get("question_ids", []) if q
+            }
+            _soft_qids = {
+                q for c in (soft_signal_clusters or [])
+                for q in c.get("question_ids", []) if q
+            }
+            _passing_q = _total_q - len(_hard_qids | _soft_qids)
+
+            # ── Open a strategy MLflow run for this iteration ──────────
+            # Tier 4: v2 naming — ``<run_short>/iter_NN_strategy/<pending>``.
+            # We don't know the AG id yet (strategist is called next); use a
+            # ``pending`` detail until the strategist returns, then update
+            # tags with the concrete ag_id once known.
+            import mlflow as _mlflow
+
+            from genie_space_optimizer.common.mlflow_names import (
+                default_tags as _v2_tags_strat,
+                strategy_run_name,
+            )
+
+            try:
+                _mlflow.end_run()
+            except Exception:
+                pass
+            _mlflow.start_run(
+                run_name=strategy_run_name(run_id, iteration_counter, "pending"),
+            )
+            try:
+                _mlflow.set_tags({
+                    **_v2_tags_strat(
+                        run_id,
+                        space_id=space_id,
+                        stage="strategy",
+                        iteration=iteration_counter,
+                    ),
+                    "genie.domain": domain,
+                    "genie.optimization_run_id": run_id,
+                    "genie.run_type": "strategy",
+                })
+
+                # Phase 1.3: try buffered AG first.  We re-validate against
+                # the current cluster set so a buffered AG whose source
+                # clusters have been resolved (or split) by a prior
+                # iteration is dropped and the strategist is re-called.
+                ag = None
+                strategy = pending_strategy if _process_all_ags else None
+                if _process_all_ags and pending_action_groups:
+                    # Track D — revalidate buffered AGs by stable signature
+                    # rather than by the unstable H00N cluster_id label.
+                    # An AG's signature stays constant across iterations;
+                    # cluster_id re-numbers. Drop AGs whose signature no
+                    # longer overlaps the current iteration's cluster set
+                    # with an explicit audit row.
+                    _live_cluster_signatures = {
+                        str(c.get("cluster_signature") or "")
+                        for c in clusters + (soft_signal_clusters or [])
+                        if c.get("cluster_signature")
+                    }
+                    _src_ids: set[str] = set()
+                    _dropped_for_drift: list[dict] = []
+                    while pending_action_groups:
+                        _candidate = pending_action_groups.pop(0)
+                        _candidate_sig = _candidate.get("_stable_signature")
+                        _candidate_sig_set = (
+                            set(_candidate_sig[0]) if _candidate_sig else set()
+                        )
+                        if not _candidate_sig_set:
+                            # Backwards-compatible fallback: AGs created
+                            # before Track D's stamping landed do not have
+                            # a signature; fall through to the legacy
+                            # cluster-id check so the loop does not stall
+                            # on in-flight buffers.
+                            _src_ids = set(
+                                _candidate.get("source_cluster_ids", []) or []
+                            )
+                            _live_cluster_ids = {
+                                c.get("cluster_id", "")
+                                for c in clusters + (soft_signal_clusters or [])
+                            }
+                            if not _src_ids or (_src_ids & _live_cluster_ids):
+                                ag = _candidate
+                                break
+                            continue
+                        if _candidate_sig_set & _live_cluster_signatures:
+                            _src_ids = set(
+                                _candidate.get("source_cluster_ids", []) or []
+                            )
+                            ag = _candidate
+                            break
+                        # Signature drift — drop and audit.
+                        _dropped_for_drift.append(_candidate)
+                    if _dropped_for_drift:
+                        for _drop in _dropped_for_drift:
+                            print(
+                                _section(
+                                    "DROPPING BUFFERED AG (signature drift)", "-"
+                                ) + "\n"
+                                + _kv("AG id", _drop.get("id", "?")) + "\n"
+                                + _kv(
+                                    "Stale signatures",
+                                    sorted(
+                                        set((_drop.get("_stable_signature") or ((),))[0])
+                                    ),
+                                ) + "\n"
+                                + _kv(
+                                    "Live signatures",
+                                    sorted(_live_cluster_signatures),
+                                ) + "\n"
+                                + _bar("-")
+                            )
+                    if ag is not None:
+                        print(
+                            _section(
+                                f"REUSING BUFFERED AG (skipping strategist call) — "
+                                f"{len(pending_action_groups)} more queued",
+                                "-",
+                            ) + "\n"
+                            + _kv("AG id", ag.get("id", "?")) + "\n"
+                            + _kv("Source clusters", sorted(_src_ids)) + "\n"
+                            + _bar("-")
+                        )
+                        # Task 8 — if regression debt is outstanding, drop any
+                        # buffered AG that does not target debt qids and force a
+                        # fresh strategist call instead.
+                        if _regression_debt_qids_for_next_iteration:
+                            _debt_set = set(_regression_debt_qids_for_next_iteration)
+                            _ag_qids = {
+                                str(q)
+                                for q in (ag.get("affected_questions", []) or [])
+                                if str(q)
+                            }
+                            if not (_debt_set & _ag_qids):
+                                ag = None
+                                pending_action_groups.clear()
+                                pending_strategy = None
+                                strategy = None
+                    else:
+                        pending_strategy = None
+                        strategy = None
+
+                if ag is None:
+                    # Task 8 — pass debt qids into the strategist context and
+                    # promote any live hard cluster covering them to the front.
+                    if _regression_debt_qids_for_next_iteration:
+                        metadata_snapshot["_mandatory_regression_debt_qids"] = list(
+                            _regression_debt_qids_for_next_iteration
+                        )
+                        _debt_set = set(_regression_debt_qids_for_next_iteration)
+                        _debt_clusters = [
+                            c for c in _strategy_hard_clusters
+                            if _debt_set & {
+                                str(q) for q in (c.get("question_ids", []) or [])
+                                if str(q)
+                            }
+                        ]
+                        _debt_cluster_ids = {
+                            str(c.get("cluster_id") or "") for c in _debt_clusters
+                        }
+                        _strategy_hard_clusters = _debt_clusters + [
+                            c for c in _strategy_hard_clusters
+                            if str(c.get("cluster_id") or "") not in _debt_cluster_ids
+                        ]
+                    _live_cluster_ids = {
+                        str(c.get("cluster_id") or "")
+                        for c in _strategy_hard_clusters + list(_strategy_soft_clusters or [])
+                        if c.get("cluster_id")
+                    }
+                    _live_diag_signatures = {
+                        str(c.get("cluster_signature") or "")
+                        for c in _strategy_hard_clusters + list(_strategy_soft_clusters or [])
+                        if c.get("cluster_signature")
+                    }
+                    _diag_preempt: dict | None = None
+                    while diagnostic_action_queue and _diag_preempt is None:
+                        _candidate = diagnostic_action_queue.pop(0)
+                        _candidate_sig = _candidate.get("_stable_signature")
+                        _candidate_sig_set = (
+                            set(_candidate_sig[0]) if _candidate_sig else set()
+                        )
+                        # Derive _src_ids once per candidate so the audit
+                        # print and the "USING DIAGNOSTIC AG" print can
+                        # reference it regardless of which match path
+                        # (signature vs id-fallback) was taken.
+                        _src_ids = {
+                            str(cid)
+                            for cid in (_candidate.get("source_cluster_ids") or [])
+                            if str(cid)
+                        }
+                        # Track D — prefer signature match; fall back to
+                        # cluster-id only when the AG predates this PR.
+                        if _candidate_sig_set:
+                            _matches_live = bool(
+                                _candidate_sig_set & _live_diag_signatures
+                            )
+                        else:
+                            _matches_live = bool(_src_ids & _live_cluster_ids)
+                        if not _matches_live:
+                            print(
+                                _section(
+                                    "SKIPPING DIAGNOSTIC AG BECAUSE CLUSTER RESOLVED", "-"
+                                ) + "\n"
+                                + _kv("AG id", _candidate.get("id", "?")) + "\n"
+                                + _kv(
+                                    "Stale signatures",
+                                    sorted(_candidate_sig_set) if _candidate_sig_set
+                                    else sorted(_src_ids),
+                                ) + "\n"
+                                + _bar("-")
+                            )
+                            continue
+                        _diag_preempt = _candidate
+                        print(
+                            _section("USING DIAGNOSTIC AG FROM COVERAGE GAP", "-")
+                            + "\n"
+                            + _kv("AG id", _diag_preempt.get("id", "?"))
+                            + "\n"
+                            + _kv("Source clusters", sorted(_src_ids))
+                            + "\n"
+                            + _bar("-")
+                        )
+
+                    # v2 Task 23 — fingerprint sql_shape_deltas accumulated in
+                    # reflection_buffer so rollbacks invalidate the memo cache.
+                    _memo_sql_deltas = [
+                        _delta
+                        for _rb in reflection_buffer
+                        for _delta in (_rb.get("sql_shape_deltas") or [])
+                    ]
+                    _memo_key = _strategist_memo_key(
+                        list(_strategy_hard_clusters), metadata_snapshot,
+                        sql_shape_deltas=_memo_sql_deltas,
+                    )
+                    from genie_space_optimizer.optimization.intent_disambiguation import (
+                        detect_intent_collisions,
+                    )
+
+                    _intent_collisions = detect_intent_collisions(_strategy_hard_clusters)
+                    if _intent_collisions:
+                        logger.warning(
+                            "Detected %d intent collision(s) across active clusters: %s",
+                            len(_intent_collisions),
+                            [
+                                {
+                                    "term": c["term"],
+                                    "columns": sorted(c["column_choices"]),
+                                }
+                                for c in _intent_collisions
+                            ],
+                        )
+                        # Task 13 — record collision touches for every qid
+                        # implicated in any column branch of the collision.
+                        try:
+                            for _coll in _intent_collisions:
+                                _term = str(_coll.get("term") or "")
+                                _qbycol = _coll.get("questions_by_column") or {}
+                                _all_qids: list[str] = []
+                                for _qids_list in _qbycol.values():
+                                    _all_qids.extend(
+                                        str(q) for q in (_qids_list or []) if q
+                                    )
+                                if _all_qids:
+                                    _journey_emit(
+                                        "intent_collision_detected",
+                                        question_ids=list(dict.fromkeys(_all_qids)),
+                                        reason=f"term={_term}",
+                                    )
+                        except Exception:
+                            logger.debug(
+                                "Task 13: intent collision journey emit failed",
+                                exc_info=True,
+                            )
+                    if _diag_preempt is not None:
+                        strategy = {
+                            "action_groups": [_diag_preempt],
+                            "_memoized": False,
+                            "_diagnostic_preempt": True,
+                        }
+                    elif _memo_key in strategist_memo_cache:
+                        strategy = copy.deepcopy(strategist_memo_cache[_memo_key])
+                        strategy["_memoized"] = True
+                    else:
+                        # Cycle 9 T5: surface accumulated forbid_tables
+                        # constraints to the strategist via metadata_snapshot.
+                        # The prompt-renderer pickup is a future task; the
+                        # data is already observable in the replay fixture.
+                        if _strategist_constraints.to_strategist_context():
+                            metadata_snapshot["_strategist_constraints"] = (
+                                _strategist_constraints.to_strategist_context()
+                            )
+                        # Cycle 5 T2 closeout — when the flag is on, surface
+                        # the prior iteration's gate-drops of causal-target
+                        # patches to the strategist's prompt context so the
+                        # LLM can propose a narrower variant or shift levers
+                        # instead of re-emitting the same dropped pattern.
+                        # With the flag off, pass None — the strategist
+                        # prompt block is omitted (byte-stable).
+                        from genie_space_optimizer.common.config import (
+                            causal_drop_feedback_to_strategist_enabled,
+                        )
+                        _t2_drops_for_strategist = (
+                            list(_prior_iteration_dropped_causal_patches)
+                            if causal_drop_feedback_to_strategist_enabled()
+                            else None
+                        )
+                        strategy = _call_llm_for_adaptive_strategy(
+                            clusters=_strategy_hard_clusters,
+                            soft_signal_clusters=_strategy_soft_clusters,
+                            metadata_snapshot=metadata_snapshot,
+                            reflection_buffer=reflection_buffer,
+                            priority_ranking=ranked,
+                            tried_patches=tried_patches,
+                            w=w,
+                            total_benchmarks=_total_q,
+                            passing_benchmarks=max(0, _passing_q),
+                            verdict_history=_verdict_history,
+                            skill_exemplars=skill_exemplars or None,
+                            human_suggestions=_human_suggestions or None,
+                            iq_scan_summary=(
+                                iq_scan_summary if _iq_scan_strategist_enabled() else None
+                            ),
+                            max_ag_patches=MAX_AG_PATCHES,
+                            intent_collisions=_intent_collisions,
+                            prior_iteration_dropped_causal_patches=(
+                                _t2_drops_for_strategist
+                            ),
+                        )
+                        strategist_memo_cache[_memo_key] = copy.deepcopy(strategy)
+                        strategy["_memoized"] = False
+                    logger.info(
+                        "Strategist memoization: key=%s hit=%s",
+                        _memo_key[:120],
+                        strategy.get("_memoized"),
+                    )
+                    strategy["_source_clusters"] = (
+                        list(_strategy_hard_clusters) + list(_strategy_soft_clusters)
+                    )
+                    _l3_diagnostics = _diagnose_lever3_directive_emission(
+                        list(_strategy_hard_clusters), strategy,
+                    )
+                    if _l3_diagnostics:
+                        logger.warning(
+                            "Lever 3 directive diagnostics: %s",
+                            json.dumps(_l3_diagnostics, default=str),
+                        )
+                        strategy["lever3_directive_diagnostics"] = _l3_diagnostics
+                    action_groups = strategy.get("action_groups", [])
+                    # Task 8 — strategist coverage enforcement. Any patchable
+                    # hard cluster the LLM dropped gets a deterministic
+                    # diagnostic AG so the loop attempts it before declaring
+                    # "exhausted".
+                    try:
+                        from genie_space_optimizer.optimization.control_plane import (
+                            diagnostic_action_group_for_cluster,
+                            uncovered_patchable_clusters,
+                        )
+
+                        _uncovered = uncovered_patchable_clusters(
+                            clusters,
+                            action_groups,
+                        )
+                        if _uncovered:
+                            # Task 6 — log a structured diagnostic so the next
+                            # operator can tell the difference between "no RCA
+                            # card", "RCA card present but strategist returned
+                            # nothing", and "output truncated".
+                            try:
+                                _uncovered_ids = [
+                                    str(c.get("cluster_id"))
+                                    for c in _uncovered
+                                    if c.get("cluster_id")
+                                ]
+                                _log_strategist_coverage_gap(
+                                    iteration=iteration_counter,
+                                    uncovered_cluster_ids=_uncovered_ids,
+                                    cluster_question_counts={
+                                        str(c.get("cluster_id")): len(
+                                            c.get("question_ids") or []
+                                        )
+                                        for c in clusters or []
+                                        if c.get("cluster_id")
+                                    },
+                                    rca_cards_present={
+                                        str(c.get("cluster_id")): bool(c.get("rca_card"))
+                                        for c in clusters or []
+                                        if c.get("cluster_id")
+                                    },
+                                    strategist_action_groups=len(
+                                        (strategy or {}).get("action_groups") or []
+                                    ),
+                                    strategist_input_token_estimate=(strategy or {}).get(
+                                        "_input_token_estimate"
+                                    ),
+                                    strategist_output_truncated=bool(
+                                        (strategy or {}).get("_output_truncated")
+                                    ),
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Failed to log strategist coverage gap diagnostic",
+                                    exc_info=True,
+                                )
+                            logger.warning(
+                                "Strategist did not cover %d patchable hard cluster(s); "
+                                "appending diagnostic AGs: %s",
+                                len(_uncovered),
+                                [c.get("cluster_id") for c in _uncovered],
+                            )
+                            from genie_space_optimizer.optimization.control_plane import (
+                                compute_ag_stable_signature,
+                            )
+
+                            for _c in _uncovered:
+                                _diag_ag = diagnostic_action_group_for_cluster(_c)
+                                # Track D — stamp a stable signature derived
+                                # from cluster_signature, qid set, and root
+                                # cause so revalidation in later iterations
+                                # does not depend on the unstable H00N
+                                # cluster_id label.
+                                _diag_ag["_stable_signature"] = compute_ag_stable_signature(
+                                    _diag_ag, [_c]
+                                )
+                                # Cycle 5 T3 — when the cluster has no parent
+                                # RCA AND ``GSO_DIAGNOSTIC_AG_RCA_REGEN`` is
+                                # on, the AG enters the regeneration branch:
+                                # emit ``RCA_REGENERATION_TRIGGERED``,
+                                # attempt regen (no-op until the regen
+                                # helper lands), then emit
+                                # ``RCA_REGENERATION_EXHAUSTED`` and skip the
+                                # AG so we don't generate empty proposals.
+                                # With the flag off, every AG flows through
+                                # as before — byte-stable.
+                                try:
+                                    from genie_space_optimizer.common.config import (
+                                        diagnostic_ag_rca_regen_enabled,
+                                    )
+                                    if (
+                                        diagnostic_ag_rca_regen_enabled()
+                                        and _diag_ag.get("needs_rca_regeneration")
+                                    ):
+                                        from genie_space_optimizer.optimization.decision_emitters import (
+                                            rca_regeneration_triggered_record,
+                                            rca_regeneration_exhausted_record,
+                                        )
+                                        _t3_cluster_id = str(
+                                            _diag_ag.get("primary_cluster_id")
+                                            or _c.get("cluster_id") or ""
+                                        )
+                                        _t3_target_qids = tuple(
+                                            str(q)
+                                            for q in (_c.get("question_ids") or [])
+                                            if q
+                                        )
+                                        # Cycle 6 F-7 — emit diagnostic_ag
+                                        # trunk events so the journey
+                                        # classifier picks
+                                        # HARD_FAILURE_UNRESOLVED rather
+                                        # than TERMINAL_UNACTIONABLE for
+                                        # T3-regen-exhausted hard qids.
+                                        _emit_diagnostic_ag_trunk_events(
+                                            journey_emit=_journey_emit,
+                                            cluster_qids=_t3_target_qids,
+                                            cluster_id=_t3_cluster_id,
+                                        )
+                                        _t3_trig = rca_regeneration_triggered_record(
+                                            run_id=str(run_id),
+                                            iteration=int(iteration_counter),
+                                            cluster_id=_t3_cluster_id,
+                                            target_qids=_t3_target_qids,
+                                        )
+                                        # Cycle 6 F-1 — gate duplicate emits.
+                                        _t3_trig_key = _emit_idempotency_key(
+                                            _t3_trig.to_dict()
+                                        )
+                                        if _t3_trig_key not in _iter_emitted_keys:
+                                            _iter_emitted_keys.add(_t3_trig_key)
+                                            _decision_emit(_t3_trig)
+                                            _current_iter_inputs.setdefault(
+                                                "decision_records", []
+                                            ).append(_t3_trig.to_dict())
+                                        # Regen helper is a follow-up; for
+                                        # now every regen attempt fails so
+                                        # the AG retires here.
+                                        _t3_exh = rca_regeneration_exhausted_record(
+                                            run_id=str(run_id),
+                                            iteration=int(iteration_counter),
+                                            cluster_id=_t3_cluster_id,
+                                            attempted_evidence_sources=(),
+                                        )
+                                        _t3_exh_key = _emit_idempotency_key(
+                                            _t3_exh.to_dict()
+                                        )
+                                        if _t3_exh_key not in _iter_emitted_keys:
+                                            _iter_emitted_keys.add(_t3_exh_key)
+                                            _decision_emit(_t3_exh)
+                                            _current_iter_inputs.setdefault(
+                                                "decision_records", []
+                                            ).append(_t3_exh.to_dict())
+                                            # Cycle 6 F-7 — also emit the
+                                            # rca_exhausted trunk event so
+                                            # the classifier can
+                                            # distinguish tried-and-
+                                            # exhausted from never-tried.
+                                            for _q in _t3_target_qids:
+                                                try:
+                                                    _journey_emit(
+                                                        "rca_exhausted",
+                                                        question_id=str(_q),
+                                                        cluster_id=_t3_cluster_id,
+                                                    )
+                                                except Exception:
+                                                    logger.debug(
+                                                        "F-7: rca_exhausted "
+                                                        "trunk emit failed "
+                                                        "(non-fatal)",
+                                                        exc_info=True,
+                                                    )
+                                        # Skip this AG entirely — do not
+                                        # append to action_groups or the
+                                        # diagnostic queue.
+                                        continue
+                                except Exception:
+                                    logger.debug(
+                                        "Cycle 5 T3: RCA regen branch failed "
+                                        "(non-fatal); proceeding with the "
+                                        "original diagnostic AG",
+                                        exc_info=True,
+                                    )
+                                action_groups.append(_diag_ag)
+                                diagnostic_action_queue.append(_diag_ag)
+                                # Task 13 — diagnostic AG covers all qids in
+                                # the uncovered cluster.
+                                try:
+                                    _diag_qids = [
+                                        str(q)
+                                        for q in (_c.get("question_ids") or [])
+                                        if q
+                                    ]
+                                    _diag_ag_id = str(
+                                        _diag_ag.get("id")
+                                        or _diag_ag.get("ag_id")
+                                        or ""
+                                    )
+                                    if _diag_qids:
+                                        _journey_emit(
+                                            "diagnostic_ag",
+                                            question_ids=_diag_qids,
+                                            ag_id=_diag_ag_id,
+                                            cluster_id=str(
+                                                _c.get("cluster_id") or ""
+                                            ),
+                                            root_cause=str(
+                                                _c.get("root_cause")
+                                                or _c.get("asi_failure_type")
+                                                or ""
+                                            ),
+                                        )
+                                except Exception:
+                                    logger.debug(
+                                        "Task 13: diagnostic_ag journey emit failed",
+                                        exc_info=True,
+                                    )
+                    except Exception:
+                        logger.debug(
+                            "Strategist coverage enforcement raised (non-fatal)",
+                            exc_info=True,
+                        )
+                    # Sort by priority (lower = higher priority); fall back
+                    # to source-cluster impact_score when priority is
+                    # missing or tied.
+                    _impact_by_cid = {
+                        c.get("cluster_id", ""): float(c.get("impact_score", 0.0))
+                        for c in clusters + (soft_signal_clusters or [])
+                    }
+
+                    def _ag_sort_key(_ag: dict) -> tuple:
+                        _pri = _ag.get("priority")
+                        _pri_v = float(_pri) if isinstance(_pri, (int, float)) else 999.0
+                        _src = _ag.get("source_cluster_ids", []) or []
+                        _impact = max(
+                            (_impact_by_cid.get(_cid, 0.0) for _cid in _src),
+                            default=0.0,
+                        )
+                        return (_pri_v, -_impact)
+
+                    # Track 4 (Phase A burn-down) — decompose any
+                    # heterogeneous AG spanning multiple root-cause
+                    # families or tables when the bundle lacks a shared
+                    # direct fix. Per-cluster diagnostic AGs replace the
+                    # parent so cap budget can preserve a direct fix per
+                    # cluster.
+                    from genie_space_optimizer.optimization.control_plane import (
+                        decompose_overbroad_ag,
+                    )
+                    _all_clusters_for_decomposition = list(clusters or []) + list(
+                        soft_signal_clusters or []
+                    )
+                    _decomposed_action_groups: list[dict] = []
+                    for _ag_in in action_groups:
+                        _decomposed_action_groups.extend(
+                            decompose_overbroad_ag(
+                                _ag_in, _all_clusters_for_decomposition
+                            )
+                        )
+                    if len(_decomposed_action_groups) != len(action_groups):
+                        print(
+                            _section(
+                                f"AG DECOMPOSITION GUARDRAIL — {len(action_groups)} -> "
+                                f"{len(_decomposed_action_groups)} AGs",
+                                "-",
+                            ) + "\n"
+                            + _kv(
+                                "Original AG ids",
+                                ", ".join(_a.get("id", "?") for _a in action_groups),
+                            ) + "\n"
+                            + _kv(
+                                "Decomposed AG ids",
+                                ", ".join(
+                                    _a.get("id", "?") for _a in _decomposed_action_groups
+                                ),
+                            ) + "\n"
+                            + _bar("-")
+                        )
+                    action_groups = _decomposed_action_groups
+                    action_groups = sorted(action_groups, key=_ag_sort_key)
+                    # Cycle 10 W8 — emit AG_LEVERS_UNIONED for each AG
+                    # whose lever set was widened by Cycle 10 W2 union.
+                    # The pre-union snapshot lives on the AG dict as
+                    # ``_levers_before_union`` (see
+                    # ``union_ag_levers_with_recommended``).
+                    try:
+                        for _ag_w8 in (action_groups or []):
+                            _ag_id_w8 = str(_ag_w8.get("id") or "")
+                            _before_w8 = tuple(
+                                str(k) for k in
+                                (_ag_w8.get("_levers_before_union") or ())
+                            )
+                            _after_w8 = tuple(
+                                str(k) for k in
+                                ((_ag_w8.get("lever_directives") or {}).keys())
+                            )
+                            if _before_w8 and set(_before_w8) < set(_after_w8):
+                                emit_ag_levers_unioned_if_widened(
+                                    run_id=str(run_id),
+                                    iteration=int(iteration_counter),
+                                    ag_id=_ag_id_w8,
+                                    cluster_id=str(
+                                        (_ag_w8.get("source_cluster_ids") or ["?"])[0]
+                                    ),
+                                    levers_before=_before_w8,
+                                    levers_after=_after_w8,
+                                    iter_inputs=_current_iter_inputs,
+                                )
+                    except Exception:
+                        logger.debug(
+                            "Cycle 10 W8: ag_levers_unioned wiring failed (non-fatal)",
+                            exc_info=True,
+                        )
+                    ag = action_groups[0] if action_groups else None
+                    if _process_all_ags and len(action_groups) > 1:
+                        pending_action_groups = list(
+                            action_groups[1:_MAX_AGS_PER_STRATEGIST_CALL]
+                        )
+                        pending_strategy = strategy
+                        # Track D — stamp the stable signature on every
+                        # buffered AG before queueing. The signature is
+                        # computed against the clusters present at
+                        # buffering time so revalidation in later
+                        # iterations checks "does this AG's signature
+                        # still appear in the live cluster set" rather
+                        # than "does the H00N label still match".
+                        from genie_space_optimizer.optimization.control_plane import (
+                            compute_ag_stable_signature,
+                        )
+
+                        _all_clusters_for_signature = list(clusters or []) + list(
+                            soft_signal_clusters or []
+                        )
+                        for _buffered_ag in pending_action_groups:
+                            _buffered_ag["_stable_signature"] = compute_ag_stable_signature(
+                                _buffered_ag, _all_clusters_for_signature
+                            )
+                        print(
+                            _section(
+                                f"BUFFERING {len(pending_action_groups)} ADDITIONAL AG(S) "
+                                f"FOR LATER ITERATION(S)",
+                                "-",
+                            ) + "\n"
+                            + _kv(
+                                "Buffered AGs",
+                                ", ".join(
+                                    _a.get("id", "?") for _a in pending_action_groups
+                                ),
+                            ) + "\n"
+                            + _bar("-")
+                        )
+                    else:
+                        pending_action_groups = []
+                        pending_strategy = None
+
+                _global_rewrite = strategy.get("global_instruction_rewrite")
+                if isinstance(_global_rewrite, dict):
+                    non_empty = {k: v for k, v in _global_rewrite.items() if v is not None}
+                    if non_empty and ag is not None:
+                        ld = ag.setdefault("lever_directives", {})
+                        l5 = ld.setdefault("5", {})
+                        l5["instruction_sections"] = non_empty
+                elif isinstance(_global_rewrite, str) and _global_rewrite.strip():
+                    if ag is not None:
+                        ld = ag.setdefault("lever_directives", {})
+                        l5 = ld.setdefault("5", {})
+                        l5["instruction_guidance"] = _global_rewrite.strip()
+
+                if ag is None and _iter_num == 1:
+                    logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
+                    fallback_strategy = _generate_holistic_strategy(
+                        clusters=clusters,
+                        soft_signal_clusters=soft_signal_clusters,
+                        metadata_snapshot=metadata_snapshot,
+                        w=w,
+                    )
+                    _fb_ags = fallback_strategy.get("action_groups", [])
+                    _fb_ags.sort(key=lambda a: a.get("priority", 999))
+                    if _fb_ags:
+                        ag = _fb_ags[0]
+                        strategy = fallback_strategy
+            finally:
+                _mlflow.end_run()
+
+            if ag is None and clusters:
+                _remaining_qids = set()
+                for c in clusters:
+                    _remaining_qids.update(c.get("question_ids", []))
+                if _remaining_qids and _iter_num <= max_iterations - 1:
+                    logger.info(
+                        "Strategist returned 0 AGs but %d clusters with %d questions remain — "
+                        "constructing diagnostic fallback AG",
+                        len(clusters), len(_remaining_qids),
+                    )
+                    _top_cluster = ranked[0] if ranked else clusters[0]
+                    ag = {
+                        "id": f"AG{iteration_counter}_fallback",
+                        "root_cause_summary": _top_cluster.get("root_cause", "unresolved_failures"),
+                        "affected_questions": _top_cluster.get("question_ids", []),
+                        "source_cluster_ids": [_top_cluster.get("cluster_id", "")],
+                        "lever_directives": {
+                            "5": {"instruction_guidance": "Add example SQLs and routing instructions for remaining failure patterns"},
+                            "6": {"generate_expressions": True},
+                        },
+                        "rationale": (
+                            f"Diagnostic fallback: {len(_remaining_qids)} question(s) still failing. "
+                            f"Trying Lever 5 (instructions/examples) + Lever 6 (SQL expressions) "
+                            f"as a broad-spectrum fix."
+                        ),
+                        "coordination_notes": "Fallback AG — strategist returned empty, applying broad-spectrum lever 5+6",
+                    }
+                    strategy = strategy or {}
+                    strategy["action_groups"] = [ag]
+                    print(
+                        _section(f"DIAGNOSTIC FALLBACK AG — {len(_remaining_qids)} questions remain", "!") + "\n"
+                        + _kv("Cluster", _top_cluster.get("cluster_id", "?")) + "\n"
+                        + _kv("Root cause", _top_cluster.get("root_cause", "?")) + "\n"
+                        + _kv("Questions", len(_top_cluster.get("question_ids", []))) + "\n"
+                        + _bar("!")
+                    )
+
+            if ag is None:
+                logger.info("Strategist produced 0 action groups — ending lever loop")
+                print(
+                    _section("Strategy produced 0 action groups — nothing to do", "-") + "\n"
+                    + _bar("-")
+                )
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="strategy_zero_ags",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=strategy_zero_ags skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                break
+
+            ag_id = ag.get("id", f"AG{iteration_counter}")
+            ags_attempted.append(ag_id)
+            lever_keys = sorted(ag.get("lever_directives", {}).keys())
+
+            # Phase A — capture strategist AG snapshot for replay-fixture export.
+            try:
+                _current_iter_inputs["strategist_response"]["action_groups"].append({
+                    "id": str(ag_id),
+                    "affected_questions": [
+                        str(q) for q in (ag.get("affected_questions") or []) if q
+                    ],
+                    "patches": [],
+                })
+            except Exception:
+                logger.debug(
+                    "Phase A: strategist AG capture failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Tier 3.3: relabel header so the scorecard is clearly identified
+            # as "best (post last accepted iter)" rather than conflated with
+            # the latest eval. After Tier 1.3, ``prev_accuracy`` is refreshed
+            # by the post-enrichment eval, so the two blocks now represent
+            # the same reality (current space state), but the label clarifies
+            # intent for operators reading stale runs.
+            print(
+                _section(f"ACTION GROUP {ag_id} — Iteration ({_iteration_label(iteration_counter)})") + "\n"
+                + _kv("Root cause", ag.get("root_cause_summary", "?")[:120]) + "\n"
+                + _kv("Levers", ", ".join(lever_keys)) + "\n"
+                + _kv("Affected questions", len(ag.get("affected_questions", []))) + "\n"
+                + _kv("Best accuracy (post last accepted)", f"{best_accuracy:.1f}%") + "\n"
+                + _scorecard(best_scores) + "\n"
+                + _kv(
+                    "Failure analysis source",
+                    f"iter {iteration_counter - 1} full eval (current space state)",
+                ) + "\n"
+                + _bar("=")
+            )
+
+            _ag_source_cids = list(ag.get("source_cluster_ids", []))
+            _ag_cluster_info: dict = {}
+            # Phase C2: derive identity fields used by DO-NOT-RETRY (D1-D3)
+            # from the first source cluster. Action groups can span multiple
+            # clusters but in practice they share a root cause (the strategist
+            # is instructed to merge clusters with the same blame set). The
+            # first cluster's root_cause / blame_set is representative enough
+            # for collision detection.
+            _ag_root_cause: str = ""
+            _ag_blame_set: Any = None
+            # T2.1: collect iteration-independent cluster signatures for
+            # every source cluster this AG targets. Reflection buffer stamps
+            # them so the next iteration can detect "this signature has
+            # been tried before" even if the pretty cluster_id changed.
+            _ag_source_signatures: list[str] = []
+            for _rc_idx, _rc in enumerate(ranked):
+                _rc_cid = _rc.get("cluster_id", "")
+                if _ag_source_cids and _rc_cid not in set(_ag_source_cids):
+                    continue
+                _rc_sig = _rc.get("cluster_signature")
+                if _rc_sig and _rc_sig not in _ag_source_signatures:
+                    _ag_source_signatures.append(_rc_sig)
+                if not _ag_cluster_info:
+                    _ag_cluster_info = {
+                        "cluster_id": _rc_cid,
+                        "impact_score": _rc.get("impact_score"),
+                        "rank": _rc_idx + 1,
+                        "question_count": len(_rc.get("question_ids", [])),
+                        "root_cause": _rc.get("root_cause") or _rc.get("asi_failure_type"),
+                        "affected_questions": _rc.get("question_ids", [])[:20],
+                        "cluster_signature": _rc_sig,
+                    }
+                    _ag_root_cause = (
+                        _rc.get("asi_failure_type")
+                        or _rc.get("root_cause")
+                        or ""
+                    )
+                    _ag_blame_set = _rc.get("asi_blame_set")
+
+            # Phase C2: reusable identity kwargs for every _build_reflection_entry
+            # call in this AG iteration. Keeps call sites DRY while guaranteeing
+            # the forbidden-set / tried-cluster bookkeeping downstream always
+            # sees the same root_cause / blame_set / source_cluster_ids.
+            _ag_identity_kwargs = {
+                "root_cause": _ag_root_cause,
+                "blame_set": _ag_blame_set,
+                "source_cluster_ids": list(_ag_source_cids),
+                "source_cluster_signatures": list(_ag_source_signatures),
+            }
+
+            # Phase D2: collision guard. The strategist occasionally re-proposes
+            # a previously-rejected (root_cause, blame_set, lever_set) tuple
+            # despite the DO NOT RETRY hint in its prompt (see Q004 regression).
+            # When that happens, skip this AG rather than deploying the same
+            # patch again. The reflection entry is logged with rollback_class
+            # OTHER so this skip doesn't count against any budget — it's
+            # purely a routing correction.
+            _forbidden = _compute_forbidden_ag_set(reflection_buffer)
+            _collision_key = _ag_collision_key(
+                ag, _ag_root_cause, _ag_blame_set, lever_keys,
+            )
+            if _collision_key is not None and _collision_key in _forbidden:
+                _rc_k, _blame_k, _lever_k = _collision_key
+                print(
+                    _section(f"[{ag_id}] AG COLLISION — skipping", "!") + "\n"
+                    + _kv("Root cause", _rc_k) + "\n"
+                    + _kv("Blame", _blame_k) + "\n"
+                    + _kv("Lever set", sorted(_lever_k)) + "\n"
+                    + _kv(
+                        "Reason",
+                        "strategist re-proposed a (root_cause, blame, lever_set) "
+                        "tuple previously rolled back for content regression",
+                    ) + "\n"
+                    + _bar("!")
+                )
+                write_stage(
+                    spark, run_id, f"AG_{ag_id}_COLLISION_SKIPPED", "SKIPPED",
+                    task_key="lever_loop", iteration=iteration_counter,
+                    detail={
+                        "root_cause": _rc_k,
+                        "blame_set": list(_blame_k) if isinstance(_blame_k, tuple) else _blame_k,
+                        "lever_set": sorted(_lever_k),
+                    },
+                    catalog=catalog, schema=schema,
+                )
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                    levers=[int(lk) for lk in lever_keys], target_objects=[],
+                    prev_scores=best_scores, new_scores=best_scores,
+                    rollback_reason="ag_collision_with_forbidden_set",
+                    patches=[],
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                    **_ag_identity_kwargs,
+                ))
+                _render_current_journey()
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="ag_identity_skip",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=ag_identity_skip skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            _ag_cluster_info["rationale"] = ag.get("rationale", strategy.get("rationale", "") if strategy else "")
+            _ag_cluster_info["escalation"] = ag.get("escalation") or None
+            _global_rewrite = strategy.get("global_instruction_rewrite", "") if strategy else ""
+            _ag_cluster_info["instruction_rewrite_preview"] = str(_global_rewrite)[:500] if _global_rewrite else ""
+
             write_stage(
-                spark, run_id, "LEVER_LOOP_ESCALATION_EXIT", "COMPLETE",
+                spark, run_id, f"AG_{ag_id}_STARTED", "STARTED",
                 task_key="lever_loop", iteration=iteration_counter,
-                detail={
-                    "consecutive_escalations": _consecutive_esc,
-                    "escalation_type": _last_esc_type,
-                },
+                detail=_ag_cluster_info if _ag_cluster_info else None,
                 catalog=catalog, schema=schema,
             )
-            break
 
-        iteration_counter += 1
-
-        # Phase H iteration content completeness — pre-stamp the trace /
-        # summary entries so any subsequent ``continue`` / ``break``
-        # leaves a renderable iteration in the operator transcript. The
-        # rich data is written in by ``_finalize_iteration_summary`` at
-        # every iteration-body-level exit and at the end-of-body block.
-        _stamp_iteration_stub(
-            iter_traces=_iter_traces,
-            iter_summaries=_iter_summaries,
-            iteration=iteration_counter,
-        )
-
-        # Phase A — append-on-begin: allocate the per-iteration snapshot
-        # AND register it in ``_replay_fixture_iterations`` immediately,
-        # so any subsequent ``continue`` / ``break`` (rollback paths,
-        # cap drops, diagnostic-AG paths, plateau exits, etc.) cannot
-        # silently drop this iteration from the replay fixture.
-        # Subsequent code mutates this dict in place; the list entry is
-        # the same reference, so mutations are reflected automatically.
-        from genie_space_optimizer.optimization.journey_fixture_exporter import (
-            begin_iteration_capture as _begin_iteration_capture,
-        )
-        _current_iter_inputs: dict = _begin_iteration_capture(
-            iterations_data=_replay_fixture_iterations,
-            iteration=iteration_counter,
-        )
-
-        # Cycle 5 T1 — productive-iteration budget accounting locals.
-        # All three are populated unconditionally because their cost is
-        # negligible; they are READ only when
-        # ``productive_iteration_budget_enabled()`` is true (Option A:
-        # gate emission, not capture). With the flag off the locals are
-        # set but never consumed → zero behaviour change, zero new
-        # decision records, byte-stable replay. The most-recent typed
-        # P4 reason at the SKIPPING / NO_APPLIED sites is sourced from
-        # ``_current_iter_inputs["decision_records"]`` which the harness
-        # already accumulates per iteration.
-        _iter_consumed: bool = True
-        _iter_no_op_cause: str = ""
-        _iter_applied_count: int = 0
-
-        # Cycle 5 T2 — per-iteration accumulator for gate-drops carrying
-        # a causal-target patch. Populated unconditionally at the
-        # blast-radius drop site (capture is cheap memory; no behaviour
-        # change). Consumed at iteration end to refresh the outer-scope
-        # ``_prior_iteration_dropped_causal_patches`` list, which the
-        # next iteration's ``ActionGroupsInput`` reads — gated by
-        # ``GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST`` so byte-stability
-        # holds with the flag off.
-        _iter_dropped_causal: list = []
-
-        # Cycle 6 F-1 — per-iteration emit-dedup set for Cycle 5 records
-        # (iteration_budget_decision, soft_cluster_drift_recovered,
-        # rca_regeneration_*). Each Cycle 5 emit site checks
-        # ``_emit_idempotency_key(rec)`` against this set before
-        # emitting and skips on hit. Reset at every iteration body
-        # entry so cross-iteration repeats (intentional) still flow.
-        _iter_emitted_keys: set[tuple] = set()
-
-        # P3 task 4 — drain any structural-synthesis proposals queued
-        # at the prior iteration's lever-5 drop site. Same-iteration
-        # injection (below at the drop site) is the active path, so
-        # this list is empty in steady state; the drain runs each
-        # iteration for hygiene and to surface anything carried over
-        # for replay observability.
-        _forced_synthesis_proposals_carryover = (
-            _consume_structural_synthesis_buffer(_structural_synthesis_buffer)
-        )
-        if _forced_synthesis_proposals_carryover:
-            logger.info(
-                "P3: drained %d carry-over structural-synthesis proposal(s) "
-                "from prior iteration",
-                len(_forced_synthesis_proposals_carryover),
-            )
-            _current_iter_inputs.setdefault(
-                "carryover_structural_proposals", []
-            ).extend(_forced_synthesis_proposals_carryover)
-
-        # ── Per-question journey ledger accumulator (Task 13) ────────
-        # Stamp every stage that touches a question so the end-of-
-        # iteration ledger can reconstruct each qid's full timeline.
-        from genie_space_optimizer.optimization.question_journey import (
-            QuestionJourneyEvent as _JourneyEvent,
-            build_question_journey_ledger as _build_journey_ledger,
-            render_question_journey_once as _render_journey_once,
-        )
-        _journey_events: list[_JourneyEvent] = []
-        _journey_render_state: dict[str, bool] = {"rendered": False}
-
-        def _journey_emit(stage: str, **fields):
-            """Append journey event(s); fail-safe for any caller."""
-            try:
-                qids = fields.pop("question_ids", None)
-                qid = fields.pop("question_id", None)
-                target_qids = list(qids) if qids else (
-                    [qid] if qid else []
-                )
-                for q in target_qids:
-                    qstr = str(q).strip()
-                    if not qstr:
+            # ── 3B.4a+: Persist improvement proposals from strategist ───
+            _ag_proposals = ag.get("proposals", [])
+            if _ag_proposals and isinstance(_ag_proposals, list):
+                for _prop in _ag_proposals:
+                    if not isinstance(_prop, dict):
                         continue
-                    _journey_events.append(_JourneyEvent(
-                        question_id=qstr, stage=stage, **fields,
-                    ))
-            except Exception:
-                logger.debug(
-                    "journey_emit failed (non-fatal) stage=%s", stage,
-                    exc_info=True,
+                    try:
+                        write_suggestion(spark, catalog, schema, {
+                            "run_id": run_id,
+                            "space_id": space_id,
+                            "iteration": iteration_counter,
+                            "lever": None,
+                            "type": _prop.get("type", "METRIC_VIEW"),
+                            "title": _prop.get("title", "Untitled proposal"),
+                            "rationale": _prop.get("rationale"),
+                            "definition": _prop.get("definition"),
+                            "affected_questions": _prop.get("affected_questions", []),
+                            "estimated_impact": _prop.get("estimated_impact"),
+                        })
+                    except Exception:
+                        logger.debug("Failed to write suggestion from AG %s", ag_id, exc_info=True)
+                if _ag_proposals:
+                    logger.info("Wrote %d improvement proposals from AG %s", len(_ag_proposals), ag_id)
+
+            # ── 3B.4b: Handle escalation if present ─────────────────────
+            _escalation = ag.get("escalation", "")
+            if _escalation:
+                print(
+                    _section(f"ESCALATION: {_escalation}", "!") + "\n"
+                    + _kv("Type", _escalation) + "\n"
+                    + _kv("Affected questions", ag.get("affected_questions", [])) + "\n"
+                    + _bar("!")
                 )
-
-        def _decision_emit(record):
-            """v2 Pre-Task 0.5: pin the iteration-body decision-emit closure.
-
-            The harness historically appends decision records via direct
-            calls to ``_current_iter_inputs.setdefault("decision_records",
-            []).append(record.to_dict())`` (~17 sites in this iteration
-            body). v2 introduces this closure with the SAME shape so every
-            Phase A wire-up routes ``ctx.decision_emit(record)`` through
-            one place.
-
-            Contract: ``record`` is a typed DecisionRecord (has
-            .to_dict()) OR a plain dict. On exception: log debug + swallow
-            (matches _journey_emit shape).
-            """
-            try:
-                rec_dict = (
-                    record.to_dict() if hasattr(record, "to_dict")
-                    else dict(record)
-                )
-                _current_iter_inputs.setdefault(
-                    "decision_records", []
-                ).append(rec_dict)
-            except Exception:
-                logger.debug(
-                    "decision_emit failed (non-fatal)", exc_info=True,
-                )
-
-        def _render_current_journey() -> None:
-            """Render this AG iteration's journey ledger exactly once."""
-            try:
-                _render_journey_once(
-                    events=_journey_events,
+                _esc_result = _handle_escalation(
+                    _escalation, ag,
+                    w=w, spark=spark, run_id=run_id,
+                    catalog=catalog, schema=schema, domain=domain,
                     iteration=iteration_counter,
-                    render_state=_journey_render_state,
+                    benchmarks=benchmarks,
+                    verdict_history=_verdict_history,
+                    reflection_buffer=reflection_buffer,
+                    metadata_snapshot=metadata_snapshot,
                 )
+                logger.info("Escalation result: %s", _esc_result)
+
+                write_stage(
+                    spark, run_id, f"AG_{ag_id}_ESCALATION", "COMPLETE",
+                    task_key="lever_loop", iteration=iteration_counter,
+                    detail={
+                        "escalation_type": _escalation,
+                        "handled": _esc_result.get("handled", False),
+                        "detail": _esc_result.get("detail", {}),
+                        "affected_questions": ag.get("affected_questions", [])[:20],
+                    },
+                    catalog=catalog, schema=schema,
+                )
+
+                _esc_tier = _esc_result.get("detail", {}).get("tier_action", "")
+
+                if _escalation == "flag_for_review" or (
+                    _escalation == "remove_tvf" and _esc_tier == "flagged_only"
+                ):
+                    reflection_buffer.append(_build_reflection_entry(
+                        iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                        levers=[], target_objects=ag.get("affected_questions", []),
+                        prev_scores=best_scores, new_scores=best_scores,
+                        rollback_reason=f"escalation:{_escalation}",
+                        patches=[],
+                        affected_question_ids=ag.get("affected_questions", []),
+                        prev_failure_qids=prev_failure_qids,
+                        new_failure_qids=prev_failure_qids,
+                        escalation_handled=True,
+                        **_ag_identity_kwargs,
+                    ))
+                    continue
+
+                if _escalation == "gt_repair":
+                    _gt_repair_corrections = _esc_result.get("detail", {}).get("corrections_applied", 0)
+                    if _gt_repair_corrections > 0:
+                        reflection_buffer.append(_build_reflection_entry(
+                            iteration=iteration_counter, ag_id=ag_id, accepted=True,
+                            levers=[], target_objects=ag.get("affected_questions", []),
+                            prev_scores=best_scores, new_scores=best_scores,
+                            rollback_reason=None,
+                            patches=[],
+                            affected_question_ids=ag.get("affected_questions", []),
+                            prev_failure_qids=prev_failure_qids,
+                            new_failure_qids=prev_failure_qids,
+                            reflection_text=f"GT repair applied {_gt_repair_corrections} benchmark correction(s)",
+                            escalation_handled=True,
+                            **_ag_identity_kwargs,
+                        ))
+                    else:
+                        _unfixed = set(ag.get("affected_questions", [])) - set(
+                            _esc_result.get("detail", {}).get("corrected_qids", [])
+                        ) - set(
+                            _esc_result.get("detail", {}).get("quarantined_qids", [])
+                        )
+                        escalated_gt_repair_qids.update(_unfixed)
+                        reflection_buffer.append(_build_reflection_entry(
+                            iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                            levers=[], target_objects=ag.get("affected_questions", []),
+                            prev_scores=best_scores, new_scores=best_scores,
+                            rollback_reason="escalation:gt_repair (delegated to arbiter)",
+                            patches=[],
+                            affected_question_ids=ag.get("affected_questions", []),
+                            prev_failure_qids=prev_failure_qids,
+                            new_failure_qids=prev_failure_qids,
+                            escalation_handled=True,
+                            **_ag_identity_kwargs,
+                        ))
+                    continue
+
+                if _escalation == "remove_tvf" and _esc_tier in ("auto_apply", "apply_and_flag"):
+                    _tvf_id = _esc_result.get("detail", {}).get("tvf_id", "")
+                    _prev_asset = _esc_result.get("detail", {}).get("previous_tvf_asset", {})
+                    if _tvf_id:
+                        _synthetic_patch = {
+                            "type": "remove_tvf",
+                            "target": _tvf_id,
+                            "new_text": "",
+                            "old_text": "",
+                            "previous_tvf_asset": _prev_asset,
+                            "lever": 3,
+                            "risk_level": "high",
+                            "predicted_affected_questions": len(ag.get("affected_questions", [])),
+                            "rationale": (
+                                f"TVF {_tvf_id} auto-removed by tiered confidence model "
+                                f"(tier={_esc_tier})"
+                            ),
+                        }
+                        _tvf_conf = _esc_result.get("detail", {}).get("confidence", "?")
+                        print(
+                            _section(f"[{ag_id}] SYNTHETIC remove_tvf PATCH", "!") + "\n"
+                            + _kv("TVF", _tvf_id) + "\n"
+                            + _kv("Confidence", _tvf_conf) + "\n"
+                            + _kv("Tier action", _esc_tier) + "\n"
+                            + _bar("!")
+                        )
+                        _tvf_apply_log = apply_patch_set(
+                            w, space_id, [_synthetic_patch], metadata_snapshot,
+                            apply_mode=apply_mode,
+                            force_apply=True,
+                        )
+                        _tvf_lever = 3
+                        for idx, entry in enumerate(_tvf_apply_log.get("applied", [])):
+                            write_patch(
+                                spark, run_id, iteration_counter, _tvf_lever, idx,
+                                _build_patch_record(entry, _tvf_lever, apply_mode),
+                                catalog, schema,
+                            )
+                        if _tvf_apply_log.get("patch_deployed", False):
+                            logger.info("TVF %s removed successfully (tier=%s)", _tvf_id, _esc_tier)
+                            metadata_snapshot = _tvf_apply_log.get("post_snapshot", metadata_snapshot)
+                            if _original_instruction_sections:
+                                metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
+                        else:
+                            logger.warning(
+                                "TVF removal patch deploy failed: %s",
+                                _tvf_apply_log.get("patch_error", "unknown"),
+                            )
+                    else:
+                        logger.warning(
+                            "remove_tvf escalation with tier %s but no tvf_id — skipping",
+                            _esc_tier,
+                        )
+
+            try:
+                from genie_space_optimizer.optimization.rca_execution import (
+                    forced_levers_from_reflections,
+                    next_grounding_remediation,
+                    plans_for_action_group,
+                    required_levers_for_action_group,
+                    union_execution_levers,
+                )
+
+                _source_clusters_for_execution = strategy.get("_source_clusters", [])
+                _rca_plans_for_ag = plans_for_action_group(
+                    ag,
+                    metadata_snapshot.get("_rca_execution_plans") or [],
+                    source_clusters=_source_clusters_for_execution,
+                )
+                _rca_required_levers = required_levers_for_action_group(
+                    ag,
+                    metadata_snapshot.get("_rca_execution_plans") or [],
+                    source_clusters=_source_clusters_for_execution,
+                )
+                _forced_from_reflections = forced_levers_from_reflections(
+                    reflection_buffer,
+                    target_rca_ids=tuple(p.rca_id for p in _rca_plans_for_ag),
+                    min_repeats=2,
+                )
+                _grounding_remediation = next_grounding_remediation(
+                    reflection_buffer,
+                    target_rca_ids=tuple(p.rca_id for p in _rca_plans_for_ag),
+                )
+                _forced_from_grounding = tuple(
+                    int(x)
+                    for x in (_grounding_remediation.get("forced_levers") or ())
+                )
+                _all_required_rca_levers = tuple(dict.fromkeys(
+                    list(_rca_required_levers)
+                    + list(_forced_from_reflections)
+                    + list(_forced_from_grounding)
+                ))
+                if _all_required_rca_levers:
+                    ag["_rca_execution"] = {
+                        "rca_ids": [p.rca_id for p in _rca_plans_for_ag],
+                        "required_levers": list(_all_required_rca_levers),
+                        "defect_keys": [p.defect_key for p in _rca_plans_for_ag],
+                        "grounding_terms": sorted({
+                            term for p in _rca_plans_for_ag for term in p.grounding_terms
+                        }),
+                        "forced_from_reflections": list(_forced_from_reflections),
+                        "grounding_remediation": _grounding_remediation.get("action", "none"),
+                    }
+                    lever_keys = union_execution_levers(
+                        lever_keys,
+                        _all_required_rca_levers,
+                    )
+                    logger.info(
+                        "[%s] RCA execution required levers=%s final_levers=%s rca_ids=%s",
+                        ag_id,
+                        list(_all_required_rca_levers),
+                        lever_keys,
+                        ag["_rca_execution"]["rca_ids"],
+                    )
             except Exception:
+                logger.debug("Failed to union RCA-required levers", exc_info=True)
+
+            if "6" in lever_keys:
+                try:
+                    from genie_space_optimizer.optimization.control_plane import (
+                        rows_for_qids,
+                        target_qids_from_action_group,
+                    )
+                    from genie_space_optimizer.optimization.feature_mining import (
+                        extract_failed_row_sql_expression_candidates,
+                    )
+
+                    _all_rows_for_structural_learning = _get_failure_rows(
+                        spark, run_id, catalog, schema,
+                    )
+                    _structural_target_qids = target_qids_from_action_group(
+                        ag,
+                        strategy.get("_source_clusters", []),
+                    )
+                    _structural_rows = rows_for_qids(
+                        _all_rows_for_structural_learning,
+                        _structural_target_qids,
+                    )
+                    _structural_candidates: list[dict] = []
+                    for _row in _structural_rows:
+                        for _candidate in extract_failed_row_sql_expression_candidates(_row):
+                            _structural_candidates.append(_candidate.as_dict())
+                    if _structural_candidates:
+                        ag["_lever6_structural_candidates"] = _structural_candidates
+                        logger.info(
+                            "[%s] Lever 6 structural candidates from failed GT SQL: %d",
+                            ag_id,
+                            len(_structural_candidates),
+                        )
+                        print(
+                            _section(
+                                f"LEVER 6 STRUCTURAL SQL LEARNING [{ag_id}]",
+                                "-",
+                            )
+                            + "\n"
+                            + _kv("Scoped rows", len(_structural_rows))
+                            + "\n"
+                            + _kv("Candidates", len(_structural_candidates))
+                            + "\n"
+                            + _kv(
+                                "Source",
+                                "arbiter-approved failed question expected_sql",
+                            )
+                            + "\n"
+                            + _bar("-")
+                        )
+                except Exception:
+                    logger.debug(
+                        "Failed to attach Lever 6 structural candidates",
+                        exc_info=True,
+                    )
+
+            # ── 3B.5: Generate proposals + apply patches ─────────────────
+            # Task 4 — initialize per-AG patch-survival snapshots. They get
+            # filled in at each handoff gate (proposed → normalized →
+            # applyable → capped → applied) and printed after the applier so
+            # operators can see exactly where patches were dropped.
+            _survival_proposed: list[dict] = []
+            _survival_normalized: list[dict] = []
+            _survival_applyable: list[dict] = []
+            _survival_capped: list[dict] = []
+            all_proposals: list[dict] = []
+            for lever_key in lever_keys:
+                lever_int = int(lever_key)
+                levers_attempted.append(lever_int)
+                lever_proposals = generate_proposals_from_strategy(
+                    strategy=strategy,
+                    action_group=ag,
+                    metadata_snapshot=metadata_snapshot,
+                    target_lever=lever_int,
+                    apply_mode=apply_mode,
+                    w=w,
+                    spark=spark,
+                    catalog=catalog,
+                    gold_schema=schema,
+                    warehouse_id=resolve_warehouse_id(""),
+                    benchmarks=benchmarks,
+                    # Cycle 9 W4 — pass the per-run DOA fingerprint buffer so
+                    # the strategist's end-of-function prune drops candidates
+                    # whose retry signature was already captured as
+                    # target_still_hard in this run.
+                    doa_fingerprint_buffer=_doa_fingerprint_buffer,
+                )
+                all_proposals.extend(lever_proposals)
+
+            # P4 task 5 — stdout marker when an AG produced zero proposals.
+            # Distinct from STRUCTURAL_GATE_DROPPED (proposal existed but
+            # was dropped) and NO_STRUCTURAL_CANDIDATE (synthesis attempted
+            # but no archetype matched). Emitted before the L5-drop block
+            # so the empty-proposals signal fires regardless of L5 state.
+            if not all_proposals:
+                try:
+                    from genie_space_optimizer.optimization.run_analysis_contract import (
+                        proposal_generation_empty_marker,
+                    )
+                    print(proposal_generation_empty_marker(
+                        ag_id=str(ag_id),
+                        iteration=iteration_counter,
+                        target_qids=tuple(
+                            str(q) for q in (ag.get("affected_questions") or [])
+                            if str(q)
+                        ),
+                    ), flush=True)
+                except Exception:
+                    logger.debug(
+                        "P4: proposal_generation_empty_marker emit failed (non-fatal)",
+                        exc_info=True,
+                    )
+
+            # Cycle 8 Bug 1 Phase 3b Task B — drain Lever 5 structural-gate
+            # drops for this AG into the iteration's decision_records. The
+            # gate fires inside generate_proposals_from_strategy and stashes
+            # one record per drop on optimizer._LEVER5_GATE_DROPS; we snapshot
+            # here, filter to this AG, and build a typed GATE_DECISION
+            # DecisionRecord. The full ledger is reset at the end of the
+            # iteration alongside the Bug-4 counters.
+            try:
+                from genie_space_optimizer.optimization.optimizer import (
+                    get_lever5_gate_drops as _get_lever5_gate_drops,
+                )
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    lever5_structural_gate_records as _lever5_structural_gate_records,
+                )
+
+                _l5_all_drops = _get_lever5_gate_drops()
+                _l5_ag_drops = [
+                    d for d in _l5_all_drops
+                    if str(d.get("ag_id") or "") == str(ag_id)
+                ]
+                if _l5_ag_drops:
+                    _l5_ag_root_cause = ""
+                    _l5_ag_rca_id = ""
+                    for _cid in (ag.get("source_cluster_ids") or []):
+                        _l5_ag_rca_id = str(
+                            _iter_rca_id_by_cluster.get(str(_cid)) or ""
+                        )
+                        _src_cluster = _iter_source_clusters_by_id.get(str(_cid))
+                        if isinstance(_src_cluster, dict) and not _l5_ag_root_cause:
+                            _l5_ag_root_cause = str(
+                                _src_cluster.get("root_cause") or ""
+                            )
+                        if _l5_ag_rca_id and _l5_ag_root_cause:
+                            break
+                    _l5_records = _lever5_structural_gate_records(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        ag_id=str(ag_id),
+                        rca_id=_l5_ag_rca_id,
+                        root_cause=_l5_ag_root_cause,
+                        target_qids=tuple(
+                            str(q) for q in (ag.get("affected_questions") or [])
+                            if str(q)
+                        ),
+                        drops=_l5_ag_drops,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).extend([r.to_dict() for r in _l5_records])
+
+                    # P4 task 5 — stdout marker for the L5 structural-gate
+                    # drop. Aggregates root_causes across the AG's drops.
+                    try:
+                        from genie_space_optimizer.optimization.run_analysis_contract import (
+                            structural_gate_dropped_marker,
+                        )
+                        _l5_marker_root_causes: list[str] = []
+                        for _md in _l5_ag_drops:
+                            for _rc in (_md.get("root_causes") or ()):
+                                _rc_s = str(_rc)
+                                if _rc_s and _rc_s not in _l5_marker_root_causes:
+                                    _l5_marker_root_causes.append(_rc_s)
+                        print(structural_gate_dropped_marker(
+                            ag_id=str(ag_id),
+                            iteration=iteration_counter,
+                            root_causes=_l5_marker_root_causes,
+                            target_qids=tuple(
+                                str(q) for q in (ag.get("affected_questions") or [])
+                                if str(q)
+                            ),
+                        ), flush=True)
+                    except Exception:
+                        logger.debug(
+                            "P4: structural_gate_dropped_marker emit failed (non-fatal)",
+                            exc_info=True,
+                        )
+
+                    # P3 task 3+4 wiring — force structural synthesis when
+                    # the lever-5 structural gate drops an instruction-only
+                    # proposal for a SQL-shape root cause. Closes the iter-2
+                    # / iter-5 silent-skip path in run
+                    # 2423b960-16e8-41d4-a0cb-74c563378e05. Same-iteration
+                    # injection: a synthesized add_example_sql is appended
+                    # to ``all_proposals`` so it flows through the existing
+                    # normalization / applyability / applier pipeline. On
+                    # failure, a NO_STRUCTURAL_CANDIDATE record is emitted
+                    # so the transcript shows synthesis was attempted.
+                    try:
+                        from genie_space_optimizer.optimization.cluster_driven_synthesis import (
+                            run_cluster_driven_synthesis_for_single_cluster,
+                        )
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            no_structural_candidate_record,
+                        )
+
+                        for _drop in _l5_ag_drops:
+                            _drop_cluster: dict | None = None
+                            _drop_root_cause = ""
+                            for _rc in (_drop.get("root_causes") or ()):
+                                if not _should_force_structural_synthesis(
+                                    gate_drop_reason=(
+                                        "lever5_structural_sql_shape_no_example_sql"
+                                    ),
+                                    cluster_root_cause=str(_rc),
+                                ):
+                                    continue
+                                for _cid in (_drop.get("source_clusters") or ()):
+                                    _cand = _iter_source_clusters_by_id.get(str(_cid))
+                                    if isinstance(_cand, dict) and str(
+                                        _cand.get("root_cause") or ""
+                                    ) == str(_rc):
+                                        _drop_cluster = _cand
+                                        _drop_root_cause = str(_rc)
+                                        break
+                                if _drop_cluster is not None:
+                                    break
+                            if _drop_cluster is None:
+                                continue
+                            _synth_result = run_cluster_driven_synthesis_for_single_cluster(
+                                _drop_cluster,
+                                metadata_snapshot,
+                                benchmarks=benchmarks,
+                                catalog=catalog,
+                                gold_schema=schema,
+                                warehouse_id=resolve_warehouse_id(""),
+                                w=w,
+                                spark=spark,
+                            )
+                            if _synth_result.proposal is not None:
+                                _sp = _synth_result.proposal
+                                _forced_proposal = {
+                                    "proposal_id": f"P{len(all_proposals) + 1:03d}",
+                                    "cluster_id": f"{ag_id}_FORCED_SYN",
+                                    "lever": 5,
+                                    "scope": "genie_config",
+                                    "patch_type": "add_example_sql",
+                                    "change_description": (
+                                        f"[{ag_id}] Forced structural synthesis: "
+                                        f"{str(_sp.get('example_question', ''))[:80]}"
+                                    ),
+                                    "proposed_value": _sp.get("example_question", ""),
+                                    "example_question": _sp.get("example_question", ""),
+                                    "example_sql": _sp.get("example_sql", ""),
+                                    "parameters": _sp.get("parameters", []) or [],
+                                    "usage_guidance": _sp.get("usage_guidance", ""),
+                                    "rationale": (
+                                        f"Forced structural synthesis at L5 gate "
+                                        f"drop (archetype="
+                                        f"{_sp.get('_archetype_name', '?')}). "
+                                        f"Root cause: {_drop_root_cause}."
+                                    ),
+                                    "confidence": 0.85,
+                                    "questions_fixed": 1,
+                                    "questions_at_risk": 0,
+                                    "net_impact": 0.85,
+                                    "kit_id": _sp.get("kit_id", ""),
+                                    "target_qids": _sp.get("target_qids", []),
+                                    "rca_id": _sp.get("rca_id", ""),
+                                    "_archetype_name": _sp.get("_archetype_name", ""),
+                                    "_cluster_id": _sp.get("_cluster_id", ""),
+                                    "provenance": {
+                                        "synthesis_source": "forced_lever5_drop",
+                                        "drop_root_cause": _drop_root_cause,
+                                        "kit_id": _sp.get("kit_id", ""),
+                                        "target_qids": _sp.get("target_qids", []),
+                                    },
+                                }
+                                all_proposals.append(_forced_proposal)
+                                logger.info(
+                                    "P3: forced structural synthesis succeeded "
+                                    "for AG=%s root_cause=%s archetype=%s",
+                                    ag_id, _drop_root_cause,
+                                    _sp.get("_archetype_name", "?"),
+                                )
+                            else:
+                                _nsc = no_structural_candidate_record(
+                                    run_id=run_id,
+                                    iteration=iteration_counter,
+                                    ag_id=str(ag_id),
+                                    cluster_id=str(
+                                        _drop_cluster.get("cluster_id") or ""
+                                    ),
+                                    rca_id=_l5_ag_rca_id,
+                                    root_cause=_drop_root_cause,
+                                    target_qids=tuple(
+                                        str(q) for q in (
+                                            ag.get("affected_questions") or []
+                                        )
+                                        if str(q)
+                                    ),
+                                    attempted_archetypes=(
+                                        _synth_result.attempted_archetypes
+                                    ),
+                                )
+                                _current_iter_inputs.setdefault(
+                                    "decision_records", []
+                                ).append(_nsc.to_dict())
+                                try:
+                                    from genie_space_optimizer.optimization.run_analysis_contract import (
+                                        no_structural_candidate_marker,
+                                    )
+                                    print(no_structural_candidate_marker(
+                                        ag_id=str(ag_id),
+                                        iteration=iteration_counter,
+                                        attempted_archetypes=(
+                                            _synth_result.attempted_archetypes
+                                        ),
+                                    ), flush=True)
+                                except Exception:
+                                    logger.debug(
+                                        "P4: no_structural_candidate_marker emit "
+                                        "failed (non-fatal)",
+                                        exc_info=True,
+                                    )
+                                logger.info(
+                                    "P3: forced structural synthesis produced no "
+                                    "candidate for AG=%s root_cause=%s "
+                                    "skipped=%s archetypes=%s",
+                                    ag_id, _drop_root_cause,
+                                    _synth_result.skipped_reason,
+                                    _synth_result.attempted_archetypes,
+                                )
+                    except Exception:
+                        _phase_b_producer_exceptions[
+                            "forced_structural_synthesis"
+                        ] = (
+                            _phase_b_producer_exceptions.get(
+                                "forced_structural_synthesis", 0
+                            ) + 1
+                        )
+                        logger.debug(
+                            "P3: forced-structural-synthesis at L5 drop "
+                            "site failed (non-fatal)",
+                            exc_info=True,
+                        )
+                        if _phase_b_strict_mode():
+                            raise
+            except Exception as _lever5_structural_gate_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="lever5_structural_gate",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_lever5_structural_gate_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for lever5_structural_gate",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["lever5_structural_gate"] = (
+                    _phase_b_producer_exceptions.get("lever5_structural_gate", 0) + 1
+                )
                 logger.debug(
-                    "Task 13: journey ledger render failed (non-fatal)",
+                    "Cycle 8 3b: lever5_structural_gate_records failed (non-fatal)",
                     exc_info=True,
                 )
+                if _phase_b_strict_mode():
+                    raise
 
-        # ── 3B.1b: Per-iteration arbiter corrections ─────────────────
-        _iter_corr = _run_arbiter_corrections(
-            w, spark, run_id, catalog, schema, domain,
-            already_corrected=_correction_state["corrected_qids"],
-            already_repaired=_correction_state["repaired_qids"],
-            quarantined_qids=_correction_state["quarantined_qids"],
-            data_profile=metadata_snapshot.get("_data_profile"),
-        )
-        _correction_state["corrected_qids"] = _iter_corr["corrected_qids"]
-        _correction_state["quarantined_qids"] = _iter_corr["quarantined_qids"]
+            # Cycle 7 N3: force one Lever-6 add_sql_snippet_* candidate
+            # when the AG's source cluster has a SQL-shape root cause,
+            # ``recommended_levers`` includes 6, and no L6 patch is
+            # already in this AG's slate. Closes the run-to-run variance
+            # on gs_009 missing_filter between attempts 596465849524605
+            # (no L6, terminal 95.8%) and 993610879088298 (L6 emitted,
+            # 100% in 2 iters). Default off behind
+            # ``GSO_REQUIRE_LEVER6_FOR_SQL_SHAPE_RCA``.
+            try:
+                from genie_space_optimizer.optimization.optimizer import (
+                    _generate_lever6_proposal,
+                )
+                for _force_cid in (ag.get("source_cluster_ids") or ()):
+                    _force_cluster = _iter_source_clusters_by_id.get(
+                        str(_force_cid)
+                    )
+                    if not isinstance(_force_cluster, dict):
+                        continue
+                    # Cycle 9 W1: AG_DECOMPOSED_* AGs (Cycle 6
+                    # decompose_overbroad_ag) populate ``affected_questions``
+                    # but leave ``target_qids`` empty. The legacy reader
+                    # silently disabled Cycle 7 N3 for those AGs in
+                    # production runs (run 1099b152). Fall back to
+                    # ``affected_questions`` when the flag is on.
+                    from genie_space_optimizer.common.config import (
+                        force_l6_reads_affected_questions_enabled
+                        as _force_l6_fallback_on,
+                    )
+                    _force_target_qids_legacy = tuple(
+                        str(q) for q in (ag.get("target_qids") or ())
+                        if str(q)
+                    )
+                    if (
+                        _force_target_qids_legacy
+                        or not _force_l6_fallback_on()
+                    ):
+                        _force_target_qids = _force_target_qids_legacy
+                    else:
+                        _force_target_qids = tuple(
+                            str(q)
+                            for q in (ag.get("affected_questions") or ())
+                            if str(q)
+                        )
+                    # Cycle 10 W3.4 — narrow try/except around the inner
+                    # call so we can attribute None vs raise outcomes to a
+                    # typed decision record instead of the legacy DEBUG-
+                    # swallow at the outer except.
+                    _force_outcome = "ok"
+                    _force_exception_repr = ""
+                    _forced_l6 = None
+                    try:
+                        _forced_l6 = _force_lever6_proposal_for_ag(
+                            run_id=str(run_id),
+                            iteration=int(iteration_counter),
+                            ag_id=str(ag_id),
+                            cluster=dict(_force_cluster),
+                            ag_target_qids=_force_target_qids,
+                            ag_proposals_so_far=list(all_proposals),
+                            metadata_snapshot=metadata_snapshot,
+                            decision_emit=lambda _rec: (
+                                _current_iter_inputs.setdefault(
+                                    "decision_records", []
+                                ).append(_rec.to_dict())
+                            ),
+                            generate_lever6=_generate_lever6_proposal,
+                            w=w,
+                            spark=spark,
+                            catalog=catalog,
+                            gold_schema=schema,
+                            warehouse_id=resolve_warehouse_id(""),
+                            benchmarks=benchmarks,
+                        )
+                        if _forced_l6 is None:
+                            _force_outcome = "declined"
+                    except Exception as _force_exc:
+                        _force_outcome = "raised"
+                        _force_exception_repr = repr(_force_exc)[:512]
+                        try:
+                            from genie_space_optimizer.common.config import (
+                                phase_b_producer_typed_exceptions_enabled as _typed_on,
+                            )
+                            if _typed_on():
+                                from genie_space_optimizer.optimization.decision_emitters import (
+                                    producer_exception_record as _producer_exception_record,
+                                )
+                                _pe_rec = _producer_exception_record(
+                                    run_id=run_id,
+                                    iteration=iteration_counter,
+                                    producer="forced_lever6_n3",
+                                    ag_id=str((ag or {}).get("id") or ""),
+                                    exception=_force_exc,
+                                )
+                                _current_iter_inputs.setdefault(
+                                    "decision_records", []
+                                ).append(_pe_rec.to_dict())
+                        except Exception:
+                            logger.debug(
+                                "Phase B: producer_exception_record emission failed for forced_lever6_n3",
+                                exc_info=True,
+                            )
+                        _phase_b_producer_exceptions["forced_lever6_n3"] = (
+                            _phase_b_producer_exceptions.get(
+                                "forced_lever6_n3", 0
+                            ) + 1
+                        )
+                        logger.debug(
+                            "Cycle 7 N3: forced Lever-6 emit raised (non-fatal)",
+                            exc_info=True,
+                        )
+                        if _phase_b_strict_mode():
+                            raise
 
-        metadata_snapshot["_regression_rca_findings"] = []
-        metadata_snapshot["_regression_mining_hints"] = ""
-        try:
-            if reflection_buffer:
-                _mining_context = _collect_regression_mining_iteration_context(
-                    reflection_buffer,
-                    enable_rca_ledger=ENABLE_REGRESSION_MINING_RCA_LEDGER,
-                    enable_strategist_hints=ENABLE_REGRESSION_MINING_STRATEGIST,
-                    min_confidence=REGRESSION_MINING_STRATEGIST_MIN_CONFIDENCE,
+                    if _forced_l6 is not None:
+                        _forced_l6 = dict(_forced_l6)
+                        _forced_l6["proposal_id"] = (
+                            f"P{len(all_proposals) + 1:03d}"
+                        )
+                        _forced_l6.setdefault(
+                            "cluster_id",
+                            _force_cluster.get("cluster_id", ag_id),
+                        )
+                        _forced_l6.setdefault("scope", "genie_config")
+                        _forced_l6["change_description"] = (
+                            f"[{ag_id}] FORCED Lever-6 SQL Expression: "
+                            f"{_forced_l6.get('display_name', 'unnamed')} "
+                            f"({_forced_l6.get('snippet_type', '?')})"
+                        )
+                        _forced_l6.setdefault(
+                            "proposed_value", _forced_l6.get("sql", "")
+                        )
+                        _forced_l6.setdefault(
+                            "rationale",
+                            f"Cycle 7 N3 forced Lever-6 for "
+                            f"{_force_cluster.get('root_cause', '?')}",
+                        )
+                        _forced_l6.setdefault("questions_at_risk", 0)
+                        _forced_l6.setdefault(
+                            "net_impact",
+                            max(
+                                _forced_l6.get("questions_fixed", 0) * 0.7,
+                                1.0,
+                            ),
+                        )
+                        all_proposals.append(_forced_l6)
+                        logger.info(
+                            "Cycle 7 N3: forced Lever-6 candidate succeeded "
+                            "for AG=%s cluster=%s root_cause=%s",
+                            ag_id,
+                            _force_cluster.get("cluster_id", "?"),
+                            _force_cluster.get("root_cause", "?"),
+                        )
+                    else:
+                        # Cycle 10 W3.4 — typed outcome instead of silent
+                        # absorption when force-L6 declined or raised.
+                        _emit_force_l6_outcome(
+                            outcome=_force_outcome,
+                            run_id=str(run_id),
+                            iteration=int(iteration_counter),
+                            ag_id=str(ag_id),
+                            cluster_id=str(
+                                _force_cluster.get("cluster_id", "?")
+                            ),
+                            root_cause=str(
+                                _force_cluster.get("root_cause", "?")
+                            ),
+                            target_qids=_force_target_qids,
+                            exception_repr=_force_exception_repr,
+                            iter_inputs=_current_iter_inputs,
+                        )
+            except Exception as _forced_lever6_n3_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="forced_lever6_n3",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_forced_lever6_n3_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for forced_lever6_n3",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["forced_lever6_n3"] = (
+                    _phase_b_producer_exceptions.get(
+                        "forced_lever6_n3", 0
+                    ) + 1
                 )
-                metadata_snapshot["_regression_rca_findings"] = (
-                    _mining_context["rca_findings"]
+                logger.debug(
+                    "Cycle 7 N3: forced Lever-6 outer scope failed (non-fatal)",
+                    exc_info=True,
                 )
-                metadata_snapshot["_regression_mining_hints"] = (
-                    _mining_context["strategist_hints"]
-                )
-        except Exception:
-            logger.debug(
-                "Failed to convert regression-mining insights to RCA findings",
-                exc_info=True,
+                if _phase_b_strict_mode():
+                    raise
+
+            # Task 4 — patch-survival snapshot: proposed gate.
+            _survival_proposed = list(all_proposals)
+
+            # ── T2.2: Reflection-as-validator ────────────────────────────
+            # Build a per-patch forbidden set from prior rolled-back iterations
+            # and drop any proposal whose (patch_type, target) signature was
+            # already rolled back. Without this the strategist routinely
+            # re-proposes the same patch type against the same table after a
+            # content regression (observed: iter-1 + iter-3 of a real run
+            # both patched ``mv_<domain>_fact_<entity>.description`` →
+            # rolled back → iter-3 re-proposed ``update_description`` on
+            # the same table).
+            #
+            # Escape hatch: a proposal carrying
+            # ``escalation_justification: <non-empty>`` bypasses the filter,
+            # and every rejection is logged so operators can see what was
+            # dropped and why. The existing cluster-level DO-NOT-RETRY
+            # (_compute_forbidden_ag_set) covers lever/root-cause combos;
+            # this new per-patch guard covers patch-type/target combos.
+            # Task 18 — precise reflection retry. Build the forbidden set
+            # using ``patch_retry_signature`` (column-/section-level) so a
+            # rolled-back patch on column ``A`` of table ``T`` does not
+            # block a fresh patch on column ``B`` of the same table. The
+            # coarse ``(ptype, target)`` set is kept in parallel for the
+            # rewrite-bypass emission below.
+            from genie_space_optimizer.optimization.reflection_retry import (
+                patch_retry_signature,
+                retry_allowed_after_rollback,
             )
 
-        # ── 3B.2: Re-cluster from latest eval ────────────────────────
-        _analysis = _analyze_and_distribute(
-            spark, run_id, catalog, schema, metadata_snapshot,
-            iteration_counter - 1, lever_label=0,
-            quarantined_qids=_correction_state["quarantined_qids"],
-            exclude_qids=escalated_gt_repair_qids,
-            phase_h_anchor_run_id=_phase_h_anchor_run_id,
-        )
-        clusters = _analysis["all_clusters"]
-        soft_signal_clusters = _analysis["soft_signal_clusters"]
-        rca_ledger = _analysis.get("rca_ledger") or {}
-        # Track H — same row source the soft pile was built from. Pinned
-        # to the analyze-distribute return so the soft-cluster currency
-        # check sees the exact rows the clusterer saw.
-        _analysis_failure_rows = _analysis.get("failure_rows") or []
-
-        # Phase A — Defensive carrier seed at iteration start. The
-        # primary seed (lever-loop pre-loop block) populates
-        # `_latest_eval_result` from `baseline_iter`, and the per-gate
-        # refresh (`_extract_eval_result_from_gate`) keeps it fresh on
-        # every accept/rollback. But two skip-eval `continue` paths
-        # bypass the gate entirely:
-        #   * applier blast-radius gate dropped all patches
-        #     ("deterministic_no_applied_patches" → SKIP EVAL: NO
-        #     APPLIED PATCHES)
-        #   * dead-on-arrival AG retry blocked (same selected patch
-        #     IDs already produced no applied patches)
-        # When every iteration in a run takes one of those paths, the
-        # carrier never refreshes and — if the seed silently produced
-        # 0 qids — the replay fixture's `eval_rows` end up empty for
-        # every iteration. Lazy-seed here as a last line of defence so
-        # the snapshot below always has at least the baseline state.
-        if not (_latest_eval_result or {}).get("question_ids"):
-            try:
-                _lazy_seed = _seed_eval_result_from_baseline_iter(
-                    baseline_iter
+            _patch_forbidden: set[tuple[str, str]] = set()
+            _patch_forbidden_signatures: set[tuple] = set()
+            _rolled_back_patches_for_retry: list[dict] = []
+            _content_rollback_cause: str = ""
+            for _rb in reflection_buffer:
+                if _rb.get("accepted"):
+                    continue
+                # CONTENT_REGRESSION rollbacks are the ones that signal "the
+                # patch made things worse". Other classes (infra, schema)
+                # don't indicate the patch was wrong, only that applying it
+                # blew up.
+                from genie_space_optimizer.optimization.rollback_class import (
+                    RollbackClass as _RC,
                 )
-                if _lazy_seed:
-                    _latest_eval_result = _lazy_seed
+                if _rb.get("rollback_class") != _RC.CONTENT_REGRESSION.value:
+                    continue
+                _content_rollback_cause = str(_rb.get("rollback_class") or "")
+                for _dnr in _rb.get("do_not_retry", []):
+                    _s = str(_dnr).strip()
+                    if " on " not in _s:
+                        continue
+                    _ptype, _target = _s.split(" on ", 1)
+                    _patch_forbidden.add((_ptype.strip(), _target.strip()))
+                # Task 18 — precise patch signatures for the rolled-back
+                # patches stored on the reflection entry.
+                for _rb_patch in _rb.get("do_not_retry_patches", []) or []:
+                    if isinstance(_rb_patch, dict):
+                        _rolled_back_patches_for_retry.append(_rb_patch)
+                        _patch_forbidden_signatures.add(
+                            patch_retry_signature(_rb_patch)
+                        )
+
+            # B1.3 — diagnostics so an empty ``_patch_forbidden`` is
+            # debuggable: distinguish (a) no rollbacks yet, (b) all
+            # rollbacks classified non-CONTENT_REGRESSION, (c)
+            # CONTENT_REGRESSION rollbacks but empty ``do_not_retry``.
+            from genie_space_optimizer.optimization.rollback_class import (
+                RollbackClass as _RC_DIAG,
+            )
+            _total_rb = sum(
+                1 for r in reflection_buffer if not r.get("accepted")
+            )
+            _content_rb = sum(
+                1 for r in reflection_buffer
+                if not r.get("accepted")
+                and r.get("rollback_class") == _RC_DIAG.CONTENT_REGRESSION.value
+            )
+            _content_rb_with_dnr = sum(
+                1 for r in reflection_buffer
+                if not r.get("accepted")
+                and r.get("rollback_class") == _RC_DIAG.CONTENT_REGRESSION.value
+                and r.get("do_not_retry")
+            )
+            logger.info(
+                "[%s] T2.2 forbidden set: size=%d  rollbacks_total=%d  "
+                "content_rollbacks=%d  with_do_not_retry=%d",
+                ag_id, len(_patch_forbidden), _total_rb, _content_rb,
+                _content_rb_with_dnr,
+            )
+
+            # PR-E Task 3 — content-fingerprint dedup runs irrespective of
+            # rollback_class so byte-identical re-proposals get blocked even
+            # when the rollback was infra/insufficient-gain (which leaves
+            # ``do_not_retry`` empty and lets the existing _patch_forbidden
+            # match miss the duplicate). Build the all-rollbacks list inline
+            # because _rolled_back_patches_for_retry filters to
+            # CONTENT_REGRESSION only.
+            _all_rolled_back_patches_for_dedup: list[dict] = []
+            for _rb in reflection_buffer:
+                if _rb.get("accepted"):
+                    continue
+                for _rb_patch in _rb.get("do_not_retry_patches", []) or []:
+                    if isinstance(_rb_patch, dict):
+                        _all_rolled_back_patches_for_dedup.append(_rb_patch)
+            all_proposals, _content_dedup_dropped = (
+                _drop_proposals_matching_rolled_back_content_fingerprints(
+                    proposals=all_proposals,
+                    rolled_back_patches=_all_rolled_back_patches_for_dedup,
+                )
+            )
+            if _content_dedup_dropped:
+                logger.info(
+                    "[%s] PR-E content-fingerprint dedup dropped %d proposals",
+                    ag_id, len(_content_dedup_dropped),
+                )
+
+            if _patch_forbidden:
+                from genie_space_optimizer.common.config import (
+                    ENFORCE_REFLECTION_REVALIDATION,
+                )
+                _kept: list[dict] = []
+                _dropped: list[tuple[str, str, str]] = []  # (ptype, target, reason)
+                _reflection_rewrites: list[dict] = []  # for audit emission below
+                # Map ``(ptype, target)`` → previous proposal_id so we can
+                # link parent_proposal_id when a rewrite passes the bypass.
+                _prev_proposal_ids: dict[tuple[str, str], str] = {}
+                for _rb in reflection_buffer:
+                    if _rb.get("accepted"):
+                        continue
+                    for _entry in _rb.get("do_not_retry", []) or []:
+                        _es = str(_entry).strip()
+                        if " on " in _es:
+                            _ept, _etgt = _es.split(" on ", 1)
+                            _prev_proposal_ids.setdefault(
+                                (_ept.strip(), _etgt.strip()),
+                                str(_rb.get("ag_id") or ""),
+                            )
+                for _p in all_proposals:
+                    _ptype = str(_p.get("type") or _p.get("patch_type") or "")
+                    # B1.1 — raw proposals carry ``table`` (column-level
+                    # patches) before ``proposals_to_patches`` populates
+                    # ``target``. Without reading ``table`` here, T2.2
+                    # extracts ``"?"`` and never matches the forbidden
+                    # set entries (which use the FQN target string).
+                    _target = str(
+                        _p.get("target") or _p.get("target_object")
+                        or _p.get("target_table")
+                        or _p.get("table")
+                        or "?"
+                    )
+                    _key = (_ptype, _target)
+                    _justification = str(_p.get("escalation_justification") or "").strip()
+                    # Task 18 — precise signature short-circuit. If the
+                    # patch's column-/section-level ``patch_retry_signature``
+                    # is NOT in the rolled-back set, ``retry_allowed_after_rollback``
+                    # returns ``allowed=True`` and we keep the proposal even if
+                    # the coarse ``(ptype, target)`` key matches.
+                    _precise_sig = patch_retry_signature(_p)
+                    if (
+                        _key in _patch_forbidden
+                        and _precise_sig not in _patch_forbidden_signatures
+                    ):
+                        _retry_decision = retry_allowed_after_rollback(
+                            current_patch=_p,
+                            rolled_back_patches=_rolled_back_patches_for_retry,
+                            rollback_cause=_content_rollback_cause,
+                        )
+                        if _retry_decision.allowed:
+                            logger.info(
+                                "[%s] T2.2 precise retry allowed: ptype=%s target=%s "
+                                "reason=%s",
+                                ag_id, _ptype, _target, _retry_decision.reason,
+                            )
+                            _kept.append(_p)
+                            continue
+                    if _key in _patch_forbidden:
+                        if not _justification:
+                            _dropped.append((_ptype, _target,
+                                             "rolled back previously (no escalation_justification)"))
+                            continue
+                        if (
+                            ENFORCE_REFLECTION_REVALIDATION
+                            and len(_justification) < 16
+                        ):
+                            # Task 10: a one-word justification is not
+                            # enough evidence. Require concrete reasoning
+                            # so the bypass is auditable, not free.
+                            _dropped.append((_ptype, _target,
+                                             "escalation_justification too short to be concrete"))
+                            continue
+                        # Task 10: this is a reflection rewrite. Treat as
+                        # a brand-new proposal: stamp fresh proposal_id,
+                        # link parent_proposal_id for attribution, mark
+                        # the rewrite flag so downstream gates and the
+                        # audit trail can recognise it.
+                        _orig_pid = str(_p.get("proposal_id") or "")
+                        _parent_pid = (
+                            _prev_proposal_ids.get(_key) or _orig_pid or ""
+                        )
+                        _new_pid = f"{_orig_pid or 'rewrite'}:rev{iteration_counter}"
+                        _p["parent_proposal_id"] = _parent_pid
+                        _p["proposal_id"] = _new_pid
+                        _p["is_reflection_rewrite"] = True
+                        _p["requires_full_revalidation"] = True
+                        _reflection_rewrites.append({
+                            "ptype": _ptype,
+                            "target": _target,
+                            "parent_proposal_id": _parent_pid,
+                            "proposal_id": _new_pid,
+                            "justification": _justification[:240],
+                            "cluster_id": _p.get("cluster_id"),
+                        })
+                        _kept.append(_p)
+                    else:
+                        _kept.append(_p)
+                if _dropped:
                     logger.warning(
-                        "Phase A: lazy-seeded _latest_eval_result from "
-                        "baseline at iteration_counter=%d (carrier was "
-                        "empty — primary seed produced 0 qids and no "
-                        "gate result has refreshed it yet). %d qids, "
-                        "%d failures.",
-                        iteration_counter,
-                        len(_lazy_seed.get("question_ids") or []),
-                        len(_lazy_seed.get("failure_question_ids") or []),
+                        "[%s] T2.2 reflection-as-validator dropped %d proposal(s) "
+                        "that were rolled back in prior iterations without an "
+                        "escalation_justification:",
+                        ag_id, len(_dropped),
+                    )
+                    for _ptype, _target, _reason in _dropped:
+                        logger.warning("  - %s on %s (%s)", _ptype, _target, _reason)
+                    print(
+                        _section(
+                            f"[{ag_id}] T2.2 Reflection validator: dropped "
+                            f"{len(_dropped)} re-proposal(s)",
+                            "-",
+                        )
+                    )
+                    for _ptype, _target, _reason in _dropped:
+                        print(f"|  - {_ptype} on {_target} ({_reason})")
+                    print(_bar("-"))
+                # Task 10: emit a ``reflection_rewrite`` decision audit
+                # row for every rewrite that survived the bypass. Lets
+                # operators query "show me every AG where the strategist
+                # re-tried a previously-rolled-back patch with a fresh
+                # justification" without log scraping.
+                if _reflection_rewrites:
+                    try:
+                        from genie_space_optimizer.optimization.state import (
+                            write_lever_loop_decisions as _t10_audit,
+                        )
+                        _t10_rows: list[dict] = []
+                        for _idx, _rw in enumerate(_reflection_rewrites, start=1):
+                            _t10_rows.append({
+                                "run_id": run_id,
+                                "iteration": iteration_counter,
+                                "ag_id": ag_id,
+                                "decision_order": _idx,
+                                "stage_letter": "G",
+                                "gate_name": "reflection_rewrite",
+                                "decision": "accepted",
+                                "reason_code": "escalation_justification_supplied",
+                                "reason_detail": (
+                                    f"{_rw['ptype']} on {_rw['target']}: "
+                                    f"{_rw['justification']}"
+                                )[:2000],
+                                "proposal_ids": [_rw["proposal_id"]],
+                                "source_cluster_ids": (
+                                    [_rw["cluster_id"]] if _rw.get("cluster_id") else []
+                                ),
+                                "metrics": {
+                                    "patch_type": _rw["ptype"],
+                                    "target": _rw["target"],
+                                    "parent_proposal_id": _rw["parent_proposal_id"],
+                                },
+                            })
+                        if _t10_rows:
+                            _t10_audit(
+                                spark, _t10_rows,
+                                catalog=catalog, schema=schema,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Task 10 reflection_rewrite audit emission "
+                            "failed (non-fatal)",
+                            exc_info=True,
+                        )
+                    logger.info(
+                        "[%s] T2.2 reflection-as-validator accepted %d "
+                        "rewrite(s) with escalation_justification; each will "
+                        "re-run grounding (Task 5) + counterfactual + apply "
+                        "gates as a brand-new proposal.",
+                        ag_id, len(_reflection_rewrites),
+                    )
+                all_proposals = _kept
+
+                # Phase A — Lossless contract: stamp dropped_at_reflection for
+                # patches the reflection retry signature filtered out. Per-qid
+                # attribution falls back to the AG's affected_questions because
+                # the reflection drop tuples carry only (ptype, target, reason).
+                try:
+                    if _dropped:
+                        _ag_affected = [
+                            str(q) for q in (ag.get("affected_questions") or []) if q
+                        ]
+                        _emit_gate_drop_journey(
+                            emit=_journey_emit,
+                            gate="reflection",
+                            dropped=[
+                                {
+                                    "proposal_id": "",
+                                    "patch_type": str(_ptype or ""),
+                                    "cluster_id": "",
+                                    "target_qids": list(_ag_affected),
+                                    "_drop_reason": str(_reason or ""),
+                                }
+                                for (_ptype, _target, _reason) in _dropped
+                            ],
+                        )
+                except Exception:
+                    logger.debug(
+                        "Phase A: reflection-gate journey emit failed (non-fatal)",
+                        exc_info=True,
+                    )
+
+            # ── T2.4: Counterfactual asset-impact scan ───────────────────
+            # Before applying, identify passing benchmarks that reference
+            # each patch's target asset. If a patch touches an asset that
+            # many passing questions depend on, we're rolling the dice on
+            # those questions — stamp ``high_collateral_risk`` on the
+            # proposal and warn prominently. Downstream the slice-gate
+            # (once T3.1 lands) should prioritise the at-risk set.
+            _passing_qids = set(b.get("id") for b in benchmarks if b.get("id")) - (prev_failure_qids or set())
+            _affected_qids = set(ag.get("affected_questions", []) or [])
+            _affected_n = max(len(_affected_qids), 1)
+            # Phase 3c Task A: scan body extracted into _t24_counterfactual_scan
+            # so the per-proposal stamp logic can be exercised in isolation.
+            # The helper stamps ``passing_dependents`` on every visited
+            # proposal (including instruction rewrites with no target table)
+            # and returns the legacy ``_collateral_details`` shape used by
+            # the summary print below.
+            _collateral_details = _t24_counterfactual_scan(
+                all_proposals=all_proposals,
+                benchmarks=benchmarks,
+                ag=ag,
+                prev_failure_qids=prev_failure_qids or set(),
+            )
+            # B2 — ALWAYS print a summary so operators can distinguish
+            # "scan ran, nothing flagged" from "scan didn't run".
+            _total_with_metadata = sum(
+                1 for _b in benchmarks if _b.get("required_tables")
+            )
+            logger.info(
+                "[%s] T2.4 counterfactual scan: %d/%d proposal(s) high-risk; "
+                "benchmarks_with_required_tables=%d/%d (SQL-text fallback used otherwise)",
+                ag_id, len(_collateral_details), len(all_proposals),
+                _total_with_metadata, len(benchmarks),
+            )
+            print(
+                _section(
+                    f"[{ag_id}] T2.4 Counterfactual scan: "
+                    f"{len(_collateral_details)} high-risk proposal(s)",
+                    "-",
+                )
+            )
+            print(
+                _kv(
+                    "Benchmarks with required_tables",
+                    f"{_total_with_metadata}/{len(benchmarks)}",
+                )
+            )
+            if _collateral_details:
+                for _ptype, _target, _deps in _collateral_details:
+                    print(
+                        f"|  - {_ptype} on {_target}  "
+                        f"(passing dependents: {len(_deps)}+, "
+                        f"affected: {_affected_n})"
+                    )
+                    print(f"|    sample deps: {', '.join(_deps[:5])}")
+            print(_bar("-"))
+
+            # ── Log proposals ────────────────────────────────────────────
+            _n_valid = 0
+            _n_failed = 0
+            proposal_lines = [_section(f"[{ag_id}] Proposals ({len(all_proposals)} total)", "-"), "|"]
+            for pi, p in enumerate(all_proposals, 1):
+                cluster_id = p.get("cluster_id", "?")
+                ptype = p.get("type", p.get("patch_type", "?"))
+                rationale = str(p.get("rationale", ""))
+                proposed_value = str(p.get("proposed_value", ""))
+                table = p.get("table", "")
+                column = p.get("column", "")
+                status = _classify_proposal_log_status(p)
+                if status == "FAILED (non-JSON)":
+                    _n_failed += 1
+                elif status == "INVALID_TARGET":
+                    _n_failed += 1
+                else:
+                    _n_valid += 1
+
+                proposal_lines.append(f"|  Proposal {pi} / {len(all_proposals)}  [{cluster_id}]")
+                proposal_lines.append(f"|    {'Type:':<24s} {ptype}")
+                proposal_lines.append(f"|    {'Lever:':<24s} {p.get('lever', '?')}")
+                if table:
+                    proposal_lines.append(f"|    {'Table:':<24s} {table}")
+                if column:
+                    proposal_lines.append(f"|    {'Column:':<24s} {column}")
+                proposal_lines.append(f"|    {'Rationale:':<24s} {rationale[:200]}")
+                _p_col_sect = p.get("column_sections")
+                _p_tbl_sect = p.get("table_sections")
+                if isinstance(_p_col_sect, dict) and _p_col_sect:
+                    proposal_lines.append(f"|    Sections proposed:")
+                    for _sk, _sv in _p_col_sect.items():
+                        _sv_str = str(_sv).replace("\n", " ")
+                        proposal_lines.append(f"|      {_sk}: \"{_sv_str[:100]}\"")
+                elif isinstance(_p_tbl_sect, dict) and _p_tbl_sect:
+                    proposal_lines.append(f"|    Table sections proposed:")
+                    for _sk, _sv in _p_tbl_sect.items():
+                        _sv_str = str(_sv).replace("\n", " ")
+                        proposal_lines.append(f"|      {_sk}: \"{_sv_str[:100]}\"")
+                elif proposed_value:
+                    _val_preview = proposed_value.replace("\n", "\\n")
+                    proposal_lines.append(f"|    {'Value (preview):':<24s} {_val_preview[:300]}")
+                proposal_lines.append(f"|    {'Status:':<24s} {status}")
+                proposal_lines.append("|")
+
+            proposal_lines.append("|  --- Summary ---")
+            proposal_lines.append(f"|    {'Valid proposals:':<24s} {_n_valid} of {len(all_proposals)}")
+            if _n_failed:
+                proposal_lines.append(f"|    {'Failed (non-JSON):':<24s} {_n_failed}")
+            proposal_lines.append(f"|    Proceeding with {_n_valid} patch(es)")
+            proposal_lines.append(_bar("-"))
+            print("\n".join(proposal_lines))
+
+            # ── Provenance log ───────────────────────────────────────────
+            _prov_patch_lines = ["\n-- Patch Provenance " + "-" * 58]
+            for pi, p in enumerate(all_proposals, 1):
+                prov = p.get("provenance", {})
+                if not prov:
+                    continue
+                cid = prov.get("cluster_id", "?")
+                rc = prov.get("root_cause", "?")
+                lv = prov.get("lever", "?")
+                ln = prov.get("lever_name", "?")
+                pt = prov.get("patch_type", "?")
+                _prov_patch_lines.append(f"|  P{pi:03d} [{cid}] lever={lv} ({ln}) type={pt} root_cause={rc}")
+            _prov_patch_lines.append("-" * 78)
+            print("\n".join(_prov_patch_lines))
+
+            _prop_mappings = [
+                {"cluster_id": p.get("cluster_id"), "proposal_id": p.get("proposal_id"), "patch_type": p.get("patch_type"), "lever": p.get("lever")}
+                for p in all_proposals if p.get("cluster_id")
+            ]
+            try:
+                update_provenance_proposals(spark, run_id, iteration_counter - 1, _prop_mappings, catalog, schema)
+            except Exception:
+                logger.debug("Failed to update provenance proposals", exc_info=True)
+
+            if not all_proposals:
+                print(_section(f"[{ag_id}] No proposals — SKIPPING iteration", "-"))
+                write_stage(
+                    spark, run_id, f"AG_{ag_id}_STARTED", "SKIPPED",
+                    task_key="lever_loop", iteration=iteration_counter,
+                    detail={"reason": "no_proposals", "levers": lever_keys},
+                    catalog=catalog, schema=schema,
+                )
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                    levers=[], target_objects=[], prev_scores=best_scores,
+                    new_scores=best_scores, rollback_reason="no_proposals", patches=[],
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                    **_ag_identity_kwargs,
+                ))
+                _render_current_journey()
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="proposals_empty",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=proposals_empty skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            # Task 6A — RCA/patch-type compatibility gate. Drop proposals
+            # whose patch type cannot fix the cluster's RCA defect (e.g. a
+            # measure patch for a missing-filter defect).
+            try:
+                from genie_space_optimizer.optimization.proposal_grounding import (
+                    proposal_is_defect_compatible,
+                )
+
+                _compatible_proposals: list[dict] = []
+                _incompatible_proposals: list[dict] = []
+                for _p in all_proposals:
+                    _decision = proposal_is_defect_compatible(_p)
+                    if _decision["compatible"]:
+                        _compatible_proposals.append(_p)
+                    else:
+                        _incompatible_proposals.append({
+                            "proposal_id": str(_p.get("proposal_id") or _p.get("id") or "?"),
+                            "patch_type": str(_p.get("patch_type") or _p.get("type") or "?"),
+                            "rca_kind": _decision.get("rca_kind"),
+                            "reason": _decision["reason"],
+                        })
+                if _incompatible_proposals:
+                    print(
+                        _section(f"[{ag_id}] DEFECT-COMPATIBILITY GATE", "-") + "\n"
+                        + _kv("Proposals dropped", len(_incompatible_proposals)) + "\n"
+                        + "\n".join(
+                            f"|  - {d['proposal_id']} ({d['patch_type']}): "
+                            f"rca={d['rca_kind']} reason={d['reason']}"
+                            for d in _incompatible_proposals
+                        ) + "\n"
+                        + _bar("-")
+                    )
+                    logger.warning(
+                        "AG %s defect-compatibility gate dropped %d proposal(s)",
+                        ag_id,
+                        len(_incompatible_proposals),
+                    )
+                all_proposals = _compatible_proposals
+            except Exception:
+                logger.debug(
+                    "Defect-compatibility gate failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # ── Apply coordinated patch set ──────────────────────────────
+            try:
+                from genie_space_optimizer.optimization.proposal_shape import (
+                    normalize_column_proposals,
+                )
+
+                _uc_columns_for_shape = (
+                    metadata_snapshot.get("_uc_columns", [])
+                    if isinstance(metadata_snapshot, dict)
+                    else []
+                )
+                # Phase A — capture pre-normalize proposals so the journey
+                # emit can map dropped proposal_ids back to their target qids.
+                _pre_normalize_proposals = list(all_proposals)
+                all_proposals, _shape_decisions = normalize_column_proposals(
+                    all_proposals,
+                    uc_columns=_uc_columns_for_shape,
+                )
+                if _shape_decisions:
+                    print(
+                        _section(f"[{ag_id}] RCA COLUMN SHAPE NORMALIZATION", "-") + "\n"
+                        + _kv("Decisions", len(_shape_decisions)) + "\n"
+                        + "\n".join(
+                            f"|  - {d['proposal_id']} ({d['patch_type']}): "
+                            f"{d['decision']} reason={d['reason']} outputs={d['output_count']}"
+                            for d in _shape_decisions[:12]
+                        ) + "\n"
+                        + _bar("-")
+                    )
+                    _rca_shape_drop_reasons = {
+                        "missing_table_for_column",
+                        "missing_column",
+                        "invalid_column_target",
+                        "ambiguous_table_for_column",
+                    }
+                    _rca_shape_drops = [
+                        d for d in _shape_decisions
+                        if d.get("decision") == "dropped"
+                        and d.get("reason") in _rca_shape_drop_reasons
+                    ]
+                    if _rca_shape_drops:
+                        logger.warning(
+                            "[%s] rca_theme_shape_dropped: %d malformed column "
+                            "proposal(s) dropped during normalization; reasons=%s",
+                            ag_id,
+                            len(_rca_shape_drops),
+                            sorted({str(d.get("reason")) for d in _rca_shape_drops}),
+                        )
+                        for _drop in _rca_shape_drops:
+                            _audit_emit(
+                                stage_letter="G",
+                                gate_name="rca_column_shape_normalization",
+                                decision="reject",
+                                reason_code="rca_theme_shape_dropped",
+                                reason_detail=(
+                                    f"proposal_id={_drop.get('proposal_id')} "
+                                    f"reason={_drop.get('reason')}"
+                                ),
+                                affected_qids=[],
+                                metrics={
+                                    "proposal_id": _drop.get("proposal_id"),
+                                    "patch_type": _drop.get("patch_type"),
+                                    "reason": _drop.get("reason"),
+                                    "output_count": _drop.get("output_count"),
+                                },
+                            )
+            except Exception:
+                logger.debug(
+                    "RCA column proposal normalization failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Phase A — Lossless contract: stamp dropped_at_normalize for
+            # every proposal that was filtered by normalize_column_proposals.
+            try:
+                _shape_dropped_ids = {
+                    str(d.get("proposal_id") or "")
+                    for d in (locals().get("_shape_decisions") or [])
+                    if d.get("decision") == "dropped" and d.get("proposal_id")
+                }
+                if _shape_dropped_ids:
+                    _proposals_by_id = {
+                        str(p.get("proposal_id") or p.get("id") or ""): p
+                        for p in (locals().get("_pre_normalize_proposals") or [])
+                    }
+                    _dropped_normalize_proposals = [
+                        {
+                            "proposal_id": pid,
+                            "patch_type": str(
+                                (_proposals_by_id.get(pid) or {}).get("patch_type")
+                                or (_proposals_by_id.get(pid) or {}).get("type")
+                                or ""
+                            ),
+                            "cluster_id": str(
+                                (_proposals_by_id.get(pid) or {}).get("cluster_id") or ""
+                            ),
+                            "target_qids": list(
+                                (_proposals_by_id.get(pid) or {}).get("target_qids") or []
+                            ),
+                            "_grounding_target_qids": list(
+                                (_proposals_by_id.get(pid) or {}).get("_grounding_target_qids") or []
+                            ),
+                            "_drop_reason": next(
+                                (
+                                    str(d.get("reason") or "")
+                                    for d in (_shape_decisions or [])
+                                    if str(d.get("proposal_id") or "") == pid
+                                    and d.get("decision") == "dropped"
+                                ),
+                                "",
+                            ),
+                        }
+                        for pid in _shape_dropped_ids
+                    ]
+                    _emit_gate_drop_journey(
+                        emit=_journey_emit,
+                        gate="normalize",
+                        dropped=_dropped_normalize_proposals,
                     )
             except Exception:
                 logger.debug(
-                    "Phase A: lazy baseline seed failed (non-fatal)",
+                    "Phase A: normalize-gate journey emit failed (non-fatal)",
                     exc_info=True,
                 )
 
-        # Phase A — Lossless contract: stamp the eval-entry events for
-        # every qid that entered this iteration's eval. This eliminates
-        # the validator's missing_qid violations (one per qid) and the
-        # illegal-transition violations that would otherwise arise from
-        # qids that begin their journey at 'clustered' or 'soft_signal'
-        # without a preceding 'evaluated' event.
-        try:
-            _eval_qids_for_entry = list(
-                (_latest_eval_result or {}).get("question_ids") or []
-            )
-            _hard_qid_set = {
-                str(q)
-                for c in (clusters or [])
-                for q in (c.get("question_ids") or [])
-                if q
-            }
-            _soft_qid_set = {
-                str(q)
-                for c in (soft_signal_clusters or [])
-                for q in (c.get("question_ids") or [])
-                if q
-            } - _hard_qid_set
-            _gt_corr_qid_set = {
-                str(c.get("question_id") or "")
-                for c in (_analysis.get("gt_correction_candidates") or [])
-                if c.get("question_id")
-            }
-            _all_classified = _hard_qid_set | _soft_qid_set | _gt_corr_qid_set
-            _already_passing_set = (
-                {str(q) for q in _eval_qids_for_entry if q}
-                - _all_classified
-            )
-            _emit_eval_entry_journey(
-                emit=_journey_emit,
-                eval_qids=_eval_qids_for_entry,
-                already_passing_qids=sorted(_already_passing_set),
-                hard_qids=sorted(_hard_qid_set),
-                soft_qids=sorted(_soft_qid_set),
-                gt_correction_qids=sorted(_gt_corr_qid_set),
-            )
-        except Exception:
-            logger.debug(
-                "Phase A: eval-entry journey emit failed (non-fatal)",
-                exc_info=True,
-            )
+            patches = proposals_to_patches(all_proposals)
 
-        # Phase B observability follow-up — initialize per-iteration
-        # producer-exception counter and shared lookup maps used by the
-        # 5 typed-record producers wired below.
-        _iter_producer_exceptions: dict[str, int] = {
-            "eval_classification": 0,
-            "cluster": 0,
-            "rca_formed": 0,
-            "strategist_ag": 0,
-            "ag_outcome": 0,
-            "post_eval_resolution": 0,
-            "proposal_generated": 0,
-            "patch_applied": 0,
-        }
-        _iter_classification: dict[str, str] = {}
-        for _q in _already_passing_set:
-            _iter_classification[str(_q)] = "already_passing"
-        for _q in _hard_qid_set:
-            _iter_classification[str(_q)] = "hard"
-        for _q in _soft_qid_set:
-            _iter_classification[str(_q)] = "soft"
-        for _q in _gt_corr_qid_set:
-            _iter_classification[str(_q)] = "gt_correction"
-        _iter_cluster_by_qid: dict[str, str] = {}
-        _iter_source_clusters_by_id: dict[str, dict] = {}
-        for _c in (clusters or []):
-            _cid = str(_c.get("cluster_id") or "")
-            if _cid:
-                _iter_source_clusters_by_id[_cid] = _c
-            for _q in (_c.get("question_ids") or []):
-                _qstr = str(_q)
-                if _qstr and _cid:
-                    _iter_cluster_by_qid[_qstr] = _cid
-        # Phase B delta Task 1: derive {cluster_id: rca_id} from the
-        # iteration's RCA findings so every producer (cluster_records,
-        # strategist_ag_records, ag_outcome_decision_record,
-        # post_eval_resolution_records, blast_radius_decision_records,
-        # dead_on_arrival_decision_records) stamps a real rca_id on
-        # every record. Empty when no findings overlap a cluster's
-        # question_ids; the validator's per-decision_type rules treat
-        # missing rca_id as a violation, which is the desired loud
-        # signal for that case.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                rca_id_by_cluster_from_findings,
-            )
-            from genie_space_optimizer.optimization.rca import (
-                rca_findings_from_clusters,
-            )
-            _iter_rca_id_by_cluster: dict[str, str] = (
-                rca_id_by_cluster_from_findings(
-                    clusters=clusters or [],
-                    findings=rca_findings_from_clusters(clusters or []),
+            # Phase A — populate ``patches`` on the matching AG snapshot for
+            # replay-fixture export. Match by ag_id; use the most recent
+            # snapshot (this iteration's append).
+            try:
+                _ag_snapshots = (
+                    _current_iter_inputs["strategist_response"]["action_groups"]
                 )
-            )
-        except Exception:
-            logger.debug(
-                "Phase B delta Task 1: rca_id_by_cluster derivation failed (non-fatal)",
-                exc_info=True,
-            )
-            _iter_rca_id_by_cluster = {}
+                for _snap in reversed(_ag_snapshots):
+                    if str(_snap.get("id")) == str(ag_id):
+                        _ag_affected_qids = [
+                            str(q) for q in (ag.get("affected_questions") or []) if q
+                        ]
+                        _snap["patches"] = [
+                            {
+                                "proposal_id": str(_p.get("proposal_id") or _p.get("id") or ""),
+                                "patch_type": str(_p.get("patch_type") or _p.get("type") or ""),
+                                "target_qids": _patch_snapshot_target_qids(
+                                    _p, _ag_affected_qids,
+                                ),
+                                "cluster_id": str(_p.get("cluster_id") or ""),
+                            }
+                            for _p in (all_proposals or [])
+                        ]
+                        break
+            except Exception:
+                logger.debug(
+                    "Phase A: patch capture for replay fixture failed (non-fatal)",
+                    exc_info=True,
+                )
 
-        # Phase B observability follow-up — closure that builds an
-        # ACCEPTANCE_DECIDED record from an AG and outcome string and
-        # stashes it on the iteration snapshot. Captures the iteration
-        # scope (clusters, lookups, exception counter) so the 5 outcome
-        # sites in the harness can call it inline with one line each.
-        def _phase_b_emit_ag_outcome_record(_ag_obj, _outcome_str):
+            # Phase A — Lossless contract: stamp ag_assigned for every qid
+            # this AG targets, before any 'proposed' event fires. The
+            # contract requires AG_ASSIGNED between CLUSTERED and PROPOSED.
+            try:
+                _ag_assigned_qids = sorted({
+                    str(q)
+                    for _p in (all_proposals or [])
+                    for q in (
+                        _p.get("_grounding_target_qids")
+                        or _p.get("target_qids")
+                        or []
+                    )
+                    if q
+                })
+                if not _ag_assigned_qids:
+                    _ag_assigned_qids = [
+                        str(q) for q in (ag.get("affected_questions") or []) if q
+                    ]
+                _emit_ag_assignment_journey(
+                    emit=_journey_emit,
+                    ag_id=str(ag_id),
+                    affected_qids=_ag_assigned_qids,
+                )
+            except Exception:
+                logger.debug(
+                    "Phase A: ag_assigned journey emit failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Phase F+H A2 (v2): F4 action_groups — additive observability
+            # with atomic dedup. Replaces inline _strategist_ag_records with
+            # the stage call which emits the same STRATEGIST_AG_EMITTED
+            # records via ctx.decision_emit per stages/action_groups.py:
+            # 83-84.
+            #
+            # Verified against: stages/action_groups.py:32-51 (Input), 68-89
+            # (select body), harness.py:12280-12291 (_iter_rca_id_by_cluster),
+            # harness:567 (_build_ag_alternatives_by_id helper).
+            #
+            # Phase D.5 Task 6 alternatives builder hoisted out of the inline
+            # producer try-block (v1 stayed inside; v2 needs the result for
+            # F4's ag_alternatives_by_id input).
+            _ag_alts_by_id = _build_ag_alternatives_by_id(
+                strategist_returned_ags=(
+                    list(strategist_returned_ags)
+                    if "strategist_returned_ags" in locals()
+                    else [ag]
+                ),
+                emitted_ag_ids=[str(ag.get("id") or ag.get("ag_id") or "")],
+            )
+
             try:
                 from genie_space_optimizer.optimization.decision_emitters import (
-                    ag_outcome_decision_record as _ag_outcome_decision_record,
-                    is_strict_mode as _phase_b_strict_mode_inner,
+                    is_strict_mode as _phase_b_strict_mode,
+                )
+                from genie_space_optimizer.optimization.stages import (
+                    StageContext as _StageCtx,
+                )
+                from genie_space_optimizer.optimization.stages import (
+                    action_groups as _ags_stage,
                 )
 
-                _ag_rec = _ag_outcome_decision_record(
-                    run_id=run_id,
-                    iteration=iteration_counter,
-                    ag=_ag_obj,
-                    outcome=str(_outcome_str or ""),
-                    source_clusters_by_id=_iter_source_clusters_by_id,
-                    rca_id_by_cluster=_iter_rca_id_by_cluster,
+                _stage_ctx_a2 = _StageCtx(
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    space_id=str(space_id),
+                    domain=str(domain),
+                    catalog=str(catalog),
+                    schema=str(schema),
+                    apply_mode=str(apply_mode),
+                    journey_emit=_journey_emit,
+                    decision_emit=_decision_emit,
+                    mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
+                    feature_flags={},
                 )
-                if _ag_rec is not None:
+                # Spine stage 4 — Action Group Selection. Consumes the
+                # carry-over from the prior iteration's spine stage 10
+                # (Learning) via ``prior_buckets_by_qid``. When the bucket
+                # map is non-empty, ``select`` drops MODEL_CEILING qids
+                # from each AG's target set and tags AGs whose remaining
+                # qids are all EVIDENCE_GAP with ``ag_kind=
+                # "evidence_gathering"``. Iter 1 sees an empty map (no
+                # carry-over yet), so the slate is unfiltered.
+                _ags_inp = _ags_stage.ActionGroupsInput(
+                    action_groups=tuple([ag]),
+                    source_clusters_by_id={
+                        str(_c.get("cluster_id") or ""): _c
+                        for _c in (clusters or [])
+                        if _c.get("cluster_id")
+                    },
+                    rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
+                    ag_alternatives_by_id={
+                        k: tuple(v) for k, v in (_ag_alts_by_id or {}).items()
+                    },
+                    prior_buckets_by_qid=dict(_prior_buckets_by_qid),
+                    # Cycle 5 T2 — gate-drops carrying a causal-target
+                    # patch from the prior iteration. Threaded
+                    # unconditionally (the dataclass field accepts an empty
+                    # tuple as default); the strategist prompt-builder
+                    # consumer surfaces these only when
+                    # GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST is on, so
+                    # passing the tuple here with the flag off is byte-
+                    # stable. Iter 1 sees ().
+                    prior_iteration_dropped_causal_patches=tuple(
+                        _prior_iteration_dropped_causal_patches
+                    ),
+                )
+                # Phase F+H Commit B11: wrap F4 with stage_io_capture
+                # decorator. Replay-byte-stable — wrap_with_io_capture
+                # returns the stage output unchanged; MLflow log_text
+                # calls are no-ops while mlflow_anchor_run_id is None
+                # (C17 wires the anchor on real runs).
+                from genie_space_optimizer.optimization.stage_io_capture import (
+                    wrap_with_io_capture as _wrap_with_io_capture_a2,
+                )
+                _ags_wrapped = _wrap_with_io_capture_a2(
+                    execute=_ags_stage.execute,
+                    stage_key="action_group_selection",
+                )
+                _ag_slate = _ags_wrapped(_stage_ctx_a2, _ags_inp)
+                # NOTE: F4 stage emits the same records the inline producer
+                # did, but ActionGroupSlate does NOT expose them as a tuple.
+                # The pre-A2 harness incremented _phase_b_target_qids_missing_
+                # count from _ag_records here. After A2, the counter stays at
+                # 0 for this iteration (records still flow into Optimization
+                # Trace via _decision_emit; only the counter aggregation is
+                # lost). TODO follow-up: extend ActionGroupSlate with a
+                # records tuple OR re-derive from _current_iter_inputs[
+                # "decision_records"] tail.
+            except Exception as _strategist_ag_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="strategist_ag",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_strategist_ag_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for strategist_ag",
+                        exc_info=True,
+                    )
+                _iter_producer_exceptions["strategist_ag"] += 1
+                _phase_b_producer_exceptions["strategist_ag"] = (
+                    _phase_b_producer_exceptions.get("strategist_ag", 0) + 1
+                )
+                logger.debug(
+                    "Phase F+H A2 v2: action_groups stage failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Phase C Task 5 — RCA-groundedness gate at AG level.
+            # Observability-first: emits one GATE_DECISION/DROPPED record
+            # per AG that fails the groundedness predicate, but does NOT
+            # remove the AG from the iteration's pipeline. Existing patch-
+            # cap and blast-radius gates remain authoritative.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    groundedness_gate_records as _groundedness_gate_records,
+                )
+                from genie_space_optimizer.optimization.rca import (
+                    rca_findings_from_clusters as _rca_findings_from_clusters_c5,
+                )
+                from genie_space_optimizer.optimization.rca_groundedness import (
+                    is_rca_grounded as _is_rca_grounded_c5,
+                )
+
+                _phase_c_findings_ag = _rca_findings_from_clusters_c5(clusters or [])
+                _ag_verdict = _is_rca_grounded_c5(
+                    ag, _phase_c_findings_ag, target_kind="ag",
+                )
+                if not _ag_verdict.accepted:
+                    _ag_root_cause_c5 = ""
+                    _ag_rca_id_c5 = ""
+                    for _cid in (ag.get("source_cluster_ids") or []):
+                        _ag_rca_id_c5 = str(
+                            _iter_rca_id_by_cluster.get(str(_cid)) or ""
+                        )
+                        if _ag_rca_id_c5:
+                            break
+                    _gate_records_ag = _groundedness_gate_records(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        drops=[{
+                            "ag_id": str(ag.get("id") or ag.get("ag_id") or ""),
+                            "proposal_id": "",
+                            "target_qids": list(ag.get("affected_questions") or []),
+                            "rca_id": _ag_rca_id_c5,
+                            "root_cause": _ag_root_cause_c5,
+                            "target_kind": "ag",
+                            "verdict": _ag_verdict,
+                        }],
+                    )
                     _current_iter_inputs.setdefault(
                         "decision_records", []
-                    ).append(_ag_rec.to_dict())
-            except Exception as _ag_outcome_exc:
+                    ).extend([r.to_dict() for r in _gate_records_ag])
+            except Exception as _groundedness_ag_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="groundedness_ag",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_groundedness_ag_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for groundedness_ag",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["groundedness_ag"] = (
+                    _phase_b_producer_exceptions.get("groundedness_ag", 0) + 1
+                )
+                logger.debug(
+                    "Phase C: AG groundedness gate failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Task 13 — emit ``proposed`` events for every proposal that
+            # survived to ``proposals_to_patches``. Use both
+            # ``_grounding_target_qids`` and ``target_qids`` so we capture
+            # the full causal target set even when one is empty.
+            try:
+                for _p in (all_proposals or []):
+                    _ptids = list(_p.get("_grounding_target_qids") or [])
+                    if not _ptids:
+                        _ptids = list(_p.get("target_qids") or [])
+                    _ptids = [str(q) for q in _ptids if q]
+                    if not _ptids:
+                        continue
+                    # Plan N1 Task 4 — stamp parent_proposal_id so the
+                    # validator's lane-key collapses this ``proposed``
+                    # event into the same lane as the matching ``applied_*``
+                    # / ``dropped_at_cap`` events keyed on the expanded
+                    # child id. ``_p`` is at the proposal level so its
+                    # ``proposal_id`` is the parent today.
+                    _proposed_pid = str(
+                        _p.get("proposal_id") or _p.get("id") or ""
+                    )
+                    _journey_emit(
+                        "proposed",
+                        question_ids=_ptids,
+                        proposal_id=_proposed_pid,
+                        parent_proposal_id=str(
+                            _p.get("parent_proposal_id")
+                            or _p.get("source_proposal_id")
+                            or _proposed_pid
+                        ),
+                        patch_type=str(
+                            _p.get("patch_type") or _p.get("type") or ""
+                        ),
+                        cluster_id=str(_p.get("cluster_id") or ""),
+                    )
+            except Exception:
+                logger.debug(
+                    "Task 13: proposed journey emit failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Phase F+H A3 (v2): F5 proposals — additive observability with
+            # atomic dedup. Replaces inline _proposal_generated_records (in
+            # the deleted block) with the stage call which emits
+            # PROPOSAL_GENERATED via ctx.decision_emit per
+            # stages/proposals.py:128-129 and stamps content_fingerprint per
+            # :108-115 using the SAME reflection_retry.patch_retry_signature
+            # function the harness already used at :14311 (algorithm parity
+            # confirmed — NO all_proposals replacement needed).
+            #
+            # Verified against: stages/proposals.py:39-55 (Input), 95-135
+            # (generate body), harness.py:14311 (PR-E content_fingerprint
+            # stamping site, same algorithm), harness.py:12280-12291
+            # (_iter_rca_id_by_cluster).
+            #
+            # Phase D.5 Task 7 alternatives builder hoisted out of the
+            # deleted inline producer try-block (v1 stayed inside; v2 needs
+            # the result for F5's proposal_alternatives_by_ag input).
+            _proposal_alts = _build_proposal_alternatives_for_ag(
+                raw_proposals=(
+                    list(_raw_proposals_for_ag)
+                    if "_raw_proposals_for_ag" in locals()
+                    else (all_proposals or [])
+                ),
+                surviving_proposal_ids=[
+                    str(p.get("proposal_id") or p.get("id") or "")
+                    for p in (all_proposals or [])
+                ],
+            )
+
+            try:
+                from genie_space_optimizer.optimization.stages import (
+                    StageContext as _StageCtx,
+                )
+                from genie_space_optimizer.optimization.stages import (
+                    proposals as _prop_stage,
+                )
+
+                _stage_ctx_a3 = _StageCtx(
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    space_id=str(space_id),
+                    domain=str(domain),
+                    catalog=str(catalog),
+                    schema=str(schema),
+                    apply_mode=str(apply_mode),
+                    journey_emit=_journey_emit,
+                    decision_emit=_decision_emit,
+                    mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
+                    feature_flags={},
+                )
+                _cluster_root_cause_by_id = {
+                    str(_c.get("cluster_id") or ""): str(_c.get("root_cause") or "")
+                    for _c in (clusters or [])
+                    if _c.get("cluster_id")
+                }
+                _prop_inp = _prop_stage.ProposalsInput(
+                    proposals_by_ag={
+                        str(ag_id): tuple(all_proposals or []),
+                    },
+                    rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
+                    cluster_root_cause_by_id=_cluster_root_cause_by_id,
+                    proposal_alternatives_by_ag={
+                        str(ag_id): tuple(_proposal_alts or []),
+                    },
+                )
+                # Phase F+H Commit B12: wrap F5 with stage_io_capture
+                # decorator. Replay-byte-stable — wrap_with_io_capture
+                # returns the stage output unchanged; MLflow log_text
+                # calls are no-ops while mlflow_anchor_run_id is None
+                # (C17 wires the anchor on real runs).
+                from genie_space_optimizer.optimization.stage_io_capture import (
+                    wrap_with_io_capture as _wrap_with_io_capture_a3,
+                )
+                _prop_wrapped = _wrap_with_io_capture_a3(
+                    execute=_prop_stage.execute,
+                    stage_key="proposal_generation",
+                )
+                _prop_slate = _prop_wrapped(_stage_ctx_a3, _prop_inp)
+                # _prop_slate is observability-only: F6 (deferred) would
+                # consume _prop_slate.proposals_by_ag (fingerprint-stamped)
+                # when wired. Until F6 lands, the harness's all_proposals
+                # (already fingerprinted by :14311) is the canonical input
+                # to downstream gates — DO NOT replace.
+            except Exception as _proposal_generated_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="proposal_generated",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_proposal_generated_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for proposal_generated",
+                        exc_info=True,
+                    )
+                _iter_producer_exceptions["proposal_generated"] += 1
+                _phase_b_producer_exceptions["proposal_generated"] = (
+                    _phase_b_producer_exceptions.get("proposal_generated", 0) + 1
+                )
+                logger.debug(
+                    "Phase F+H A3 v2: proposals stage failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Phase C Task 5 — RCA-groundedness gate at proposal level.
+            # Same observability-first contract as the AG-level gate above.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    groundedness_gate_records as _groundedness_gate_records_p,
+                )
+                from genie_space_optimizer.optimization.rca import (
+                    rca_findings_from_clusters as _rca_findings_from_clusters_c5p,
+                )
+                from genie_space_optimizer.optimization.rca_groundedness import (
+                    is_rca_grounded as _is_rca_grounded_c5p,
+                )
+
+                _phase_c_findings_p = _rca_findings_from_clusters_c5p(clusters or [])
+                _proposal_drops_c5: list[dict] = []
+                for _prop in (all_proposals or []):
+                    _prop_id = str(_prop.get("proposal_id") or "")
+                    if not _prop_id:
+                        continue
+                    _verdict_p = _is_rca_grounded_c5p(
+                        _prop, _phase_c_findings_p, target_kind="proposal",
+                    )
+                    if _verdict_p.accepted:
+                        continue
+                    _proposal_drops_c5.append({
+                        "ag_id": str(ag.get("id") or ""),
+                        "proposal_id": _prop_id,
+                        "target_qids": list(_prop.get("target_qids") or []),
+                        "rca_id": str(_prop.get("rca_id") or ""),
+                        "root_cause": str(_prop.get("root_cause") or ""),
+                        "target_kind": "proposal",
+                        "verdict": _verdict_p,
+                    })
+                if _proposal_drops_c5:
+                    _gate_records_p = _groundedness_gate_records_p(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        drops=_proposal_drops_c5,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).extend([r.to_dict() for r in _gate_records_p])
+            except Exception as _groundedness_proposal_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="groundedness_proposal",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_groundedness_proposal_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for groundedness_proposal",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["groundedness_proposal"] = (
+                    _phase_b_producer_exceptions.get("groundedness_proposal", 0) + 1
+                )
+                logger.debug(
+                    "Phase C: proposal groundedness gate failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Task 4 — patch-survival snapshot: normalized gate.
+            _survival_normalized = list(patches)
+
+            # Phase 4.3: expand ``rewrite_instruction`` proposals into
+            # ``update_instruction_section`` children BEFORE the cap so a
+            # single rewrite_instruction proposal does not balloon past the
+            # cap inside ``apply_patch_set``. Idempotent — applier will not
+            # re-split children that already carry ``_split_from``.
+            try:
+                from genie_space_optimizer.optimization.applier import (
+                    _expand_rewrite_splits as _harness_expand_splits,
+                )
+                _pre_split_count = len(patches)
+                patches = _harness_expand_splits(patches)
+                if len(patches) > _pre_split_count:
+                    logger.info(
+                        "Phase 4.3: rewrite splits expanded patch list "
+                        "%d -> %d before diversity-aware cap",
+                        _pre_split_count, len(patches),
+                    )
+            except Exception:
+                logger.debug(
+                    "Phase 4.3: pre-cap rewrite split expansion failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Task 5: ground proposals against failing-question surfaces.
+            # AG2 in the retail run shipped 8-patch bundles whose targets
+            # (e.g. ``zone_combination``) did not appear in the failing
+            # questions' SQL or NL surface. Drop patches that cannot
+            # plausibly affect any failing question before the diversity
+            # cap so the resulting bundle is causally auditable.
+            _dominant_grounding_category = ""
+            try:
+                from genie_space_optimizer.common.config import (
+                    MIN_PROPOSAL_RELEVANCE,
+                )
+                from genie_space_optimizer.optimization.control_plane import (
+                    rows_for_qids,
+                    target_qids_from_action_group,
+                )
+                from genie_space_optimizer.optimization.proposal_grounding import (
+                    causal_relevance_score as _patch_relevance,
+                    explain_causal_relevance as _explain_patch_relevance,
+                )
+
+                _all_rows_for_grounding = _get_failure_rows(
+                    spark, run_id, catalog, schema,
+                )
+                _ag_target_qids = target_qids_from_action_group(
+                    ag,
+                    strategy.get("_source_clusters", []),
+                )
+                _rows_for_grounding = (
+                    rows_for_qids(_all_rows_for_grounding, _ag_target_qids)
+                    if _ag_target_qids else list(_all_rows_for_grounding)
+                )
+                _audit_decisions_grounding: list[tuple[dict, float, str]] = []
+                _grounded: list[dict] = []
+                _grounding_debug_by_idx: list[dict] = []
+                _grounding_debug_rows: list[dict] = []
+                for _patch in patches:
+                    try:
+                        _rca_exec = ag.get("_rca_execution") or {}
+                        if isinstance(_rca_exec, dict):
+                            _patch["_rca_grounding_terms"] = sorted(set(
+                                list(_patch.get("_rca_grounding_terms") or [])
+                                + list(_rca_exec.get("grounding_terms") or [])
+                            ))
+                    except Exception:
+                        logger.debug("Failed to stamp RCA grounding terms", exc_info=True)
+                    _debug = _explain_patch_relevance(
+                        _patch,
+                        _rows_for_grounding,
+                        target_qids=_ag_target_qids,
+                        min_relevance=MIN_PROPOSAL_RELEVANCE,
+                    )
+                    _score = float(_debug.get("score", 0.0))
+                    _patch["_grounding_target_qids"] = list(_ag_target_qids)
+                    _patch["relevance_score"] = round(_score, 3)
+                    _patch["_grounding_failure_category"] = _debug.get("failure_category")
+                    if _score >= MIN_PROPOSAL_RELEVANCE:
+                        _grounded.append(_patch)
+                        _audit_decisions_grounding.append((_patch, _score, "kept"))
+                    else:
+                        _audit_decisions_grounding.append((_patch, _score, "dropped"))
+                    _grounding_debug_by_idx.append(_debug)
+                    _grounding_debug_rows.append({
+                        "patch_type": _patch.get("type") or _patch.get("patch_type"),
+                        "target": (
+                            _patch.get("column")
+                            or _patch.get("target")
+                            or _patch.get("section_name")
+                            or "?"
+                        ),
+                        "score": round(_score, 3),
+                        "category": _debug.get("failure_category"),
+                        "scoped_row_count": len(_rows_for_grounding),
+                        "surface_size": _debug.get("surface_size"),
+                        "overlap": list(_debug.get("overlap") or [])[:8],
+                        "rca_overlap": list(_debug.get("rca_overlap") or [])[:8],
+                    })
+
+                _dropped = [d for d in _audit_decisions_grounding if d[2] == "dropped"]
+                _dropped_grounding_patches = [
+                    patch for patch, _score, decision in _audit_decisions_grounding
+                    if decision == "dropped"
+                ]
+                _grounding_categories = [
+                    str(patch.get("_grounding_failure_category") or "")
+                    for patch in _dropped_grounding_patches
+                    if str(patch.get("_grounding_failure_category") or "")
+                ]
+                _dominant_grounding_category = (
+                    max(set(_grounding_categories), key=_grounding_categories.count)
+                    if _grounding_categories else ""
+                )
+                if _dropped:
+                    logger.info(
+                        "Task 5 grounding [%s]: dropped %d/%d ungrounded patches "
+                        "(min_relevance=%.2f)",
+                        ag_id, len(_dropped), len(patches), MIN_PROPOSAL_RELEVANCE,
+                    )
+                    print(
+                        _section(
+                            f"PROPOSAL GROUNDING [{ag_id}]: kept {len(_grounded)} of "
+                            f"{len(patches)}", "-",
+                        ) + "\n"
+                        + _kv(
+                            "Dropped (ungrounded)",
+                            ", ".join(
+                                f"{p.get('type', '?')}:{p.get('column', p.get('target', '?'))}"
+                                f" (rel={s:.2f})"
+                                for p, s, _d in _dropped[:5]
+                            ) + (
+                                f" (+{len(_dropped) - 5} more)" if len(_dropped) > 5 else ""
+                            ),
+                        ) + "\n"
+                        + _kv(
+                            "Grounding debug",
+                            "; ".join(
+                                f"{d['patch_type']}:{d['target']} cat={d['category']} "
+                                f"rows={d['scoped_row_count']} surface={d['surface_size']} "
+                                f"overlap={d['overlap']} rca={d['rca_overlap']}"
+                                for d in _grounding_debug_rows[:3]
+                            ),
+                        ) + "\n"
+                        + _bar("-")
+                    )
+                patches = _grounded
+
+                # Phase A — Lossless contract: stamp dropped_at_grounding for
+                # every dropped patch's target qids so the validator sees a
+                # legal proposed → dropped_at_grounding transition.
+                try:
+                    _emit_gate_drop_journey(
+                        emit=_journey_emit,
+                        gate="grounding",
+                        dropped=[
+                            {
+                                "proposal_id": str(p.get("proposal_id") or p.get("id") or ""),
+                                "patch_type": str(p.get("patch_type") or p.get("type") or ""),
+                                "cluster_id": str(p.get("cluster_id") or ""),
+                                "target_qids": list(p.get("target_qids") or []),
+                                "_grounding_target_qids": list(
+                                    p.get("_grounding_target_qids") or []
+                                ),
+                                "_drop_reason": "ungrounded",
+                            }
+                            for p in (_dropped_grounding_patches or [])
+                        ],
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase A: grounding-gate journey emit failed (non-fatal)",
+                        exc_info=True,
+                    )
+
+                try:
+                    from genie_space_optimizer.optimization.rca_decision_trace import (
+                        format_patch_inventory,
+                    )
+
+                    print(
+                        _section(f"PROPOSAL INVENTORY [{ag_id}]", "-") + "\n"
+                        + _kv("AG target QIDs", list(_ag_target_qids)) + "\n"
+                        + _kv("Grounded patch count", len(patches)) + "\n"
+                        + _kv("Patches", format_patch_inventory(patches)) + "\n"
+                        + _bar("-")
+                    )
+                except Exception:
+                    logger.debug("Failed to print proposal inventory", exc_info=True)
+
+                # Emit a per-patch ``proposal_grounding`` decision row for
+                # each kept/dropped decision so the Task-3 audit chain
+                # ``cluster -> proposal -> grounding -> apply -> accept``
+                # is queryable end-to-end.
+                try:
+                    from genie_space_optimizer.optimization.state import (
+                        write_lever_loop_decisions as _write_decisions,
+                    )
+                    _grounding_rows: list[dict] = []
+                    for _idx, (_patch, _score, _dec) in enumerate(
+                        _audit_decisions_grounding, start=1,
+                    ):
+                        _debug_for_row = (
+                            _grounding_debug_by_idx[_idx - 1]
+                            if _idx - 1 < len(_grounding_debug_by_idx)
+                            else _explain_patch_relevance(
+                                _patch,
+                                _rows_for_grounding,
+                                target_qids=_ag_target_qids,
+                                min_relevance=MIN_PROPOSAL_RELEVANCE,
+                            )
+                        )
+                        _category_for_row = _debug_for_row.get("failure_category")
+                        _grounding_rows.append({
+                            "run_id": run_id,
+                            "iteration": iteration_counter,
+                            "ag_id": ag_id,
+                            "decision_order": _idx,
+                            "stage_letter": "H",
+                            "gate_name": "proposal_grounding",
+                            "decision": (
+                                "accepted" if _dec == "kept" else "dropped"
+                            ),
+                            "reason_code": (
+                                None if _dec == "kept" else (_category_for_row or "below_min_relevance")
+                            ),
+                            "metrics": {
+                                "relevance_score": round(float(_score), 3),
+                                "min_relevance": MIN_PROPOSAL_RELEVANCE,
+                                "patch_type": _patch.get("type"),
+                                "target": (
+                                    _patch.get("column")
+                                    or _patch.get("target")
+                                    or _patch.get("metric")
+                                    or _patch.get("instruction_section")
+                                ),
+                                "lever": _patch.get("lever"),
+                                "rca_id": _patch.get("rca_id"),
+                                "patch_family": _patch.get("patch_family"),
+                                "target_qids": _patch.get("target_qids", []),
+                                "ag_target_qids": list(_ag_target_qids),
+                                "scoped_row_count": len(_rows_for_grounding),
+                                "failure_category": _category_for_row,
+                                "debug": _debug_for_row,
+                            },
+                            "proposal_ids": (
+                                [_patch.get("proposal_id")]
+                                if _patch.get("proposal_id") else []
+                            ),
+                            "source_cluster_ids": (
+                                [_patch.get("cluster_id")]
+                                if _patch.get("cluster_id") else []
+                            ),
+                        })
+                    if _grounding_rows:
+                        _write_decisions(
+                            spark, _grounding_rows, catalog=catalog, schema=schema,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist proposal_grounding decision rows",
+                        exc_info=True,
+                    )
+            except Exception:
+                logger.debug(
+                    "Task 5 proposal grounding failed (non-fatal); proceeding with "
+                    "all patches.",
+                    exc_info=True,
+                )
+
+            _grounding_skip = _should_skip_eval_for_patch_bundle(
+                patches=patches,
+                apply_log=None,
+                stage="post_grounding",
+            )
+            if _grounding_skip.skip:
+                logger.warning(
+                    "[%s] Skipping acceptance eval: %s",
+                    ag_id,
+                    _grounding_skip.reason_detail,
+                )
+                print(
+                    _section(f"[{ag_id}] SKIP EVAL: NO GROUNDED PATCHES", "!") + "\n"
+                    + _kv("Reason", _grounding_skip.reason_detail) + "\n"
+                    + _bar("!")
+                )
+                write_stage(
+                    spark,
+                    run_id,
+                    f"AG_{ag_id}_NO_GROUNDED_PATCHES",
+                    "SKIPPED",
+                    task_key="lever_loop",
+                    iteration=iteration_counter,
+                    detail={"reason_code": _grounding_skip.reason_code},
+                    catalog=catalog,
+                    schema=schema,
+                )
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter,
+                    ag_id=ag_id,
+                    accepted=False,
+                    levers=[int(lk) for lk in lever_keys],
+                    target_objects=[],
+                    prev_scores=best_scores,
+                    new_scores=best_scores,
+                    rollback_reason=_grounding_skip.reason_code,
+                    patches=[],
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                    extra={
+                        "rca_execution": ag.get("_rca_execution", {}),
+                        "grounding_failure_stage": "post_grounding",
+                        "grounding_failure_reason": _grounding_skip.reason_code,
+                        "grounding_failure_category": _dominant_grounding_category,
+                        "rca_next_action": _next_grounding_action_payload(
+                            rollback_reason=_grounding_skip.reason_code,
+                            grounding_failure_category=_dominant_grounding_category,
+                            repeated_count=1,
+                        ),
+                    },
+                    **_ag_identity_kwargs,
+                ))
+                _render_current_journey()
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="post_grounding_skip",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=post_grounding_skip skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            # Task 2 — Blast-radius gate. The counterfactual scan above stamps
+            # ``passing_dependents`` and ``high_collateral_risk`` on each
+            # proposal; turn those informational stamps into a deterministic
+            # gate so high-blast-radius patches are dropped before they reach
+            # the patch cap and ship.
+            try:
+                from genie_space_optimizer.optimization.proposal_grounding import (
+                    instruction_patch_scope_is_safe as _instruction_scope_is_safe,
+                    patch_blast_radius_is_safe,
+                )
+                from genie_space_optimizer.optimization.control_plane import (
+                    target_qids_from_action_group as _target_qids_for_blast,
+                )
+
+                _blast_target_qids = _target_qids_for_blast(
+                    ag,
+                    strategy.get("_source_clusters", []),
+                )
+                # Cycle 2 Task 2: collect every currently-hard qid across
+                # all clusters so blast-radius can downgrade rejects whose
+                # outside-target dependents are themselves hard (shared-
+                # cause beneficiaries).
+                _live_hard_qids_for_blast = tuple(
+                    str(q)
+                    for cluster in (clusters or [])
+                    for q in (cluster.get("question_ids") or [])
+                    if str(q)
+                )
+                _blast_kept: list[dict] = []
+                _blast_dropped: list[dict] = []
+                for _candidate in patches:
+                    _decision = patch_blast_radius_is_safe(
+                        _candidate,
+                        ag_target_qids=_blast_target_qids,
+                        max_outside_target=0,
+                        live_hard_qids=_live_hard_qids_for_blast,
+                    )
+                    if not _decision["safe"]:
+                        _blast_dropped.append({
+                            "proposal_id": str(
+                                _candidate.get("proposal_id")
+                                or _candidate.get("id")
+                                or "?"
+                            ),
+                            "patch_type": str(
+                                _candidate.get("type")
+                                or _candidate.get("patch_type")
+                                or "?"
+                            ),
+                            "reason": _decision["reason"],
+                            "passing_dependents_outside_target": _decision.get(
+                                "passing_dependents_outside_target", []
+                            ),
+                            # Cycle 9 T5: surface the patch's target table
+                            # so record_blast_radius_drop can capture it
+                            # for cross-iteration forbid_tables.
+                            "target": str(
+                                _candidate.get("target")
+                                or _candidate.get("table")
+                                or ""
+                            ),
+                            # Cycle 9 W3: stash the source patch so the
+                            # narrow-replacement loop has the full dict
+                            # (where_predicate, qid_predicate_column, ...).
+                            "original_patch": _candidate,
+                        })
+                        continue
+                    # Task 2A — second classifier for broad instruction rewrites
+                    # that have no counterfactual dependents.
+                    _scope_decision = _instruction_scope_is_safe(
+                        _candidate,
+                        ag_target_qids=_blast_target_qids,
+                    )
+                    if not _scope_decision["safe"]:
+                        _blast_dropped.append({
+                            "proposal_id": str(
+                                _candidate.get("proposal_id")
+                                or _candidate.get("id")
+                                or "?"
+                            ),
+                            "patch_type": str(
+                                _candidate.get("type")
+                                or _candidate.get("patch_type")
+                                or "?"
+                            ),
+                            "reason": _scope_decision["reason"],
+                            "passing_dependents_outside_target": [],
+                            "target": str(
+                                _candidate.get("target")
+                                or _candidate.get("table")
+                                or ""
+                            ),
+                            # Cycle 9 W3: see comment above; same rationale.
+                            "original_patch": _candidate,
+                        })
+                        continue
+                    _blast_kept.append(_candidate)
+                # Cycle 9 W3 / Cycle 10 W4.4: synthesize narrow-scope
+                # variants for any L6 patches dropped at HCRF and re-test
+                # through the same gate; appending survivors back to
+                # _blast_kept. When the builder declines, emit a typed
+                # NARROW_NOT_APPLICABLE record so the L5-fallback path is
+                # observable in the trace.
+                _narrow_kept = _run_narrow_l6_replacement_loop(
+                    blast_dropped=_blast_dropped,
+                    blast_target_qids=tuple(_blast_target_qids),
+                    ag_root_cause=str(ag.get("root_cause") or ""),
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    ag_id=str(ag_id),
+                    cluster_id=str(
+                        (ag.get("source_cluster_ids") or ["?"])[0]
+                    ),
+                    iter_inputs=_current_iter_inputs,
+                )
+                if _narrow_kept:
+                    _blast_kept = list(_blast_kept) + _narrow_kept
+                if _blast_dropped:
+                    print(
+                        _section(f"[{ag_id}] BLAST-RADIUS GATE", "-") + "\n"
+                        + _kv("Patches dropped", len(_blast_dropped)) + "\n"
+                        + _kv(
+                            "AG target QIDs",
+                            list(_blast_target_qids) or "(none)",
+                        ) + "\n"
+                        + "\n".join(
+                            f"|  - {d['proposal_id']} ({d['patch_type']}): "
+                            f"reason={d['reason']}, "
+                            f"outside_target={d['passing_dependents_outside_target']}"
+                            for d in _blast_dropped
+                        ) + "\n"
+                        + _bar("-")
+                    )
+                    logger.warning(
+                        "AG %s blast-radius gate dropped %d/%d patches: %s",
+                        ag_id,
+                        len(_blast_dropped),
+                        len(patches),
+                        [d["proposal_id"] for d in _blast_dropped[:8]],
+                    )
+                    # Cycle 9 T5: record the dropped tables as forbidden for
+                    # the next strategist call on this AG so it doesn't
+                    # re-propose the same shape against the same table.
+                    try:
+                        from genie_space_optimizer.optimization.strategist_constraints import (
+                            record_blast_radius_drop,
+                        )
+                        record_blast_radius_drop(
+                            constraints=_strategist_constraints,
+                            ag_id=str(ag_id),
+                            dropped_patches=_blast_dropped,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Cycle9 T5: strategist_constraints update skipped "
+                            "(non-fatal)",
+                            exc_info=True,
+                        )
+                    # Cycle 9 T6: emit one DecisionRecord per blast-radius
+                    # drop so the iteration's decision_records is non-empty
+                    # even when no patches survive to the patch-cap.
+                    try:
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            blast_radius_decision_records,
+                            is_strict_mode,
+                        )
+                        _br_root_cause = ""
+                        _br_rca_id = ""
+                        for _cid in (ag.get("source_cluster_ids") or []):
+                            _br_cluster = (
+                                _iter_source_clusters_by_id.get(str(_cid)) or {}
+                            )
+                            if not _br_root_cause:
+                                _br_root_cause = str(
+                                    _br_cluster.get("root_cause") or ""
+                                )
+                            if not _br_rca_id:
+                                _br_rca_id = str(
+                                    _iter_rca_id_by_cluster.get(str(_cid)) or ""
+                                )
+                            if _br_root_cause and _br_rca_id:
+                                break
+                        _br_target_qids = [
+                            str(q)
+                            for q in (ag.get("affected_questions") or [])
+                            if q
+                        ]
+                        _br_records = blast_radius_decision_records(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            ag_id=str(ag_id),
+                            rca_id=_br_rca_id,
+                            root_cause=_br_root_cause,
+                            target_qids=_br_target_qids,
+                            dropped=_blast_dropped,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).extend([r.to_dict() for r in _br_records])
+                    except Exception as _blast_radius_exc:
+                        try:
+                            from genie_space_optimizer.common.config import (
+                                phase_b_producer_typed_exceptions_enabled as _typed_on,
+                            )
+                            if _typed_on():
+                                from genie_space_optimizer.optimization.decision_emitters import (
+                                    producer_exception_record as _producer_exception_record,
+                                )
+                                _pe_rec = _producer_exception_record(
+                                    run_id=run_id,
+                                    iteration=iteration_counter,
+                                    producer="blast_radius",
+                                    ag_id=str((ag or {}).get("id") or ""),
+                                    exception=_blast_radius_exc,
+                                )
+                                _current_iter_inputs.setdefault(
+                                    "decision_records", []
+                                ).append(_pe_rec.to_dict())
+                        except Exception:
+                            logger.debug(
+                                "Phase B: producer_exception_record emission failed for blast_radius",
+                                exc_info=True,
+                            )
+                        _phase_b_producer_exceptions["blast_radius"] = (
+                            _phase_b_producer_exceptions.get("blast_radius", 0)
+                            + 1
+                        )
+                        logger.debug(
+                            "blast-radius DecisionRecord emission failed "
+                            "(non-fatal)",
+                            exc_info=True,
+                        )
+                        if is_strict_mode():
+                            raise
+
+                    # Cycle 5 T2 — capture every blast-radius drop whose
+                    # target_qids overlap the AG's causal target as a typed
+                    # DroppedCausalPatch so the next iteration's strategist
+                    # can see what was rejected. Capture is unconditional
+                    # (cheap; just appends to ``_iter_dropped_causal``);
+                    # consumption by the strategist prompt is gated by the
+                    # flag at the AG construction site, preserving byte-
+                    # stability with the flag off.
+                    try:
+                        from genie_space_optimizer.optimization.stages.gates import (
+                            DroppedCausalPatch as _DroppedCausalPatch,
+                        )
+                        _t2_target_qids = tuple(
+                            str(q) for q in (ag.get("target_qids") or ()) if q
+                        )
+                        if _t2_target_qids:
+                            for _drop in _blast_dropped or ():
+                                _t2_dependents = tuple(
+                                    str(q)
+                                    for q in (
+                                        _drop.get("passing_dependents_outside_target")
+                                        or ()
+                                    )
+                                )
+                                _iter_dropped_causal.append(_DroppedCausalPatch(
+                                    gate="blast_radius",
+                                    reason=str(_drop.get("reason") or ""),
+                                    proposal_id=str(_drop.get("proposal_id") or ""),
+                                    patch_type=str(_drop.get("patch_type") or ""),
+                                    target=str(_drop.get("target") or ""),
+                                    target_qids=_t2_target_qids,
+                                    dependents_outside_target=_t2_dependents,
+                                    rca_id=str(_br_rca_id or ""),
+                                    root_cause=str(_br_root_cause or ""),
+                                ))
+                    except Exception:
+                        logger.debug(
+                            "Cycle 5 T2: dropped-causal capture failed "
+                            "(non-fatal)",
+                            exc_info=True,
+                        )
+                patches = _blast_kept
+            except ImportError:
+                # instruction_patch_scope_is_safe not yet implemented (Task 2A
+                # lands separately) — proceed with blast-radius gate alone.
+                from genie_space_optimizer.optimization.proposal_grounding import (
+                    patch_blast_radius_is_safe,
+                )
+                from genie_space_optimizer.optimization.control_plane import (
+                    target_qids_from_action_group as _target_qids_for_blast,
+                )
+
+                _blast_target_qids = _target_qids_for_blast(
+                    ag,
+                    strategy.get("_source_clusters", []),
+                )
+                # Cycle 2 Task 2: shared-cause-aware blast radius — pass
+                # the full live-hard set so the gate can downgrade rejects
+                # whose outside-target dependents are themselves hard.
+                _live_hard_qids_for_blast = tuple(
+                    str(q)
+                    for cluster in (clusters or [])
+                    for q in (cluster.get("question_ids") or [])
+                    if str(q)
+                )
+                _blast_kept = []
+                _blast_dropped = []
+                for _candidate in patches:
+                    _decision = patch_blast_radius_is_safe(
+                        _candidate,
+                        ag_target_qids=_blast_target_qids,
+                        max_outside_target=0,
+                        live_hard_qids=_live_hard_qids_for_blast,
+                    )
+                    if _decision["safe"]:
+                        _blast_kept.append(_candidate)
+                    else:
+                        _blast_dropped.append({
+                            "proposal_id": str(
+                                _candidate.get("proposal_id") or "?"
+                            ),
+                            "patch_type": str(_candidate.get("type") or "?"),
+                            "reason": _decision["reason"],
+                            "passing_dependents_outside_target": _decision.get(
+                                "passing_dependents_outside_target", []
+                            ),
+                            # Cycle 9 W3: stash the source patch so the
+                            # narrow-replacement loop has the full dict.
+                            "original_patch": _candidate,
+                        })
+                # Cycle 9 W3 / Cycle 10 W4.4: same narrow-replacement pass
+                # as Site A but for the import-fallback path (when
+                # ``instruction_patch_scope_is_safe`` import fails).
+                _narrow_kept = _run_narrow_l6_replacement_loop(
+                    blast_dropped=_blast_dropped,
+                    blast_target_qids=tuple(_blast_target_qids),
+                    ag_root_cause=str(ag.get("root_cause") or ""),
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    ag_id=str(ag_id),
+                    cluster_id=str(
+                        (ag.get("source_cluster_ids") or ["?"])[0]
+                    ),
+                    iter_inputs=_current_iter_inputs,
+                )
+                if _narrow_kept:
+                    _blast_kept = list(_blast_kept) + _narrow_kept
+                if _blast_dropped:
+                    logger.warning(
+                        "AG %s blast-radius gate dropped %d/%d patches: %s",
+                        ag_id,
+                        len(_blast_dropped),
+                        len(patches),
+                        [d["proposal_id"] for d in _blast_dropped[:8]],
+                    )
+                patches = _blast_kept
+
+            # Phase H Completion Task 4: wire F6 safety_gates as additive
+            # observability after the three harness inline gate sites
+            # (lever5_structural at the L5 emit site, rca_groundedness via
+            # _run_groundedness_gate inside _build_proposals, and
+            # blast_radius above). F6 sub-handlers emit zero DecisionRecords
+            # (verified at stages/gates.py — zero ctx.decision_emit calls);
+            # harness inline records remain authoritative. The wrap is purely
+            # additive — wrap_with_io_capture returns the GateOutcome
+            # unchanged; MLflow log_text calls are no-ops while
+            # mlflow_anchor_run_id is None. Replay-byte-stable.
+            try:
+                from genie_space_optimizer.optimization.stages import (
+                    gates as _gates_stage,
+                    StageContext as _StageCtx_f6,
+                )
+                from genie_space_optimizer.optimization.stage_io_capture import (
+                    wrap_with_io_capture as _wrap_capture_f6,
+                )
+
+                _f6_inp = _gates_stage.GatesInput(
+                    proposals_by_ag={str(ag_id): tuple(patches or [])},
+                    ags=tuple([ag] if isinstance(ag, dict) else []),
+                    rca_evidence=(
+                        dict(_rca_evidence_bundle.per_qid_evidence)
+                        if "_rca_evidence_bundle" in dir()
+                        and _rca_evidence_bundle is not None
+                        else {}
+                    ),
+                    applied_history=tuple(),
+                    rolled_back_content_fingerprints=set(
+                        _rolled_back_content_fingerprints
+                    ) if "_rolled_back_content_fingerprints" in dir() else set(),
+                    forbidden_signatures=set(),
+                    space_snapshot={},
+                )
+                _f6_stage_ctx = _StageCtx_f6(
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    space_id=str(space_id),
+                    domain=str(domain),
+                    catalog=str(catalog),
+                    schema=str(schema),
+                    apply_mode="real",
+                    journey_emit=lambda *a, **k: None,
+                    decision_emit=lambda r: None,
+                    mlflow_anchor_run_id=_phase_h_anchor_run_id,
+                    feature_flags={},
+                )
+                _f6_wrapped = _wrap_capture_f6(
+                    execute=_gates_stage.filter,
+                    stage_key="safety_gates",
+                )
+                _gate_outcome = _f6_wrapped(_f6_stage_ctx, _f6_inp)
+            except Exception:
+                logger.debug(
+                    "Phase H Task 4: F6 safety_gates stage failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Task 5 — backfill AG/cluster causal metadata onto broad
+            # strategist proposals so the cap can distinguish RCA-attributed
+            # patches (tier 3) from broad AG-fallback patches (tier 1).
+            patches = _backfill_patch_causal_metadata(
+                patches=patches,
+                action_group=ag,
+                source_clusters=(
+                    strategy.get("_source_clusters", [])
+                    if isinstance(strategy, dict)
+                    else []
+                ),
+            )
+
+            try:
+                # Dry-run applyability gate. Drops patches with applyable=False
+                # before the causal-first cap can rank them.
+                from genie_space_optimizer.optimization.patch_applyability import (
+                    filter_applyable_patches,
+                )
+
+                _patches_before_applyability = list(patches)
+                patches, _applyability_decisions = filter_applyable_patches(
+                    patches=_patches_before_applyability,
+                    metadata_snapshot=metadata_snapshot,
+                    space_id=space_id,
+                )
+                _non_applyable_decisions = [
+                    d for d in _applyability_decisions if not d.applyable
+                ]
+                if _non_applyable_decisions:
+                    print(
+                        _section(f"[{ag_id}] PATCH APPLYABILITY GATE", "-") + "\n"
+                        + _kv("Input patches", len(_patches_before_applyability)) + "\n"
+                        + _kv("Applyable patches", len(patches)) + "\n"
+                        + _kv("Dropped patches", len(_non_applyable_decisions)) + "\n"
+                        + "\n".join(
+                            f"|  - {d.expanded_patch_id or d.proposal_id} "
+                            f"{d.patch_type} target={d.target or '(none)'} "
+                            f"table={d.table or '(none)'} column={d.column or '(none)'} "
+                            f"applyable={d.applyable} reason={d.reason}"
+                            for d in _non_applyable_decisions[:12]
+                        ) + "\n"
+                        + _bar("-")
+                    )
+                    logger.warning(
+                        "AG %s patch applyability gate dropped %d/%d patch(es)",
+                        ag_id,
+                        len(_non_applyable_decisions),
+                        len(_patches_before_applyability),
+                    )
+            except Exception:
+                logger.debug(
+                    "Patch applyability gate failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Task 4 — patch-survival snapshot: applyable gate.
+            _survival_applyable = list(patches)
+
+            # Phase A — Lossless contract: stamp dropped_at_applyability for
+            # every patch the applyability gate dropped.
+            try:
+                _non_applyable = locals().get("_non_applyable_decisions") or []
+                if _non_applyable:
+                    _emit_gate_drop_journey(
+                        emit=_journey_emit,
+                        gate="applyability",
+                        dropped=[
+                            {
+                                "proposal_id": str(
+                                    getattr(d, "expanded_patch_id", None)
+                                    or getattr(d, "proposal_id", "")
+                                    or ""
+                                ),
+                                "patch_type": str(getattr(d, "patch_type", "") or ""),
+                                "cluster_id": "",
+                                "target_qids": list(getattr(d, "target_qids", []) or []),
+                                "_drop_reason": str(getattr(d, "reason", "") or ""),
+                            }
+                            for d in _non_applyable
+                        ],
+                    )
+            except Exception:
+                logger.debug(
+                    "Phase A: applyability-gate journey emit failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Task 17 — L5/L6 asset alignment gate. SQL-shape (L5) and
+            # sql-snippet (L6) patches must touch an asset that is in the
+            # source cluster's lineage; otherwise they are dropped before the
+            # cap so non-aligned patches don't burn cap slots.
+            from genie_space_optimizer.optimization.proposal_asset_alignment import (
+                l5_l6_patch_requires_asset_alignment,
+                proposal_aligns_with_cluster,
+            )
+
+            _ag_source_cluster_ids = {
+                str(cid).strip()
+                for cid in (ag.get("source_cluster_ids") or [])
+                if str(cid).strip()
+            }
+            _source_clusters_by_id = {
+                str(c.get("cluster_id") or "").strip(): c
+                for c in (strategy.get("_source_clusters") or [])
+                if str(c.get("cluster_id") or "").strip()
+            }
+            _aligned_patches: list[dict] = []
+            _alignment_drops: list[dict] = []
+            for _p in patches:
+                if not l5_l6_patch_requires_asset_alignment(_p):
+                    _aligned_patches.append(_p)
+                    continue
+                _matched_cluster = next(
+                    (
+                        _source_clusters_by_id[c]
+                        for c in _ag_source_cluster_ids
+                        if c in _source_clusters_by_id
+                    ),
+                    None,
+                )
+                _decision = proposal_aligns_with_cluster(_p, _matched_cluster)
+                if _decision.get("aligned"):
+                    _aligned_patches.append(_p)
+                    continue
+                _alignment_drops.append({
+                    "proposal_id": str(_p.get("proposal_id") or _p.get("id") or ""),
+                    "patch_type": str(_p.get("type") or _p.get("patch_type") or ""),
+                    "reason": _decision.get("reason"),
+                    "proposal_assets": list(_decision.get("proposal_assets") or ()),
+                    "cluster_assets": list(_decision.get("cluster_assets") or ()),
+                })
+            if _alignment_drops:
+                logger.info(
+                    "[%s] asset_alignment_dropped: %d patch(es); reasons=%s",
+                    ag_id, len(_alignment_drops),
+                    [d["reason"] for d in _alignment_drops],
+                )
+            patches = _aligned_patches
+
+            # Phase A — Lossless contract: stamp dropped_at_alignment for
+            # every L5/L6 patch dropped by the asset-alignment gate.
+            try:
+                if _alignment_drops:
+                    # _alignment_drops carries proposal_id but not target_qids;
+                    # look them up in the pre-alignment patch list (the union
+                    # of pre-cap patches captured into _aligned_patches +
+                    # the dropped set).
+                    _pre_alignment_patches_by_id = {
+                        str(_p.get("proposal_id") or _p.get("id") or ""): _p
+                        for _p in (
+                            list(_aligned_patches)
+                            + [
+                                _p
+                                for _p in (
+                                    locals().get("_pre_normalize_proposals") or []
+                                )
+                                if isinstance(_p, dict)
+                            ]
+                        )
+                    }
+                    _emit_gate_drop_journey(
+                        emit=_journey_emit,
+                        gate="alignment",
+                        dropped=[
+                            {
+                                "proposal_id": str(d.get("proposal_id") or ""),
+                                "patch_type": str(d.get("patch_type") or ""),
+                                "cluster_id": str(
+                                    (
+                                        _pre_alignment_patches_by_id.get(
+                                            str(d.get("proposal_id") or "")
+                                        )
+                                        or {}
+                                    ).get("cluster_id")
+                                    or ""
+                                ),
+                                "target_qids": list(
+                                    (
+                                        _pre_alignment_patches_by_id.get(
+                                            str(d.get("proposal_id") or "")
+                                        )
+                                        or {}
+                                    ).get("target_qids")
+                                    or []
+                                ),
+                                "_drop_reason": str(d.get("reason") or ""),
+                            }
+                            for d in _alignment_drops
+                        ],
+                    )
+            except Exception:
+                logger.debug(
+                    "Phase A: alignment-gate journey emit failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Tier 2.6: cap AG patch-set size. A single failing patch in a
+            # large batch rolls back everything — including the patches that
+            # would have helped. If the cap is exceeded, keep the highest-
+            # confidence / highest-impact patches first (sorted by the
+            # caller); extras are dropped with a clear warning.
+            if len(patches) > MAX_AG_PATCHES:
+                from genie_space_optimizer.optimization.patch_selection import (
+                    select_target_aware_causal_patch_cap,
+                )
+                from genie_space_optimizer.optimization.control_plane import (
+                    target_qids_from_action_group as _target_qids_for_patch_cap,
+                )
+
+                _patch_cap_target_qids = tuple(
+                    locals().get("_blast_target_qids")
+                    or _target_qids_for_patch_cap(ag, strategy.get("_source_clusters", []))
+                )
+                _active_cluster_ids_for_cap = tuple(
+                    str(cid).strip()
+                    for cid in (ag.get("source_cluster_ids") or [])
+                    if str(cid).strip()
+                )
+                _per_cluster_slot_floor = (
+                    1 if len(_active_cluster_ids_for_cap) > 1 else 0
+                )
+
+                _before_cap = list(patches)
+
+                # Optimizer Control-Plane Hardening Plan — Task B: when
+                # GSO_NO_CAUSAL_APPLYABLE_HALT is on and every RCA-matched
+                # proposal in the AG has been dropped by upstream gates,
+                # halt with reason no_causal_applyable_patch instead of
+                # falling back to non-causal proposals. Default-off
+                # preserves legacy behaviour.
+                from genie_space_optimizer.common.config import (
+                    no_causal_applyable_halt_enabled as _no_causal_halt,
+                )
+
+                if _no_causal_halt():
+                    _causal_proposals, _had_rca_matched = (
+                        _filter_to_causal_applyable_proposals(
+                            ag=ag, proposals=_before_cap,
+                        )
+                    )
+                    if (
+                        not _causal_proposals
+                        and not _had_rca_matched
+                        and ag.get("rca_id")
+                    ):
+                        logger.warning(
+                            "[%s] no_causal_applyable_patch: every RCA-"
+                            "matched proposal was dropped by upstream "
+                            "gates; halting AG before patch_cap",
+                            ag.get("id") or ag.get("ag_id"),
+                        )
+                        _audit_emit(
+                            stage_letter="L",
+                            gate_name="patch_cap",
+                            decision="skipped",
+                            reason_code="no_causal_applyable_patch",
+                            metrics={"input_count": len(_before_cap)},
+                        )
+                        patches = []
+                        _patch_cap_decisions = []
+                    else:
+                        patches, _patch_cap_decisions = (
+                            select_target_aware_causal_patch_cap(
+                                _before_cap,
+                                target_qids=_patch_cap_target_qids,
+                                max_patches=MAX_AG_PATCHES,
+                                active_cluster_ids=_active_cluster_ids_for_cap,
+                                per_cluster_slot_floor=_per_cluster_slot_floor,
+                            )
+                        )
+                else:
+                    patches, _patch_cap_decisions = (
+                        select_target_aware_causal_patch_cap(
+                            _before_cap,
+                            target_qids=_patch_cap_target_qids,
+                            max_patches=MAX_AG_PATCHES,
+                            active_cluster_ids=_active_cluster_ids_for_cap,
+                            per_cluster_slot_floor=_per_cluster_slot_floor,
+                        )
+                    )
+                _selected_ids = {
+                    str(p.get("proposal_id") or p.get("id") or "")
+                    for p in patches
+                }
+                _dropped_decisions = [
+                    d for d in _patch_cap_decisions
+                    if d.get("decision") == "dropped"
+                ]
+                for _d in _dropped_decisions:
+                    logger.info(
+                        "[%s] cap_dropped pid=%s type=%s cluster=%s "
+                        "rel=%.3f cluster_tier=%d direct=%s",
+                        ag_id,
+                        _d.get("proposal_id"),
+                        _d.get("patch_type"),
+                        _d.get("cluster_id"),
+                        float(_d.get("relevance_score") or 0.0),
+                        int(_d.get("active_cluster_match_tier") or 0),
+                        _d.get("is_direct_behavior"),
+                    )
+
+                # Task 13 — emit ``dropped_at_cap`` per drop, looking up the
+                # target_qids of the original proposal in ``_before_cap``.
+                # The drop reason is derived from the active-cluster match
+                # tier (0 = not in active cluster).
+                try:
+                    _by_pid: dict[str, dict] = {}
+                    for _bp in (_before_cap or []):
+                        _bpid = str(
+                            _bp.get("proposal_id") or _bp.get("id") or ""
+                        )
+                        if _bpid:
+                            _by_pid[_bpid] = _bp
+                    for _d in _dropped_decisions:
+                        _dpid = str(_d.get("proposal_id") or "")
+                        _orig = _by_pid.get(_dpid, {})
+                        _dt_qids = list(
+                            _orig.get("_grounding_target_qids") or []
+                        )
+                        if not _dt_qids:
+                            _dt_qids = list(_orig.get("target_qids") or [])
+                        _dt_qids = [str(q) for q in _dt_qids if q]
+                        _tier = int(_d.get("active_cluster_match_tier") or 0)
+                        _drop_reason = (
+                            "not_in_active_cluster" if _tier == 0
+                            else f"cap_overflow_tier={_tier}"
+                        )
+                        if _dt_qids:
+                            # Plan N1 Task 4 — parent_proposal_id collapse.
+                            _dpid_parent = str(
+                                _d.get("parent_proposal_id")
+                                or _d.get("source_proposal_id")
+                                or _orig.get("parent_proposal_id")
+                                or _orig.get("proposal_id")
+                                or _orig.get("id")
+                                or _dpid
+                            )
+                            _journey_emit(
+                                "dropped_at_cap",
+                                question_ids=_dt_qids,
+                                proposal_id=_dpid,
+                                parent_proposal_id=_dpid_parent,
+                                patch_type=str(_d.get("patch_type") or ""),
+                                cluster_id=str(_d.get("cluster_id") or ""),
+                                reason=_drop_reason,
+                            )
+                except Exception:
+                    logger.debug(
+                        "Task 13: dropped_at_cap journey emit failed",
+                        exc_info=True,
+                    )
+                logger.warning(
+                    "AG %s patch cap (causal-first): kept %d of %d. "
+                    "Dropped proposal_ids=%s.",
+                    ag_id,
+                    len(patches),
+                    len(_before_cap),
+                    [d.get("proposal_id") for d in _dropped_decisions[:8]],
+                )
+                print(
+                    _section(f"[{ag_id}] PATCH CAP APPLIED (causal-first)", "-") + "\n"
+                    + _kv("Original size", len(_before_cap)) + "\n"
+                    + _kv("Kept", len(patches)) + "\n"
+                    + _kv(
+                        "Selected proposal_ids",
+                        sorted(pid for pid in _selected_ids if pid) or "(none)",
+                    ) + "\n"
+                    + _kv("Dropped count", len(_dropped_decisions)) + "\n"
+                    + _kv("Dropped shown", min(len(_dropped_decisions), 8)) + "\n"
+                    + _kv("Dropped truncated", len(_dropped_decisions) > 8) + "\n"
+                    + _kv(
+                        "Dropped proposal_ids",
+                        [d.get("proposal_id") for d in _dropped_decisions[:8]]
+                        if _dropped_decisions else "(none)",
+                    ) + "\n"
+                    + _kv(
+                        "Reason",
+                        "Causal-first cap: relevance_score ranks before lever diversity.",
+                    ) + "\n"
+                    + _bar("-")
+                )
+
+                try:
+                    from genie_space_optimizer.optimization.rca_decision_trace import (
+                        OptimizationTrace,
+                        patch_cap_decision_records,
+                        patch_cap_decision_rows,
+                        render_operator_transcript,
+                    )
+                    from genie_space_optimizer.optimization.state import (
+                        write_lever_loop_decisions as _write_decisions,
+                    )
+
+                    # Phase B Trace Plan Task 7 — capture typed records first so
+                    # the iteration snapshot persists them for replay/fixture.
+                    # Then convert back to legacy rows for the existing Delta
+                    # write path (write_lever_loop_decisions consumers haven't
+                    # migrated yet).
+                    _patch_cap_records = patch_cap_decision_records(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        ag_id=ag_id,
+                        decisions=_patch_cap_decisions,
+                    )
+                    _current_iter_inputs.setdefault("decision_records", []).extend(
+                        [r.to_dict() for r in _patch_cap_records]
+                    )
+
+                    _write_decisions(
+                        spark,
+                        patch_cap_decision_rows(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            ag_id=ag_id,
+                            decisions=_patch_cap_decisions,
+                        ),
+                        catalog=catalog,
+                        schema=schema,
+                    )
+                except Exception:
+                    logger.debug("Failed to persist patch-cap decision rows", exc_info=True)
+
+            # Task 4 — patch-survival snapshot: capped gate. Capture in both
+            # branches so the ledger reflects the patch list that actually
+            # reaches the applier, regardless of whether the cap fired.
+            _survival_capped = list(patches)
+
+            _selected_patch_signature = tuple(sorted(
+                str(p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id") or "")
+                for p in patches
+                if (p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id"))
+            ))
+            # Cycle 2 Task 3: also compute the selected-proposal-ID
+            # signature so DOA replay can be caught even when blast-radius
+            # collapses the applied-patch signature to ``()``.
+            _doa_selected_proposal_signature = (
+                _compute_selected_proposal_signature(
+                    (ag.get("proposals") or []) if isinstance(ag, dict) else []
+                )
+            )
+            _doa_selected_blocked = _is_doa_selected_signature_blocked(
+                seen=_doa_selected_proposal_signatures,
+                ag_id=str(ag_id),
+                signature=_doa_selected_proposal_signature,
+            )
+            if (
+                _selected_patch_signature in _dead_on_arrival_patch_signatures
+                or _doa_selected_blocked
+            ):
+                _doa_dedup_reason = (
+                    "same selected proposal IDs already produced no applied patches"
+                    if _doa_selected_blocked
+                    else "same selected patch IDs already produced no applied patches"
+                )
+                logger.warning(
+                    "Skipping dead-on-arrival AG retry for %s "
+                    "(applied_sig=%s selected_sig=%s)",
+                    ag_id,
+                    _selected_patch_signature,
+                    _doa_selected_proposal_signature,
+                )
+                print(
+                    _section(f"[{ag_id}] DEAD-ON-ARRIVAL RETRY BLOCKED", "!") + "\n"
+                    + _kv("Patch signature", _selected_patch_signature) + "\n"
+                    + _kv("Selected proposal signature", _doa_selected_proposal_signature) + "\n"
+                    + _kv("Reason", _doa_dedup_reason) + "\n"
+                    + _bar("!")
+                )
+                # Phase A — Replay-fixture capture: the AG never reached the
+                # gate, so no accept/rollback path runs. Without this entry
+                # the iteration's ag_outcomes dict stays empty and the
+                # fixture loses the signal that an AG was even attempted.
+                try:
+                    _current_iter_inputs["ag_outcomes"][str(ag_id)] = (
+                        "skipped_dead_on_arrival"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase A: ag_outcome capture (dead-on-arrival) failed (non-fatal)",
+                        exc_info=True,
+                    )
+                _phase_b_emit_ag_outcome_record(ag, "skipped_dead_on_arrival")
+                # Cycle 9 T1: selective drain — keep buffered AGs whose
+                # affected_questions are disjoint from the failed AG's.
+                _survivors, _dropped_buffered = _drain_buffered_action_groups(
+                    failed_ag=ag,
+                    buffered=pending_action_groups,
+                    reason="dead_on_arrival",
+                )
+                pending_action_groups = _survivors
+                if not pending_action_groups:
+                    pending_strategy = None
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="no_pending_ags_first_pass",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=no_pending_ags_first_pass skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            # T3.3: shadow apply. When enabled, the intent is to clone the
+            # space, apply patches to the clone, eval, and promote only on
+            # pass. The Genie SDK fork/promote primitives aren't wired yet,
+            # so for now we log the intent and fall back to in-place apply;
+            # the rollback path below still covers us. Leaving this here so
+            # operators can see the flag is respected by code and we have a
+            # single commit to wire the actual fork when available.
+            if SHADOW_APPLY:
+                logger.warning(
+                    "[%s] T3.3 SHADOW_APPLY=True but the Genie fork/promote "
+                    "API is not yet integrated in this harness; falling back "
+                    "to in-place apply with rollback-on-regression.",
+                    ag_id,
+                )
+                print(
+                    _section(f"[{ag_id}] SHADOW_APPLY: fallback", "-") + "\n"
+                    + _kv(
+                        "Reason",
+                        "Genie space-clone API not yet wired — rollback path "
+                        "still covers content regressions.",
+                    ) + "\n"
+                    + _bar("-")
+                )
+
+            # Task 2 — capture the live parsed Genie config immediately before
+            # patch application. This in-memory snapshot becomes the source of
+            # truth for both ``rollback`` and ``verify_rollback_restored`` so
+            # the rollback contract does not depend on Delta state that may be
+            # missing or stale.
+            from genie_space_optimizer.optimization.snapshot_contract import (
+                capture_pre_ag_snapshot,
+            )
+
+            _pre_ag_snapshot_capture = capture_pre_ag_snapshot(
+                w=w,
+                space_id=space_id,
+                ag_id=ag_id,
+            )
+            if not _pre_ag_snapshot_capture.get("captured"):
+                reason = _pre_ag_snapshot_capture.get("reason", "pre_ag_snapshot_failed")
+                logger.error(
+                    "AG %s: could not capture pre-AG snapshot before apply "
+                    "(reason=%s). Skipping patch application.",
+                    ag_id,
+                    reason,
+                )
+                print(
+                    _section(f"[{ag_id}] SKIP APPLY: PRE-AG SNAPSHOT FAILED", "!") + "\n"
+                    + _kv("Reason", reason) + "\n"
+                    + _bar("!")
+                )
+                # Phase B observability follow-up — record the AG outcome so
+                # the ACCEPTANCE_DECIDED producer (and the cross-checker
+                # invariant "every STRATEGIST_AG_EMITTED has a matching
+                # ACCEPTANCE_DECIDED") can see this terminal path. Before
+                # this fix, the AG was silently discarded with no
+                # ag_outcomes write, leaving the trace blind to
+                # snapshot-capture failures.
+                try:
+                    _current_iter_inputs["ag_outcomes"][str(ag_id)] = (
+                        "skipped_pre_ag_snapshot_failed"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase B: ag_outcome capture (pre_ag_snapshot_failed) "
+                        "failed (non-fatal)",
+                        exc_info=True,
+                    )
+                _phase_b_emit_ag_outcome_record(ag, "skipped_pre_ag_snapshot_failed")
+                # Cycle 9 T2: selective drain — keep buffered AGs whose
+                # affected_questions are disjoint from the failed AG's.
+                _survivors, _dropped_buffered = _drain_buffered_action_groups(
+                    failed_ag=ag,
+                    buffered=pending_action_groups,
+                    reason="pre_ag_snapshot_failed",
+                )
+                pending_action_groups = _survivors
+                if not pending_action_groups:
+                    pending_strategy = None
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="no_pending_ags_second_pass",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=no_pending_ags_second_pass skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            metadata_snapshot = _pre_ag_snapshot_capture["snapshot"]
+            logger.info(
+                "pre-AG snapshot captured for AG %s digest=%s",
+                ag_id,
+                _pre_ag_snapshot_capture.get("digest", ""),
+            )
+
+            apply_log = apply_patch_set(
+                w, space_id, patches, metadata_snapshot, apply_mode=apply_mode,
+            )
+
+            # Cycle 5 T1 — productive-iteration accounting. Accumulate the
+            # number of applied patches across ALL AGs in this iteration so
+            # the end-of-iteration budget decision can tell a productive
+            # iteration (≥1 applied) from a deterministic no-op (0 applied
+            # AND a typed P4 reason in the iteration's decision records).
+            try:
+                _iter_applied_count += len(apply_log.get("applied") or [])
+            except Exception:
+                logger.debug(
+                    "Cycle 5 T1: _iter_applied_count update failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Task 4 (lever-loop-v2) — per-AG patch-survival ledger. Print a
+            # cluster-coverage table across the proposed → normalized →
+            # applyable → capped → applied gates so operators can see
+            # exactly where each cluster's patches were dropped.
+            try:
+                from genie_space_optimizer.optimization.patch_survival import (
+                    PatchSurvivalSnapshot,
+                    build_patch_survival_table,
+                )
+
+                _survival_applied = [
+                    entry.get("patch", {})
+                    for entry in (apply_log.get("applied") or [])
+                    if isinstance(entry, dict) and entry.get("patch")
+                ]
+                _survival_snapshot = PatchSurvivalSnapshot(
+                    ag_id=str(ag_id),
+                    proposed=list(locals().get("_survival_proposed", []) or []),
+                    normalized=list(locals().get("_survival_normalized", []) or []),
+                    applyable=list(locals().get("_survival_applyable", []) or []),
+                    capped=list(locals().get("_survival_capped", []) or []),
+                    applied=_survival_applied,
+                )
+                _survival_table = build_patch_survival_table(_survival_snapshot)
+                if _survival_table:
+                    print(_survival_table)
+            except Exception:
+                logger.debug("Patch-survival ledger failed (non-fatal)", exc_info=True)
+
+            # Task 4 — surface cap-selected vs applier-applied disagreement at
+            # WARN level so silent applier drops (an AG2 cap selecting
+            # ``['P002#3','P004#1','P005#1']`` but only applying the
+            # off-causal filter on a ``mv_<domain>_dim_<entity>`` patch)
+            # cannot recur unnoticed.
+            try:
+                from genie_space_optimizer.optimization.applier_audit import (
+                    diff_selected_vs_applied,
+                )
+
+                _cap_selected_ids = [
+                    str(p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id") or "")
+                    for p in (patches or [])
+                    if (p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id"))
+                ]
+                _applier_applied_ids = [
+                    str(
+                        entry.get("patch", {}).get("expanded_patch_id")
+                        or entry.get("patch", {}).get("id")
+                        or entry.get("patch", {}).get("proposal_id")
+                        or ""
+                    )
+                    for entry in (apply_log.get("applied") or [])
+                    if entry.get("patch")
+                ]
+                _recon = diff_selected_vs_applied(
+                    selected_ids=_cap_selected_ids,
+                    applied_ids=_applier_applied_ids,
+                )
+                print(
+                    _section("CAP-VS-APPLIED RECONCILIATION", "-") + "\n"
+                    + _kv("Cap selected", ", ".join(_cap_selected_ids)[:200] or "(none)") + "\n"
+                    + _kv(
+                        "Applier applied",
+                        ", ".join(_applier_applied_ids)[:200] or "(none)",
+                    ) + "\n"
+                    + _kv(
+                        "Selected but not applied",
+                        ", ".join(_recon.selected_but_not_applied)[:200] or "(none)",
+                    ) + "\n"
+                    + _kv(
+                        "Applied but not selected",
+                        ", ".join(_recon.applied_but_not_selected)[:200] or "(none)",
+                    ) + "\n"
+                    + _bar("-")
+                )
+                if not _recon.in_agreement:
+                    logger.warning(
+                        "CAP-VS-APPLIED RECONCILIATION: selected_but_not_applied=%s "
+                        "applied_but_not_selected=%s",
+                        _recon.selected_but_not_applied,
+                        _recon.applied_but_not_selected,
+                    )
+            except Exception:
+                logger.debug(
+                    "Cap-vs-applied reconciliation failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            _apply_skip = _should_skip_eval_for_patch_bundle(
+                patches=patches,
+                apply_log=apply_log,
+                stage="post_apply",
+            )
+            if _apply_skip.skip:
+                if _apply_skip.reason_code == "no_applied_patches":
+                    _dead_on_arrival_ag_ids.add(str(ag_id))
+                    # Cycle 9 T4: never cache an empty signature ``()`` as
+                    # "already tried" — it represents "every patch was
+                    # dropped before the applier" (e.g. blast-radius gate),
+                    # which short-circuits subsequent strategist attempts.
+                    _record_dead_on_arrival_signature(
+                        seen=_dead_on_arrival_patch_signatures,
+                        signature=_selected_patch_signature,
+                        reason=_apply_skip.reason_code,
+                    )
+                    # Cycle 2 Task 3: also record the selected-proposal-ID
+                    # signature (informative even when blast-radius drops
+                    # every patch) so a future iteration can detect that
+                    # the same AG is being retried with the same proposals
+                    # and avoid wasting iteration budget.
+                    _doa_selected_proposal_signature = (
+                        _compute_selected_proposal_signature(
+                            (ag.get("proposals") or [])
+                            if isinstance(ag, dict) else []
+                        )
+                    )
+                    _record_doa_selected_signature(
+                        seen=_doa_selected_proposal_signatures,
+                        ag_id=str(ag_id),
+                        signature=_doa_selected_proposal_signature,
+                    )
+                    # Cycle 9 T7: emit one PATCH_SKIPPED DecisionRecord per
+                    # proposal_id in the dead-on-arrival signature. ACCEPTANCE_DECIDED
+                    # already covers the AG-level signal; this gives
+                    # finer-grained per-patch attribution (no-op patch vs
+                    # applier-rejected patch).
+                    try:
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            dead_on_arrival_decision_records,
+                            is_strict_mode,
+                        )
+                        _doa_root_cause = ""
+                        _doa_rca_id = ""
+                        for _cid in (ag.get("source_cluster_ids") or []):
+                            _doa_cluster = (
+                                _iter_source_clusters_by_id.get(str(_cid)) or {}
+                            )
+                            if not _doa_root_cause:
+                                _doa_root_cause = str(
+                                    _doa_cluster.get("root_cause") or ""
+                                )
+                            if not _doa_rca_id:
+                                _doa_rca_id = str(
+                                    _iter_rca_id_by_cluster.get(str(_cid)) or ""
+                                )
+                            if _doa_root_cause and _doa_rca_id:
+                                break
+                        _doa_target_qids = [
+                            str(q)
+                            for q in (ag.get("affected_questions") or [])
+                            if q
+                        ]
+                        _doa_records = dead_on_arrival_decision_records(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            ag_id=str(ag_id),
+                            rca_id=_doa_rca_id,
+                            root_cause=_doa_root_cause,
+                            target_qids=_doa_target_qids,
+                            signature=tuple(_selected_patch_signature or ()),
+                            reason=str(_apply_skip.reason_code or ""),
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).extend([r.to_dict() for r in _doa_records])
+                    except Exception as _dead_on_arrival_exc:
+                        try:
+                            from genie_space_optimizer.common.config import (
+                                phase_b_producer_typed_exceptions_enabled as _typed_on,
+                            )
+                            if _typed_on():
+                                from genie_space_optimizer.optimization.decision_emitters import (
+                                    producer_exception_record as _producer_exception_record,
+                                )
+                                _pe_rec = _producer_exception_record(
+                                    run_id=run_id,
+                                    iteration=iteration_counter,
+                                    producer="dead_on_arrival",
+                                    ag_id=str((ag or {}).get("id") or ""),
+                                    exception=_dead_on_arrival_exc,
+                                )
+                                _current_iter_inputs.setdefault(
+                                    "decision_records", []
+                                ).append(_pe_rec.to_dict())
+                        except Exception:
+                            logger.debug(
+                                "Phase B: producer_exception_record emission failed for dead_on_arrival",
+                                exc_info=True,
+                            )
+                        _phase_b_producer_exceptions["dead_on_arrival"] = (
+                            _phase_b_producer_exceptions.get(
+                                "dead_on_arrival", 0
+                            )
+                            + 1
+                        )
+                        logger.debug(
+                            "dead-on-arrival DecisionRecord emission failed "
+                            "(non-fatal)",
+                            exc_info=True,
+                        )
+                        if is_strict_mode():
+                            raise
+                    logger.warning(
+                        "AG %s deterministic_no_applied_patches: selected patch "
+                        "signature=%s recovery_reason=all_selected_patches_dropped_by_applier",
+                        ag_id,
+                        _selected_patch_signature,
+                    )
+                    print(
+                        _section(f"[{ag_id}] DETERMINISTIC REJECTION: NO APPLIED PATCHES", "!") + "\n"
+                        + _kv("Reason", "all_selected_patches_dropped_by_applier") + "\n"
+                        + _kv("Selected patch signature", _selected_patch_signature) + "\n"
+                        + _kv("Action", "discard buffered AG and force strategist recovery") + "\n"
+                        + _bar("!")
+                    )
+                    # Cycle 9 T3: selective drain — keep buffered AGs whose
+                    # affected_questions are disjoint from the failed AG's.
+                    _survivors, _dropped_buffered = _drain_buffered_action_groups(
+                        failed_ag=ag,
+                        buffered=pending_action_groups,
+                        reason="all_selected_patches_dropped_by_applier",
+                    )
+                    pending_action_groups = _survivors
+                    if not pending_action_groups:
+                        pending_strategy = None
+                logger.warning(
+                    "[%s] Skipping acceptance eval: %s",
+                    ag_id,
+                    _apply_skip.reason_detail,
+                )
+                print(
+                    _section(f"[{ag_id}] SKIP EVAL: NO APPLIED PATCHES", "!") + "\n"
+                    + _kv("Reason", _apply_skip.reason_detail) + "\n"
+                    + _bar("!")
+                )
+                try:
+                    from genie_space_optimizer.optimization.applier_audit import (
+                        applier_decision_counts,
+                    )
+
+                    _applier_decisions = apply_log.get("applier_decisions") or []
+                    _decision_counts = applier_decision_counts(_applier_decisions)
+                    if _decision_counts:
+                        print(
+                            _section(f"[{ag_id}] APPLIER DECISIONS", "-") + "\n"
+                            + "\n".join(
+                                f"|  {key}: {value}"
+                                for key, value in sorted(_decision_counts.items())
+                            ) + "\n"
+                            + _bar("-")
+                        )
+                    # Cycle 8 Bug 1 Phase 3a — persist applier-decision counts to
+                    # MLflow so future cycle intakes have queryable diagnostic
+                    # data. Without this, the only way to learn why an AG hit
+                    # ``skipped_no_applied_patches`` is to dig the per-AG span
+                    # out of MLflow's full trace tree, or hand-grep the cycle's
+                    # stderr. Best-effort wrapped.
+                    try:
+                        import mlflow as _mlflow_apl  # type: ignore[import-not-found]
+                        if _decision_counts and _mlflow_apl.active_run() is not None:
+                            _mlflow_apl.log_dict(
+                                {
+                                    "iteration": iteration_counter,
+                                    "ag_id": str(ag_id),
+                                    "decision_counts": dict(_decision_counts),
+                                    "reason_code": _apply_skip.reason_code,
+                                    "reason_detail": _apply_skip.reason_detail,
+                                },
+                                artifact_file=(
+                                    f"phase_a/applier_decisions/"
+                                    f"iter_{iteration_counter}_{ag_id}.json"
+                                ),
+                            )
+                            _mlflow_apl.set_tags({
+                                (
+                                    f"applier_decisions.iter_{iteration_counter}."
+                                    f"{ag_id}.dropped_count"
+                                ): str(sum(_decision_counts.values())),
+                            })
+                    except Exception:
+                        logger.debug(
+                            "Cycle 8 Bug 1 Phase 3a: MLflow applier-decisions "
+                            "persistence skipped (non-fatal)",
+                            exc_info=True,
+                        )
+                except Exception:
+                    logger.debug("Failed to print applier decision counts", exc_info=True)
+                write_stage(
+                    spark,
+                    run_id,
+                    f"AG_{ag_id}_NO_APPLIED_PATCHES",
+                    "SKIPPED",
+                    task_key="lever_loop",
+                    iteration=iteration_counter,
+                    detail={"reason_code": _apply_skip.reason_code},
+                    catalog=catalog,
+                    schema=schema,
+                )
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter,
+                    ag_id=ag_id,
+                    accepted=False,
+                    levers=[int(lk) for lk in lever_keys],
+                    target_objects=[],
+                    prev_scores=best_scores,
+                    new_scores=best_scores,
+                    rollback_reason=_apply_skip.reason_code,
+                    patches=patches,
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                    **_ag_identity_kwargs,
+                ))
+                # Phase A — Replay-fixture capture: like the dead-on-arrival
+                # branch above, the AG short-circuits before the gate and
+                # neither the rollback nor the accept paths fire. Stamp the
+                # outcome so the fixture surfaces "AG was attempted but the
+                # applier produced no applied entries".
+                try:
+                    _current_iter_inputs["ag_outcomes"][str(ag_id)] = (
+                        "skipped_no_applied_patches"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase A: ag_outcome capture (no_applied_patches) failed (non-fatal)",
+                        exc_info=True,
+                    )
+                _phase_b_emit_ag_outcome_record(ag, "skipped_no_applied_patches")
+                _render_current_journey()
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="skipped_no_applied_patches",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=skipped_no_applied_patches skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            _fallback_lever = int(lever_keys[0]) if lever_keys else 0
+            for idx, entry in enumerate(apply_log.get("applied", [])):
+                _patch_lever = int(entry.get("patch", {}).get("lever", _fallback_lever))
+                write_patch(
+                    spark, run_id, iteration_counter, _patch_lever, idx,
+                    _build_patch_record(entry, _patch_lever, apply_mode),
+                    catalog, schema,
+                )
+                # Task 13 — emit ``applied`` per applied patch.
+                # Track 3/E (Phase A burn-down) — splits into
+                # ``applied_targeted`` (qid was in the patch's
+                # target_qids) and ``applied_broad_ag_scope`` (qid was
+                # in the AG's affected_questions but not specifically
+                # targeted by this patch). Phase B's
+                # ``causal_patch_survival_pct`` consumes this distinction.
+                try:
+                    _ap = entry.get("patch", {}) or {}
+                    _ap_pid = str(
+                        _ap.get("proposal_id")
+                        or _ap.get("expanded_patch_id")
+                        or _ap.get("id")
+                        or ""
+                    )
+                    # Plan N1 Task 4 — parent for lane-key collapse.
+                    # Patches stamped by ``_stamp_expanded_patch_identity``
+                    # carry an explicit ``parent_proposal_id``; if absent,
+                    # fall back to ``source_proposal_id`` or the unqualified
+                    # id parsed out of the expanded form (``L1:P001#1`` or
+                    # ``P001#1``).
+                    _ap_parent_pid = str(
+                        _ap.get("parent_proposal_id")
+                        or _ap.get("source_proposal_id")
+                        or (
+                            _ap_pid.split(":", 1)[-1].split("#", 1)[0]
+                            if _ap_pid else ""
+                        )
+                    )
+                    _ap_target_qids = list(_ap.get("_grounding_target_qids") or [])
+                    if not _ap_target_qids:
+                        _ap_target_qids = list(_ap.get("target_qids") or [])
+                    _ap_target_qid_set = {str(q) for q in _ap_target_qids if q}
+
+                    _ap_ag_qids = {
+                        str(q)
+                        for q in (ag.get("affected_questions", []) or [])
+                        if str(q)
+                    }
+                    _ap_broad_qid_set = _ap_ag_qids - _ap_target_qid_set
+
+                    _ap_patch_type = str(
+                        _ap.get("patch_type") or _ap.get("type") or ""
+                    )
+
+                    if _ap_target_qid_set:
+                        _journey_emit(
+                            "applied_targeted",
+                            question_ids=sorted(_ap_target_qid_set),
+                            proposal_id=_ap_pid,
+                            parent_proposal_id=_ap_parent_pid,
+                            patch_type=_ap_patch_type,
+                        )
+                    if _ap_broad_qid_set:
+                        _journey_emit(
+                            "applied_broad_ag_scope",
+                            question_ids=sorted(_ap_broad_qid_set),
+                            proposal_id=_ap_pid,
+                            parent_proposal_id=_ap_parent_pid,
+                            patch_type=_ap_patch_type,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Track 3/E: applied journey emit failed (non-fatal)",
+                        exc_info=True,
+                    )
+
+            # Phase F+H Commit A4: F7 application — post-stage observability
+            # with atomic dedup. apply_patch_set at harness.py:16187 STAYS
+            # inline; this stage call consumes the apply_log it produces and
+            # emits PATCH_APPLIED records via ctx.decision_emit per
+            # stages/application.py:159-171, replacing the inline
+            # _patch_applied_records producer (formerly at this site).
+            #
+            # Dedup is atomic with the stage insertion: the inline producer
+            # block (formerly Phase B delta Task 7 — emit PATCH_APPLIED
+            # records per applied entry) is removed; the stage call emits
+            # the same records via the same producer (decision_emitters.
+            # patch_applied_records) wrapped in StageContext.decision_emit
+            # which routes back to _current_iter_inputs["decision_records"].
+            # Without atomic dedup, both fire and break byte-stability.
+            #
+            # Verified against: stages/application.py:47-62 (Input dataclass),
+            # 137-176 (apply body — does NOT call apply_patch_set; emits
+            # PATCH_APPLIED via ctx.decision_emit at :170-171),
+            # 65-77 (AppliedPatchSet — fields applied + applied_signature).
+            try:
+                from genie_space_optimizer.optimization.stages import (
+                    StageContext as _StageCtx,
+                )
+                from genie_space_optimizer.optimization.stages import (
+                    application as _app_stage,
+                )
+
+                _cluster_root_cause_by_id = {
+                    str(_c.get("cluster_id") or ""): str(_c.get("root_cause") or "")
+                    for _c in (clusters or [])
+                    if _c.get("cluster_id")
+                }
+                _stage_ctx_application = _StageCtx(
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    space_id=str(space_id),
+                    domain=str(domain),
+                    catalog=str(catalog),
+                    schema=str(schema),
+                    apply_mode=str(apply_mode),
+                    journey_emit=_journey_emit,
+                    decision_emit=(
+                        lambda record:
+                            _current_iter_inputs.setdefault(
+                                "decision_records", []
+                            ).append(record.to_dict())
+                    ),
+                    mlflow_anchor_run_id=_phase_h_anchor_run_id,
+                    feature_flags={},
+                )
+                _app_inp = _app_stage.ApplicationInput(
+                    applied_entries_by_ag={
+                        str(ag_id): tuple(apply_log.get("applied", []) or [])
+                    },
+                    ags=tuple([ag] if isinstance(ag, dict) else []),
+                    rca_id_by_cluster=_iter_rca_id_by_cluster,
+                    cluster_root_cause_by_id=_cluster_root_cause_by_id,
+                )
+                # Phase F+H Commit B14: wrap F7 with stage_io_capture decorator.
+                # Replay-byte-stable because wrap_with_io_capture returns out
+                # unchanged and the MLflow log_text calls are no-ops while
+                # _stage_ctx_application.mlflow_anchor_run_id is None (Phase C
+                # Commit 17 wires the anchor).
+                from genie_space_optimizer.optimization.stage_io_capture import (
+                    wrap_with_io_capture as _wrap_with_io_capture_a4,
+                )
+                _app_wrapped = _wrap_with_io_capture_a4(
+                    execute=_app_stage.execute,
+                    stage_key="applied_patches",
+                )
+                _applied_set = _app_wrapped(_stage_ctx_application, _app_inp)
+                # _applied_set.applied is tuple[AppliedPatch, ...]; available
+                # for downstream stages (F8 acceptance, F9 learning) when
+                # those wire-ups land.
+            except Exception as _patch_applied_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="patch_applied",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_patch_applied_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for patch_applied",
+                        exc_info=True,
+                    )
+                _iter_producer_exceptions["patch_applied"] += 1
+                _phase_b_producer_exceptions["patch_applied"] = (
+                    _phase_b_producer_exceptions.get("patch_applied", 0) + 1
+                )
+                logger.debug(
+                    "Phase F+H A4: patch_applied stage call failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            _queued = apply_log.get("queued_high", [])
+            if _queued:
+                from genie_space_optimizer.optimization.state import write_queued_patch
+                from genie_space_optimizer.optimization.labeling import flag_for_human_review
+                for qentry in _queued:
+                    _qpatch = qentry.get("patch", {})
+                    write_queued_patch(
+                        spark, run_id, iteration_counter,
+                        _qpatch.get("type", ""),
+                        _qpatch.get("target", ""),
+                        catalog, schema,
+                        confidence_tier="queued_high_risk",
+                    )
+                _queued_flag_items = [
+                    {
+                        "question_id": qentry.get("patch", {}).get("target", "unknown"),
+                        "question_text": "",
+                        "reason": (
+                            f"High-risk patch queued for review: "
+                            f"{qentry.get('patch', {}).get('type', '')} on "
+                            f"{qentry.get('patch', {}).get('target', '')}"
+                        ),
+                        "iterations_failed": 0,
+                        "patches_tried": qentry.get("patch", {}).get("type", ""),
+                    }
+                    for qentry in _queued
+                ]
+                flag_for_human_review(spark, run_id, catalog, schema, domain, _queued_flag_items)
+                _qh_lines = [_section(f"[{ag_id}] Queued {len(_queued)} High-Risk Patch(es) for Human Review", "!")]
+                for qi, qe in enumerate(_queued, 1):
+                    _qp = qe.get("patch", {})
+                    _qh_lines.append(
+                        _kv(f"  [{qi}]", f"{_qp.get('type', '?')} \u2192 {_qp.get('target', '?')}")
+                    )
+                _qh_lines.append(_bar("!"))
+                print("\n".join(_qh_lines))
+
+            if not apply_log.get("patch_deployed", False) and apply_log.get("applied"):
+                _pe = apply_log.get("patch_error", "unknown")
+                from genie_space_optimizer.optimization.rollback_class import (
+                    RollbackClass,
+                    classify_rollback_reason,
+                )
+                _pe_class = classify_rollback_reason(f"patch_deploy_failed: {_pe}")
+                print(
+                    _section(f"[{ag_id}] PATCH DEPLOY FAILED", "!") + "\n"
+                    + _kv("Error", str(_pe)[:300]) + "\n"
+                    + _kv("Rollback class", _pe_class.value) + "\n"
+                    + _bar("!")
+                )
+                write_stage(
+                    spark, run_id, f"AG_{ag_id}_PATCH_FAILED", "ERROR",
+                    task_key="lever_loop", iteration=iteration_counter,
+                    error_message=str(_pe)[:500],
+                    detail={"rollback_class": _pe_class.value},
+                    catalog=catalog, schema=schema,
+                )
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                    levers=[int(lk) for lk in lever_keys], target_objects=[],
+                    prev_scores=best_scores, new_scores=best_scores,
+                    rollback_reason=f"patch_deploy_failed: {str(_pe)[:100]}",
+                    patches=patches,
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                    **_ag_identity_kwargs,
+                ))
+                if _pe_class == RollbackClass.SCHEMA_FAILURE:
+                    print(
+                        _section("LEVER LOOP — SCHEMA-FATAL PATCH ERROR", "!") + "\n"
+                        + _kv("Error", str(_pe)[:300]) + "\n"
+                        + _kv("Rollback class", RollbackClass.SCHEMA_FAILURE.value) + "\n"
+                        + _kv("Reason", "Genie API rejected the PATCH payload structure; retrying would deterministically fail.") + "\n"
+                        + _bar("!")
+                    )
+                    write_stage(
+                        spark, run_id, "LEVER_LOOP_SCHEMA_FATAL", "ERROR",
+                        task_key="lever_loop", iteration=iteration_counter,
+                        error_message=str(_pe)[:500],
+                        detail={"rollback_class": RollbackClass.SCHEMA_FAILURE.value},
+                        catalog=catalog, schema=schema,
+                    )
+                    break
+                # Phase C3: INFRA_FAILURE retry budget. Unlike CONTENT_REGRESSION
+                # rollbacks, infra failures don't tell us anything about the
+                # strategy's quality. We don't want them to count against
+                # ``_diminishing_returns`` or the content rollback counter,
+                # but an unbounded loop of infra flakes would spin forever —
+                # hence the separate budget. Exit cleanly when the budget is
+                # exhausted with a dedicated terminal reason.
+                if _pe_class == RollbackClass.INFRA_FAILURE:
+                    _consecutive_infra = 0
+                    for _rb_entry in reversed(reflection_buffer):
+                        if _rb_entry.get("rollback_class") == RollbackClass.INFRA_FAILURE.value:
+                            _consecutive_infra += 1
+                        else:
+                            break
+                    if _consecutive_infra >= INFRA_RETRY_BUDGET:
+                        print(
+                            _section("LEVER LOOP — INFRA RETRY BUDGET EXHAUSTED", "!") + "\n"
+                            + _kv("Consecutive infra rollbacks", _consecutive_infra) + "\n"
+                            + _kv("Budget", INFRA_RETRY_BUDGET) + "\n"
+                            + _kv("Last error", str(_pe)[:300]) + "\n"
+                            + _bar("!")
+                        )
+                        write_stage(
+                            spark, run_id, "LEVER_LOOP_INFRA_EXHAUSTED", "ERROR",
+                            task_key="lever_loop", iteration=iteration_counter,
+                            error_message=str(_pe)[:500],
+                            detail={
+                                "consecutive_infra": _consecutive_infra,
+                                "budget": INFRA_RETRY_BUDGET,
+                            },
+                            catalog=catalog, schema=schema,
+                        )
+                        break
+                _render_current_journey()
+                try:
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
+                    )
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="applier_failed",
+                        run_id=run_id,
+                        iter_producer_exceptions=_iter_producer_exceptions,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase H finalise on exit_path=applier_failed skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                continue
+
+            # ── Applied Patches Detail ───────────────────────────────────
+            _applied = apply_log.get("applied", [])
+            if _applied:
+                _ap_lines = [_section(f"[{ag_id}] Applied {len(_applied)} Patch(es)", "=")]
+                for ai, aentry in enumerate(_applied, 1):
+                    _ap = aentry.get("patch", {})
+                    _aa = aentry.get("action", {})
+                    _ap_lines.append(_fmt_patch(ai, _ap, _aa, aentry))
+                _ap_lines.append(_bar("="))
+                print("\n".join(_ap_lines))
+
+            _dropped = apply_log.get("dropped_patches", [])
+            if _dropped:
+                _dp_lines = [_section(f"[{ag_id}] Dropped {len(_dropped)} Join Spec Patch(es)", "!")]
+                for di, dp in enumerate(_dropped, 1):
+                    _dp_lines.append(
+                        f"|  [{di}] {dp.get('type', '?')}: "
+                        f"{dp.get('left_table', '?')} <-> {dp.get('right_table', '?')}"
+                    )
+                _dp_lines.append(
+                    "|  Reason: join spec PATCH failed; remaining patches deployed successfully"
+                )
+                _dp_lines.append(_bar("!"))
+                print("\n".join(_dp_lines))
+
+            # ── 3B.6: Three-gate eval ───────────────────────────────────
+            # Snapshot the carried baseline at the start of *this* iteration
+            # so the next iteration's drift diagnostic has something to
+            # compare against.
+            _baseline_at_start_of_this_iter = float(best_accuracy)
+            gate_result = _run_gate_checks(
+                spark=spark,
+                w=w,
+                run_id=run_id,
+                space_id=space_id,
+                exp_name=exp_name,
+                domain=domain,
+                iteration_counter=iteration_counter,
+                ag_id=ag_id,
+                benchmarks=benchmarks,
+                proposals=all_proposals,
+                patches=patches,
+                apply_log=apply_log,
+                clusters=clusters,
+                metadata_snapshot=metadata_snapshot,
+                predict_fn=predict_fn,
+                scorers=scorers,
+                prev_model_id=prev_model_id,
+                best_scores=best_scores,
+                best_accuracy=best_accuracy,
+                catalog=catalog,
+                schema=schema,
+                reference_sqls=reference_sqls,
+                noise_floor=noise_floor,
+                affected_question_ids=set(ag.get("affected_questions", [])),
+                lever_keys=lever_keys,
+                max_benchmark_count=max_benchmark_count,
+                prev_failure_qids=prev_failure_qids,
+                prev_iter_pre_accept_baseline=_prev_iter_pre_accept_baseline,
+                accepted_baseline_rows_for_control_plane=(
+                    _accepted_baseline_rows_for_control_plane
+                ),
+                phase_h_anchor_run_id=_phase_h_anchor_run_id,
+            )
+
+            # Phase A — Lossless contract: refresh the deterministic eval-result
+            # carrier IMMEDIATELY after the gate returns, BEFORE the accept/
+            # rollback branch below. The previous wiring only refreshed on the
+            # accept path (line ~15400 region), so a run where every iteration
+            # rolled back would leave the carrier empty for the entire run,
+            # producing empty `eval_rows` and `post_eval_passing_qids` in the
+            # replay fixture and starving the journey-contract validator of qids.
+            # The helper returns {} when neither full_result nor
+            # failed_eval_result is populated; in that case we deliberately keep
+            # the prior carrier value rather than clobbering with empty.
+            _gate_eval = _extract_eval_result_from_gate(gate_result)
+            if _gate_eval:
+                _latest_eval_result = _gate_eval
+                # Defensive backfill — populate the current iteration's snapshot
+                # from THIS iteration's gate result so iter 1 has real eval_rows
+                # even when the baseline seed at _run_lever_loop start silently
+                # failed. The iter-start snapshot block (around line ~11138)
+                # reads _latest_eval_result, which on iter 1 only has the
+                # baseline seed; if that seed is empty the iter-1 snapshot is
+                # empty too. This second write fixes that without depending on
+                # the seed.
+                try:
+                    _backfill_rows = _build_fixture_eval_rows(_gate_eval)
+                    if _backfill_rows and not _current_iter_inputs.get("eval_rows"):
+                        _current_iter_inputs["eval_rows"] = _backfill_rows
+                except Exception:
+                    logger.debug(
+                        "Phase A: eval_rows backfill from gate_result failed "
+                        "(non-fatal)",
+                        exc_info=True,
+                    )
+
+            # v2 Task 21 — Per-question regression rows with full attribution.
+            # The gate returns the verdict and suppressed-qid set; the lever
+            # loop owns persistence here because ``strategy`` (cluster
+            # provenance), ``all_proposals`` (proposal IDs by qid), and
+            # ``apply_log`` (which patches actually deployed) are all in
+            # scope at this level.
+            try:
+                _t4_verdict_for_persist = gate_result.get("_t4_verdict")
+                _t4_suppressed_for_persist = gate_result.get("_suppressed_qids") or set()
+                if _t4_verdict_for_persist is not None:
+                    from genie_space_optimizer.optimization.per_question_regression import (
+                        build_question_regression_rows,
+                    )
+                    _cluster_ids_by_qid: dict[str, list[str]] = {}
+                    for _c in (strategy.get("_source_clusters") or []) if strategy else []:
+                        _cid = str(_c.get("cluster_id") or "").strip()
+                        if not _cid:
+                            continue
+                        for _q in _c.get("question_ids") or []:
+                            _cluster_ids_by_qid.setdefault(str(_q), []).append(_cid)
+                    _proposal_ids_by_qid: dict[str, list[str]] = {}
+                    for _p in (all_proposals or []):
+                        _pid = str(_p.get("proposal_id") or _p.get("id") or "").strip()
+                        if not _pid:
+                            continue
+                        for _q in _p.get("target_qids") or []:
+                            _proposal_ids_by_qid.setdefault(str(_q), []).append(_pid)
+                    _applied_patch_entries = apply_log.get("applied", []) or []
+                    _applied_patch_ids: list[str] = []
+                    for _entry in _applied_patch_entries:
+                        _ap = _entry.get("patch", {}) or {}
+                        _ap_pid = str(
+                            _ap.get("proposal_id")
+                            or _ap.get("expanded_patch_id")
+                            or _ap.get("id")
+                            or ""
+                        )
+                        if _ap_pid:
+                            _applied_patch_ids.append(_ap_pid)
+                    _t4_rows = build_question_regression_rows(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        ag_id=ag_id,
+                        verdict=_t4_verdict_for_persist,
+                        suppressed_qids=_t4_suppressed_for_persist,
+                        cluster_ids_by_qid=_cluster_ids_by_qid,
+                        proposal_ids_by_qid=_proposal_ids_by_qid,
+                        applied_patch_ids=_applied_patch_ids,
+                    )
+                    if _t4_rows:
+                        from genie_space_optimizer.optimization.state import (
+                            write_question_regressions,
+                        )
+                        write_question_regressions(
+                            spark, _t4_rows, catalog=catalog, schema=schema,
+                        )
+            except Exception:
+                logger.debug(
+                    "Failed to persist per-question regression rows", exc_info=True,
+                )
+
+            # After the gate finishes, this iteration's pre-acceptance
+            # baseline becomes the reference for the next iteration's
+            # drift diagnostic.
+            _prev_iter_pre_accept_baseline = _baseline_at_start_of_this_iter
+
+            # Phase F+H A5 (v2.1): F8 acceptance — post-stage observability
+            # with SELECTIVE atomic dedup at the 2 post-gate callsites + the
+            # post-eval block. The closure _phase_b_emit_ag_outcome_record
+            # STAYS inline because its 3 pre-gate callsites
+            # ("skipped_dead_on_arrival", "skipped_pre_ag_snapshot_failed",
+            # "skipped_no_applied_patches") are pre-gate filtering paths that
+            # bypass decide_control_plane_acceptance entirely — F8.decide()
+            # cannot reproduce them.
+            #
+            # decide_control_plane_acceptance is called once per AG INSIDE
+            # _run_gate_checks (verified PURE — zero mlflow./spark./global
+            # hits in control_plane.py). F8.decide() re-calls the same gate
+            # per AG with the same inputs, derives the same reason_code, and
+            # emits ACCEPTANCE_DECIDED + QID_RESOLUTION via stages/
+            # acceptance.py:decide.
+            #
+            # Why this anchor (best_accuracy drift trap):
+            # - At this point best_accuracy is still the pre-acceptance
+            #   baseline that _run_gate_checks consumed; best_accuracy is
+            #   only mutated later inside the accept branch.
+            # - AGs that hit the 3 pre-gate filters have already `continue`'d.
+            #   The in-scope `ag` is the SURVIVOR.
+            # - inp.ags=(ag,) captures the single-AG slate exactly (one AG
+            #   per outer iteration per the strategist invariant).
+            #
+            # Replaces:
+            # - 2 post-gate callsites further below: rolled_back (inside
+            #   the gate-failed branch) and accepted (after the accept
+            #   branch's _outcome_for_journey computation).
+            # - _post_eval_resolution_records block at iteration-end.
+            # Does NOT replace:
+            # - closure _phase_b_emit_ag_outcome_record (definition + 3
+            #   pre-gate callsites STAY inline).
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    is_strict_mode as _phase_b_strict_mode,
+                )
+                from genie_space_optimizer.optimization.stages import (
+                    StageContext as _StageCtx,
+                )
+                from genie_space_optimizer.optimization.stages import (
+                    acceptance as _accept_stage,
+                )
+
+                _stage_ctx_a5 = _StageCtx(
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    space_id=str(space_id),
+                    domain=str(domain),
+                    catalog=str(catalog),
+                    schema=str(schema),
+                    apply_mode=str(apply_mode),
+                    journey_emit=_journey_emit,
+                    decision_emit=_decision_emit,
+                    mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
+                    feature_flags={},
+                )
+
+                # Group apply_log entries by AG. Always source from apply_log
+                # (no _applied_set check) — apply_log is the iteration-local
+                # bound earlier in this iteration; _applied_set may not be
+                # bound if A4 errored upstream.
+                _accept_applied_by_ag: dict[str, list[dict]] = {}
+                for _entry in (apply_log.get("applied") or []):
+                    _patch = _entry.get("patch") or {}
+                    _entry_ag = str(_patch.get("ag_id") or "")
+                    if _entry_ag:
+                        _accept_applied_by_ag.setdefault(_entry_ag, []).append(
+                            _entry
+                        )
+                _accept_applied_by_ag_t: dict[str, tuple] = {
+                    k: tuple(v) for k, v in _accept_applied_by_ag.items()
+                }
+
+                # Source candidate_accuracy + candidate_pre_arbiter_accuracy
+                # from gate_result (the values _run_gate_checks consumed
+                # internally). Recomputing from full_result_1 is forbidden —
+                # it would diverge.
+                _accept_candidate_accuracy = float(
+                    gate_result.get("full_accuracy") or 0.0
+                )
+                _accept_candidate_pre_arbiter = _candidate_pre_arbiter_from_gate(
+                    gate_result
+                )
+                # post_rows: read from gate_result.full_result.rows (what the
+                # gate actually consumed). The previous fallback referenced
+                # ``full_result_1`` which is only assigned in the eval helper's
+                # scope and would NameError here whenever
+                # ``gate_result.full_result.rows`` is empty. We drop the
+                # impossible fallback (mirrors the safe ``or []`` pattern at
+                # the accepted-baseline write site below).
+                _accept_gate_full_result = (
+                    gate_result.get("full_result") or {}
+                )
+                _accept_post_rows = (
+                    _accept_gate_full_result.get("rows")
+                    or []
+                )
+
+                try:
+                    _accept_inp = _accept_stage.AcceptanceInput(
+                        applied_entries_by_ag=_accept_applied_by_ag_t,
+                        ags=(ag,),  # single-AG slate
+                        baseline_accuracy=float(best_accuracy),
+                        candidate_accuracy=_accept_candidate_accuracy,
+                        baseline_pre_arbiter_accuracy=float(_iter_best_pre_arbiter),
+                        candidate_pre_arbiter_accuracy=_accept_candidate_pre_arbiter,
+                        pre_rows=tuple(_baseline_rows_for_control_plane or []),
+                        post_rows=tuple(_accept_post_rows),
+                        protected_qids=(),
+                        min_gain_pp=float(MIN_POST_ARBITER_GAIN_PP),
+                        min_pre_arbiter_gain_pp=2.0,
+                        rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
+                        cluster_by_qid={},
+                    )
+                except Exception as _accept_inp_exc:
+                    from genie_space_optimizer.optimization.stage_io_capture import (
+                        record_capture_failure as _record_capture_failure,
+                        stage_artifact_paths as _stage_artifact_paths,
+                    )
+                    try:
+                        _paths = _stage_artifact_paths(
+                            int(iteration_counter), "acceptance_decision",
+                        )
+                        _record_capture_failure(
+                            stage_key="acceptance_decision",
+                            artifact_path=_paths["input"],
+                            error_class=type(_accept_inp_exc).__name__,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Phase F+H A5: record_capture_failure for "
+                            "AcceptanceInput build failed",
+                            exc_info=True,
+                        )
+                    raise
+                # Phase F+H Commit B15: wrap F8 with stage_io_capture
+                # decorator. Replay-byte-stable — wrap_with_io_capture
+                # returns the stage output unchanged; MLflow log_text
+                # calls are no-ops while mlflow_anchor_run_id is None
+                # (C17 wires the anchor on real runs).
+                from genie_space_optimizer.optimization.stage_io_capture import (
+                    wrap_with_io_capture as _wrap_with_io_capture_a5,
+                )
+                _accept_wrapped = _wrap_with_io_capture_a5(
+                    execute=_accept_stage.execute,
+                    stage_key="acceptance_decision",
+                )
+                _ag_outcome = _accept_wrapped(_stage_ctx_a5, _accept_inp)
+            except Exception as _accept_stage_exc:
                 try:
                     from genie_space_optimizer.common.config import (
                         phase_b_producer_typed_exceptions_enabled as _typed_on,
@@ -14320,6614 +20798,681 @@ def _run_lever_loop(
                             run_id=run_id,
                             iteration=iteration_counter,
                             producer="ag_outcome",
-                            ag_id=str((_ag_obj or {}).get("id") or ""),
-                            exception=_ag_outcome_exc,
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_accept_stage_exc,
                         )
                         _current_iter_inputs.setdefault(
                             "decision_records", []
                         ).append(_pe_rec.to_dict())
                 except Exception:
                     logger.debug(
-                        "Phase B: producer_exception_record emission failed",
+                        "Phase F+H A5: producer_exception_record emission failed",
                         exc_info=True,
                     )
-                _iter_producer_exceptions["ag_outcome"] += 1
+                _iter_producer_exceptions["ag_outcome"] = (
+                    _iter_producer_exceptions.get("ag_outcome", 0) + 1
+                )
                 _phase_b_producer_exceptions["ag_outcome"] = (
                     _phase_b_producer_exceptions.get("ag_outcome", 0) + 1
                 )
                 logger.debug(
-                    "Phase B: ag_outcome_decision_record failed (non-fatal)",
+                    "Phase F+H A5 v2.1: acceptance stage failed (non-fatal)",
                     exc_info=True,
                 )
-                if _phase_b_strict_mode_inner():
+                if _phase_b_strict_mode():
                     raise
 
-        # Phase B observability follow-up — emit EVAL_CLASSIFIED records
-        # (one per qid). Even when no patches reach the cap this
-        # iteration, this gives the analyzer 24+ records per iter so
-        # ``decision_records_total > 0`` and the trace is observable.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                eval_classification_records as _eval_classification_records,
-                is_strict_mode as _phase_b_strict_mode,
-            )
-
-            _eval_records = _eval_classification_records(
-                run_id=run_id,
-                iteration=iteration_counter,
-                eval_qids=_eval_qids_for_entry,
-                classification=_iter_classification,
-                cluster_by_qid=_iter_cluster_by_qid,
-            )
-            _current_iter_inputs.setdefault("decision_records", []).extend(
-                [r.to_dict() for r in _eval_records]
-            )
-        except Exception as _exc_eval:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="eval_classification",
-                        ag_id="",
-                        exception=_exc_eval,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for eval_classification",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["eval_classification"] += 1
-            _phase_b_producer_exceptions["eval_classification"] = (
-                _phase_b_producer_exceptions.get("eval_classification", 0) + 1
-            )
-            logger.debug(
-                "Phase B: eval_classification_records failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Phase B observability follow-up — emit CLUSTER_SELECTED
-        # records (one per hard cluster). Note: clusters list at this
-        # site is the hard-cluster list; soft clusters are captured
-        # separately via the journey ``soft_signal`` events.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                cluster_records as _cluster_records,
-            )
-
-            # Phase D.5 Task 5: capture cluster alternatives.
-            # ``clusters`` is the hard-only list at this site; without a
-            # local ``candidate_clusters`` collection, the fallback below
-            # produces empty alternatives (byte-stable). When a future
-            # cycle wires the candidate list (demoted + hard) into a
-            # local, pass it as ``candidate_clusters`` here.
-            _candidate_clusters_for_alts = (
-                _candidate_clusters_for_decision_trace
-                if "_candidate_clusters_for_decision_trace" in locals()
-                else (clusters or [])
-            )
-            _cluster_alts_by_id = _build_cluster_alternatives_by_id(
-                candidate_clusters=_candidate_clusters_for_alts,
-                promoted_cluster_ids=[
-                    str(c.get("cluster_id") or "")
-                    for c in (clusters or [])
-                ],
-            )
-            _hard_cluster_records = _cluster_records(
-                run_id=run_id,
-                iteration=iteration_counter,
-                clusters=clusters or [],
-                rca_id_by_cluster=_iter_rca_id_by_cluster,
-                cluster_alternatives_by_id=_cluster_alts_by_id,
-            )
-            _current_iter_inputs.setdefault("decision_records", []).extend(
-                [r.to_dict() for r in _hard_cluster_records]
-            )
-        except Exception as _cluster_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="cluster",
-                        ag_id="",
-                        exception=_cluster_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for cluster",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["cluster"] += 1
-            _phase_b_producer_exceptions["cluster"] = (
-                _phase_b_producer_exceptions.get("cluster", 0) + 1
-            )
-            logger.debug(
-                "Phase B: cluster_records failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Phase B delta Task 3 — emit RCA_FORMED records (one per
-        # cluster routed to an RCA card). Closes the gap between
-        # CLUSTER_SELECTED and STRATEGIST_AG_EMITTED in the decision
-        # trace.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                rca_formed_records as _rca_formed_records,
-            )
-
-            _rca_formed = _rca_formed_records(
-                run_id=run_id,
-                iteration=iteration_counter,
-                clusters=clusters or [],
-                rca_id_by_cluster=_iter_rca_id_by_cluster,
-            )
-            _current_iter_inputs.setdefault("decision_records", []).extend(
-                [r.to_dict() for r in _rca_formed]
-            )
-        except Exception as _rca_formed_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="rca_formed",
-                        ag_id="",
-                        exception=_rca_formed_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for rca_formed",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["rca_formed"] += 1
-            _phase_b_producer_exceptions["rca_formed"] = (
-                _phase_b_producer_exceptions.get("rca_formed", 0) + 1
-            )
-            logger.debug(
-                "Phase B: rca_formed_records failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Phase C Task 7 — emit RCA_FORMED+UNRESOLVED+RCA_UNGROUNDED
-        # for clusters with hard failures but no matching RCA finding.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                unresolved_rca_records as _unresolved_rca_records,
-            )
-
-            _unresolved_records = _unresolved_rca_records(
-                run_id=run_id,
-                iteration=iteration_counter,
-                clusters=clusters or [],
-                rca_id_by_cluster=_iter_rca_id_by_cluster,
-            )
-            _current_iter_inputs.setdefault("decision_records", []).extend(
-                [r.to_dict() for r in _unresolved_records]
-            )
-        except Exception as _unresolved_rca_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="unresolved_rca",
-                        ag_id="",
-                        exception=_unresolved_rca_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for unresolved_rca",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["unresolved_rca"] = (
-                _phase_b_producer_exceptions.get("unresolved_rca", 0) + 1
-            )
-            logger.debug(
-                "Phase C: unresolved_rca_records failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Phase A — populate replay-fixture iteration snapshot fields
-        # eval_rows / clusters / soft_clusters from the analysis result.
-        try:
-            _fr = _latest_eval_result or {}
-            _scores = _fr.get("scores") or {}
-            _arbiter_map = _fr.get("arbiter_verdicts") or {}
-            _failure_set = {str(q) for q in (_fr.get("failure_question_ids") or [])}
-            _fixture_eval_rows: list[dict] = []
-            for _qid in (_eval_qids_for_entry or []):
-                _qstr = str(_qid)
-                _correctness: str
-                if isinstance(_scores, dict) and _qstr in _scores:
-                    _v = _scores[_qstr]
-                    _correctness = "yes" if str(_v).lower() in ("yes", "true", "1", "pass") else "no"
-                else:
-                    _correctness = "no" if _qstr in _failure_set else "yes"
-                _row: dict = {"question_id": _qstr, "result_correctness": _correctness}
-                if isinstance(_arbiter_map, dict) and _qstr in _arbiter_map:
-                    _row["arbiter"] = str(_arbiter_map[_qstr])
-                _fixture_eval_rows.append(_row)
-            _current_iter_inputs["eval_rows"] = _fixture_eval_rows
-            _current_iter_inputs["clusters"] = [
-                {
-                    "cluster_id": str(c.get("cluster_id") or ""),
-                    "root_cause": str(c.get("root_cause") or ""),
-                    "question_ids": [str(q) for q in (c.get("question_ids") or []) if q],
-                }
-                for c in (clusters or [])
+            # ── 3B.7: Accept or rollback ────────────────────────────────
+            _target_objects = [
+                p.get("target_object", "") for p in patches if p.get("target_object")
             ]
-            _current_iter_inputs["soft_clusters"] = [
-                {
-                    "cluster_id": str(c.get("cluster_id") or ""),
-                    "root_cause": str(c.get("root_cause") or ""),
-                    "question_ids": [str(q) for q in (c.get("question_ids") or []) if q],
-                }
-                for c in (soft_signal_clusters or [])
-            ]
-        except Exception:
-            logger.debug(
-                "Phase A: replay-fixture iteration capture failed (non-fatal)",
-                exc_info=True,
-            )
 
-        # Task 16 — scale max_iterations by initial hard cluster count.
-        # Computed once on the first iteration (when ``clusters`` first
-        # binds) and held for the rest of the run.
-        if _iter_num == 1:
-            _scaled_max_iterations = compute_iteration_budget(
-                hard_cluster_count=len(clusters or []),
-                requested_max_iterations=max_iterations or MAX_ITERATIONS,
-            )
-            if _scaled_max_iterations != max_iterations:
-                logger.info(
-                    "Iteration budget set to %d (hard_clusters=%d, requested=%d)",
-                    _scaled_max_iterations,
-                    len(clusters or []),
-                    int(max_iterations or MAX_ITERATIONS),
-                )
-            else:
-                logger.info(
-                    "Iteration budget set to %d (hard_clusters=%d)",
-                    _scaled_max_iterations,
-                    len(clusters or []),
-                )
-            max_iterations = _scaled_max_iterations
-
-        # Task 13 — emit ``clustered`` events per qid in each hard cluster
-        # and ``soft_signal`` events for soft clusters.
-        # Plan N1 Task 2 — delegate to ``emit_cluster_membership_events``
-        # so a qid that appears in multiple clusters produces exactly
-        # one event per stage. Multi-cluster membership is preserved on
-        # ``extra.additional_cluster_ids``. Closes the trunk-repeat
-        # ``soft_signal -> soft_signal`` defect on 2afb0be2 retry
-        # attempt 993610879088298.
-        try:
-            from genie_space_optimizer.optimization.question_journey import (
-                emit_cluster_membership_events,
-            )
-            emit_cluster_membership_events(
-                journey_emit=_journey_emit,
-                hard_clusters=list(clusters or []),
-                soft_clusters=list(soft_signal_clusters or []),
-            )
-        except Exception:
-            logger.debug(
-                "Task 13: cluster journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-        metadata_snapshot["_rca_ledger"] = rca_ledger
-        try:
-            from genie_space_optimizer.optimization.rca import (
-                themes_for_strategy_context,
-            )
-
-            metadata_snapshot["_rca_themes"] = themes_for_strategy_context(
-                list(rca_ledger.get("themes") or []),
-                enable_selection=ENABLE_RCA_THEME_SELECTION,
-                max_themes=RCA_MAX_THEMES_PER_ITERATION,
-                max_patches=RCA_MAX_THEME_PATCHES_PER_ITERATION,
-            )
-        except Exception:
-            logger.debug(
-                "RCA theme selection failed; falling back to all themes",
-                exc_info=True,
-            )
-            metadata_snapshot["_rca_themes"] = rca_ledger.get("themes") or []
-        metadata_snapshot["_rca_theme_conflicts"] = (
-            rca_ledger.get("conflicts") or []
-        )
-
-        try:
-            from genie_space_optimizer.optimization.rca_execution import (
-                build_rca_execution_plans,
-            )
-
-            metadata_snapshot["_rca_execution_plans"] = build_rca_execution_plans(
-                metadata_snapshot.get("_rca_themes") or []
-            )
-        except Exception:
-            logger.debug(
-                "RCA execution plan construction failed; continuing without forced RCA levers",
-                exc_info=True,
-            )
-            metadata_snapshot["_rca_execution_plans"] = []
-
-        try:
-            from genie_space_optimizer.optimization.rca_terminal import (
-                classify_terminal_state,
-            )
-
-            _terminal_decision = classify_terminal_state(
-                post_arbiter_accuracy=float(best_accuracy),
-                max_iterations=int(max_iterations),
-                iteration_counter=int(iteration_counter),
-                actionable_plan_count=len(
-                    metadata_snapshot.get("_rca_execution_plans") or []
-                ),
-                repeated_failure_count=sum(
-                    1 for r in reflection_buffer
-                    if not r.get("accepted")
-                ),
-                judge_failure_count=sum(
-                    1 for r in reflection_buffer
-                    if r.get("rollback_reason") == "judge_unreliable"
-                ),
-                benchmark_issue_count=sum(
-                    1 for r in reflection_buffer
-                    if r.get("rollback_reason") == "benchmark_broken"
-                ),
-                unpatchable_count=sum(
-                    1 for r in reflection_buffer
-                    if r.get("rollback_reason") == "unpatchable_with_six_levers"
-                ),
-            )
-            metadata_snapshot["_rca_terminal_state"] = {
-                "status": _terminal_decision.status.value,
-                "should_continue": _terminal_decision.should_continue,
-                "reason": _terminal_decision.reason,
-            }
-        except Exception:
-            logger.debug("RCA terminal-state classification failed", exc_info=True)
-
-        try:
-            write_asi_results(spark, run_id, iteration_counter - 1, _analysis["asi_rows"], catalog, schema, mlflow_run_id=_last_full_mlflow_run_id)
-        except Exception:
-            logger.debug("Failed to write ASI results", exc_info=True)
-        try:
-            write_provenance(spark, run_id, iteration_counter - 1, 0, _analysis["prov_rows"], catalog, schema)
-        except Exception:
-            logger.debug("Failed to write provenance rows", exc_info=True)
-        try:
-            # Task 1: persist GT correction queue payloads. Empty list
-            # is a no-op inside the helper.
-            write_gt_correction_candidates(
-                spark,
-                _analysis.get("gt_correction_candidates") or [],
-                catalog=catalog,
-                schema=schema,
-            )
-        except Exception:
-            logger.debug("Failed to write GT correction candidates", exc_info=True)
-
-        # Task 8: detect cluster signatures that have hit the
-        # persistent-failure threshold across this run's reflection
-        # buffer, persist them, and exclude them from the strategist's
-        # input. Pure helper — fail-open on any error so escalation
-        # bookkeeping never blocks the loop.
-        try:
-            from genie_space_optimizer.optimization.persistent_failure_escalation import (
-                case_to_delta_row as _t8_to_row,
-                compute_human_required_escalations as _t8_compute,
-            )
-
-            _t8_cases, _t8_new_sigs = _t8_compute(
-                reflection_buffer,
-                run_id=run_id,
-                already_escalated_signatures=human_required_signatures,
-            )
-            if _t8_cases:
-                # Persist + emit a per-case audit row (Task 3 stage O).
+            if not gate_result.get("passed"):
+                reason = gate_result.get("rollback_reason", "unknown")
+                # Phase A — Lossless contract: stamp rolled_back for every
+                # qid the AG targeted. Required transition from APPLIED.
                 try:
-                    from genie_space_optimizer.optimization.state import (
-                        write_human_required_escalations as _t8_write,
-                        write_lever_loop_decisions as _t8_audit,
+                    _emit_ag_outcome_journey(
+                        emit=_journey_emit,
+                        ag_id=str(ag_id),
+                        outcome="rolled_back",
+                        affected_qids=list(ag.get("affected_questions") or []),
                     )
-                    _t8_write(
-                        spark,
-                        [_t8_to_row(c) for c in _t8_cases],
-                        catalog=catalog,
-                        schema=schema,
-                    )
-                    _t8_audit_rows = []
-                    for _idx, _c in enumerate(_t8_cases, start=1):
-                        _t8_audit_rows.append({
-                            "run_id": run_id,
-                            "iteration": iteration_counter,
-                            "ag_id": None,
-                            "decision_order": _idx,
-                            "stage_letter": "O",
-                            "gate_name": "persistent_failure_escalation",
-                            "decision": "escalated",
-                            "reason_code": _c.reason_code,
-                            "reason_detail": (
-                                f"signature={_c.cluster_signature} "
-                                f"attempts={_c.attempt_count} "
-                                f"qid={_c.question_id or '(sentinel)'}"
-                            )[:2000],
-                            "affected_qids": (
-                                [_c.question_id] if _c.question_id else []
-                            ),
-                            "source_cluster_ids": [_c.cluster_signature],
-                            "metrics": {
-                                "attempt_count": _c.attempt_count,
-                                "last_iteration": _c.last_iteration,
-                                "root_cause": _c.root_cause,
-                                **(_c.evidence or {}),
-                            },
-                        })
-                    if _t8_audit_rows:
-                        _t8_audit(
-                            spark, _t8_audit_rows,
-                            catalog=catalog, schema=schema,
-                        )
+                    _current_iter_inputs["ag_outcomes"][str(ag_id)] = "rolled_back"
                 except Exception:
                     logger.debug(
-                        "Task 8 persistence failed (non-fatal)",
+                        "Phase A: AG-outcome (rolled_back) emit/capture failed (non-fatal)",
                         exc_info=True,
                     )
-                logger.info(
-                    "Task 8: escalated %d cluster signature(s) to "
-                    "human review: %s",
-                    len(_t8_new_sigs),
-                    ", ".join(sorted(_t8_new_sigs)),
-                )
-            human_required_signatures |= _t8_new_sigs
-        except Exception:
-            logger.debug(
-                "Task 8 escalation computation failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Drop clusters whose signature is in the human-required set
-        # so the strategist does not see them. Symmetric to the
-        # ``_filter_tried_clusters`` exclusion.
-        if human_required_signatures:
-            _pre_hard = len(clusters)
-            _pre_soft = len(soft_signal_clusters)
-            clusters = [
-                c for c in clusters
-                if not (
-                    c.get("cluster_signature")
-                    and c["cluster_signature"] in human_required_signatures
-                )
-            ]
-            soft_signal_clusters = [
-                c for c in soft_signal_clusters
-                if not (
-                    c.get("cluster_signature")
-                    and c["cluster_signature"] in human_required_signatures
-                )
-            ]
-            _dropped_hard = _pre_hard - len(clusters)
-            _dropped_soft = _pre_soft - len(soft_signal_clusters)
-            if _dropped_hard or _dropped_soft:
-                logger.info(
-                    "Task 8: dropped %d hard + %d soft cluster(s) whose "
-                    "signature is in the human-required set",
-                    _dropped_hard, _dropped_soft,
-                )
-
-        clusters = _filter_tried_clusters(clusters, tried_root_causes)
-        if not clusters and not soft_signal_clusters:
-            logger.info("No actionable clusters remain — stopping at iteration %d", _iter_num)
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="no_actionable_clusters",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=no_actionable_clusters skipped (non-fatal)",
-                    exc_info=True,
-                )
-            break
-
-        # Track H — quarantine attribution audit. The strategist must
-        # never receive a quarantine that includes a currently-passing
-        # qid (attribution drift) or a singleton-hard qid (the only
-        # remaining target). Both invariants raise on violation so the
-        # loop stops with a clear traceback rather than silently
-        # soft-skipping the wrong qid.
-        _all_eval_qids_for_audit = {
-            str(q)
-            for q in (_latest_eval_result or {}).get("question_ids") or []
-            if str(q)
-        }
-        # Hard clusters list every currently-failing qid; the complement
-        # against the universe is the currently-passing set.
-        _live_hard_for_audit = {
-            str(q)
-            for cluster in (clusters or [])
-            for q in cluster.get("question_ids") or []
-            if str(q)
-        }
-        _live_passing_for_audit = _all_eval_qids_for_audit - _live_hard_for_audit
-
-        # Plan N4 — lenient quarantine attribution.
-        # Default behaviour: drift releases recovered qids,
-        # singleton-hard releases the lone target, both emit typed
-        # records + ``GSO_INVARIANT_VIOLATION_V1`` markers, and the
-        # loop continues. ``GSO_INVARIANT_STRICT=1`` (or
-        # ``GSO_DECISION_EMITTER_STRICT=1`` for replay) flips back to
-        # the legacy ``AssertionError`` path so CI still fails loud.
-        _enforce_quarantine_attribution_invariant(
-            correction_state=_correction_state,
-            currently_passing_qids=_live_passing_for_audit,
-            currently_hard_qids=_live_hard_for_audit,
-            run_id=run_id,
-            iteration=iteration_counter,
-            emit_record=lambda r: _decision_emit(r),
-            emit_marker=lambda m: print(m, flush=True),
-        )
-
-        # ── Cluster-driven synthesis iteration-scoped state ──────────
-        # Stamp clusters on the snapshot so
-        # ``_resolve_source_cluster_for_ag`` (optimizer.py) can look up
-        # source clusters by id for Lever 5 intercept. Reset the shared
-        # per-iteration budget counter + stamp the active space_id so
-        # the P2 arbiter gate can call Genie (both per Bug #4 Phase 3
-        # Invariants B and C).
-        metadata_snapshot["_failure_clusters"] = clusters
-        metadata_snapshot["_cluster_synthesis_count"] = 0
-        metadata_snapshot["_space_id"] = space_id
-
-        if metadata_snapshot.get("_regression_mining_hints"):
-            logger.info(
-                "Regression-mining strategist hints active for iter %d",
-                iteration_counter,
-            )
-
-        # ── 3B.3: Priority scoring ───────────────────────────────────
-        _scan_levers = (
-            set(iq_scan_recommended_levers)
-            if iq_scan_recommended_levers and _iq_scan_strategist_enabled()
-            else None
-        )
-        # Tier 2.3: include soft clusters in ranking. cluster_impact applies a
-        # 0.5 dampen for signal_type=="soft" so hard clusters still win at
-        # equal q_count, while large soft clusters (the response_quality=63%
-        # case) can out-rank tiny hard clusters and earn strategist attention.
-        for _sc in soft_signal_clusters or []:
-            if isinstance(_sc, dict):
-                _sc.setdefault("signal_type", "soft")
-        from genie_space_optimizer.optimization.control_plane import (
-            clusters_for_strategy,
-        )
-
-        _strategy_hard_clusters, _strategy_soft_clusters = clusters_for_strategy(
-            list(clusters or []),
-            list(soft_signal_clusters or []),
-        )
-
-        # Track H — soft-cluster currency invariant. Every qid emitted in
-        # any soft cluster must, on the *same* rows the clusterer saw,
-        # exhibit at least one row where ``has_individual_judge_failure``
-        # returns ``True``. If a soft-cluster qid has no such row, the
-        # clusterer is reading stale ASI / cached rows that no longer
-        # reflect the latest eval. Grounded against
-        # ``_analysis["failure_rows"]`` so the assertion sees the exact
-        # rows the soft pile was built from (no Delta re-read skew).
-        #
-        # Cycle 5 T5 — survival fix: instead of raising and aborting
-        # the run on drift, drop the drifted qids (or the entire
-        # cluster if every qid drifted) and emit a typed
-        # SOFT_CLUSTER_DRIFT_RECOVERED decision record. The recovery
-        # helper is pure; it returns the cleaned slate plus an audit
-        # trail. Closes the run-aborting AssertionError that hit two
-        # early task attempts of run 2423b960-16e8-41d4-a0cb-74c563378e05.
-        from genie_space_optimizer.optimization.cluster_formation_recovery import (
-            recover_from_soft_cluster_drift,
-        )
-        from genie_space_optimizer.optimization.control_plane import (
-            has_individual_judge_failure as _t5_has_jf,
-        )
-
-        try:
-            _t5_judge_failing = {
-                str(_row.get("question_id") or "")
-                for _row in (_analysis_failure_rows or [])
-                if isinstance(_row, dict)
-                and _row.get("question_id")
-                and _t5_has_jf(_row)
-            }
-            _t5_recovery = recover_from_soft_cluster_drift(
-                soft_clusters=_strategy_soft_clusters or [],
-                judge_failing_qids=_t5_judge_failing,
-            )
-            if (
-                _t5_recovery.drifted_qids_by_cluster
-                or _t5_recovery.dropped_cluster_ids
-            ):
-                # Refresh the soft slate with the cleaned clusters.
-                _strategy_soft_clusters = _t5_recovery.recovered_clusters
-                # Emit one decision record per affected cluster.
-                from genie_space_optimizer.optimization.decision_emitters import (
-                    soft_cluster_drift_recovered_record,
-                )
-                _t5_dropped = set(_t5_recovery.dropped_cluster_ids)
-                for _cid, _drifted in (
-                    _t5_recovery.drifted_qids_by_cluster.items()
-                ):
-                    _t5_rec = soft_cluster_drift_recovered_record(
-                        run_id=str(run_id),
-                        iteration=int(iteration_counter),
-                        cluster_id=str(_cid),
-                        drifted_qids=_drifted,
-                        cluster_dropped=(_cid in _t5_dropped),
-                    )
-                    # Cycle 6 F-1 — skip duplicate emits within an iteration.
-                    _t5_key = _emit_idempotency_key(_t5_rec.to_dict())
-                    if _t5_key in _iter_emitted_keys:
-                        continue
-                    _iter_emitted_keys.add(_t5_key)
-                    _decision_emit(_t5_rec)
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_t5_rec.to_dict())
-        except Exception:
-            logger.debug(
-                "Cycle 5 T5: soft-cluster drift recovery failed "
-                "(non-fatal); proceeding with original soft slate",
-                exc_info=True,
-            )
-
-        ranked = rank_clusters(
-            list(_strategy_hard_clusters) + list(_strategy_soft_clusters),
-            recommended_levers=_scan_levers,
-            # T2.1: pass reflection buffer so each cluster gains a
-            # ``history`` block with prior attempts against its
-            # iteration-independent ``cluster_signature``. The
-            # strategist can then reason about "we've tried this
-            # cluster twice and rolled back both times; consider
-            # escalating or picking a different lever".
-            reflection_buffer=reflection_buffer,
-        )
-
-        # Cycle 2 Task 4 closeout — stamp per-cluster recommended_levers
-        # so the strategist's ranking_text surfaces the per-cluster
-        # lever hint in the LLM prompt. The IQ-scan space-wide override
-        # (``_scan_levers`` passed to ``rank_clusters``) remains the
-        # authoritative tiebreaker; this stamp is the per-cluster
-        # baseline recommendation single-question shape RCAs depend on.
-        from genie_space_optimizer.optimization.stages.action_groups import (
-            stamp_recommended_levers_on_clusters,
-        )
-        ranked = stamp_recommended_levers_on_clusters(ranked)
-
-        # ── 3B.4: Adaptive strategist (1 LLM call → 1 AG) ───────────
-        print(_section(f"ADAPTIVE STRATEGIST — Iteration ({_iteration_label(iteration_counter)})", "="))
-
-        _verdict_history = _build_verdict_history(spark, run_id, catalog, schema)
-
-        # ── 3B.3b: Hard-quarantine exhausted questions ────────────────
-        if reflection_buffer:
-            _, _persist_data = _build_question_persistence_summary(
-                _verdict_history, reflection_buffer,
-            )
-            if not _rollback_state_trusted_for_quarantine:
-                logger.warning(
-                    "Skipping convergence quarantine because live state is untrusted; "
-                    "hard failures must remain visible until rollback verification passes."
-                )
-                _quarantine_qids: set[str] = set()
-                _soft_skip_qids: set[str] = set()
-                _persist_data = {}
-            _quarantine_qids: set[str] = set()
-            # T4.3: temporary quarantine for stuck/worsening questions
-            # that haven't hit the hard-quarantine threshold yet. These
-            # are excluded from cluster formation for the *current*
-            # iteration only — they re-enter next iteration automatically.
-            # Prevents a couple of stuck questions from dominating every
-            # cluster and blinding the loop to patchable failures.
-            _soft_skip_qids: set[str] = set()
-            for _pq_id, _pq_info in _persist_data.items():
-                _pq_class = _pq_info.get("classification", "")
-                _pq_consec = _pq_info.get("max_consecutive", 0)
-                _pq_conv = _pq_info.get("convergence_state", "")
-                if _pq_class == "ADDITIVE_LEVERS_EXHAUSTED" or (
-                    _pq_class == "PERSISTENT" and _pq_consec >= 3
-                ):
-                    _quarantine_qids.add(_pq_id)
-                elif _pq_conv in ("stuck", "worsening") and _pq_consec >= 2:
-                    # Not bad enough for hard-quarantine, but bad enough
-                    # to not dominate cluster-formation this pass.
-                    _soft_skip_qids.add(_pq_id)
-
-            # Iteration-local skip set used ONLY for this pass's
-            # cluster-formation call. Hard quarantine persists via
-            # ``_quarantine_qids``; soft-skip qids re-enter next iteration.
-            _iter_local_skip_qids = _quarantine_qids | _soft_skip_qids
-            if _soft_skip_qids:
-                logger.info(
-                    "T4.3: soft-skipping %d stuck/worsening question(s) "
-                    "from this iteration's cluster formation: %s",
-                    len(_soft_skip_qids), sorted(_soft_skip_qids),
-                )
-                print(
-                    _section(
-                        f"T4.3 CONVERGENCE QUARANTINE — "
-                        f"{len(_soft_skip_qids)} qid(s) soft-skipped",
-                        "-",
-                    ) + "\n"
-                    + _kv(
-                        "Questions",
-                        ", ".join(sorted(_soft_skip_qids))[:200],
-                    ) + "\n"
-                    + _kv(
-                        "Rationale",
-                        "iteration-local; not persisted into hard quarantine",
-                    ) + "\n"
-                    + _bar("-")
-                )
-                # Task 1 — iteration-local soft skip is consumed by the
-                # next ``cluster_failures(...)`` call only. The hard
-                # quarantine store ``_correction_state["quarantined_qids"]``
-                # below MUST NOT see soft-skip qids: a transiently stuck
-                # question that was already fixed by a prior accepted AG
-                # would otherwise become permanently quarantined and
-                # invisible to the next iteration's failure analysis.
-                # Bug observed in production: an AG fixing a question
-                # with several percentage-points of accuracy gain was
-                # masked when the next iteration soft-skipped the same
-                # question and then hard-quarantined it, hiding the
-                # fact that the acceptance gate had already taken
-                # credit for the fix.
-                logger.debug(
-                    "Soft-skip qids %s are iteration-local; only "
-                    "_quarantine_qids %s flow into the persistent hard "
-                    "quarantine state below.",
-                    sorted(_soft_skip_qids),
-                    sorted(_quarantine_qids),
-                )
-            if _quarantine_qids:
-                _newly_quarantined = _quarantine_qids - _correction_state["quarantined_qids"]
-                if _newly_quarantined:
-                    logger.info(
-                        "Hard-quarantining %d exhausted question(s): %s",
-                        len(_newly_quarantined), _newly_quarantined,
-                    )
-                    _correction_state["quarantined_qids"] |= _newly_quarantined
-                    try:
-                        from genie_space_optimizer.optimization.labeling import flag_for_human_review
-                        _flag_items = []
-                        for _hq_id in sorted(_newly_quarantined):
-                            _hq_info = _persist_data[_hq_id]
-                            _tried_str = "; ".join(
-                                f"iter{it}: {pt}" for it, pt in _hq_info.get("patches_tried", [])
-                            )
-                            _flag_items.append({
-                                "question_id": _hq_id,
-                                "question_text": _hq_info.get("question_text", ""),
-                                "reason": (
-                                    f"{_hq_info['classification']}: "
-                                    f"failed {_hq_info['fail_count']}/{_hq_info['total_evals']} evals, "
-                                    f"{_hq_info['max_consecutive']} consecutive"
-                                ),
-                                "iterations_failed": _hq_info.get("fail_count", 0),
-                                "patches_tried": _tried_str,
-                            })
-                        if _flag_items:
-                            _flagged = flag_for_human_review(
-                                spark, run_id, catalog, schema, domain, _flag_items,
-                            )
-                            print(
-                                _section("PERSISTENCE QUARANTINE", "!") + "\n"
-                                + _kv("Questions quarantined", len(_newly_quarantined)) + "\n"
-                                + _kv("Flagged for human review", _flagged) + "\n"
-                                + _bar("!")
-                            )
-                    except Exception:
-                        logger.warning("Failed to flag quarantined questions for human review", exc_info=True)
-                # B3.3 — prune both hard and soft clusters using the
-                # shared base-qid helper so a quarantined ``_002``
-                # excludes ``_002:v2`` / ``_002:v3`` from S001 too.
-                # Soft clusters were previously left untouched, which
-                # is what let iter-2's S001 still contain the suffixed
-                # variants of quarantined base qids.
-                _pre_prune_hard_clusters = list(clusters or [])
-                for c in list(clusters) + list(soft_signal_clusters or []):
-                    c_qids = c.get("question_ids", [])
-                    c["question_ids"] = [
-                        q for q in c_qids
-                        if not _is_quarantined_qid(q, _quarantine_qids)
-                    ]
-                clusters = [c for c in clusters if c.get("question_ids")]
-                soft_signal_clusters = [
-                    c for c in (soft_signal_clusters or [])
-                    if c.get("question_ids")
-                ]
-                # Task 5A — quarantine must not silently remove unresolved
-                # patchable hard failures and let the loop pivot to soft
-                # clusters. Stop for human review when no hard clusters
-                # remain; otherwise carry the qids in a diagnostic lane.
+                # A5 v2.1: F8 emits ACCEPTANCE_DECIDED above.
+                _render_current_journey()
+                rollback(apply_log, w, space_id, metadata_snapshot)
+                # Task 7 — verify the Genie Space actually returned to its
+                # pre-AG state. If not, halt subsequent AGs because clustering
+                # against a still-modified space pollutes downstream RCA.
                 try:
-                    from genie_space_optimizer.optimization.control_plane import (
-                        decide_quarantine_continuation,
+                    from genie_space_optimizer.optimization.applier import (
+                        verify_rollback_restored,
                     )
 
-                    _pre_prune_hard_qids = {
-                        str(q)
-                        for _c in _pre_prune_hard_clusters
-                        for q in (_c.get("question_ids", []) or [])
-                        if str(q)
-                    }
-                    _q_decision = decide_quarantine_continuation(
-                        quarantined_qids=set(_quarantine_qids),
-                        unresolved_patchable_qids=_pre_prune_hard_qids,
-                        hard_cluster_count_after_prune=len(clusters),
-                        soft_cluster_count_after_prune=len(soft_signal_clusters or []),
+                    _restore_decision = verify_rollback_restored(
+                        w=w,
+                        space_id=space_id,
+                        expected_snapshot=metadata_snapshot,
                     )
-                    if _q_decision["action"] == "stop_for_human_review":
+                    if not _restore_decision.get("verified", True):
+                        logger.error(
+                            "AG %s: verify_rollback_restored returned not verified "
+                            "(reason=%s, first_diff=%s). Genie Space state may not "
+                            "match pre-iteration baseline. Failing run terminally.",
+                            ag_id,
+                            _restore_decision.get("reason", "unknown"),
+                            _restore_decision.get("first_diff_path", "(none)"),
+                        )
                         print(
-                            _section("QUARANTINE STOP — PATCHABLE HARD FAILURES", "!") + "\n"
-                            + _kv("Blocking QIDs", ", ".join(_q_decision["blocking_qids"])) + "\n"
-                            + "|  Quarantine removed unresolved hard failures. Stopping instead of pivoting to soft signals.\n"
-                            + _bar("!")
+                            _section("ROLLBACK VERIFICATION FAILED", "-") + "\n"
+                            + _kv("AG", ag_id) + "\n"
+                            + _kv("Reason", _restore_decision.get("reason", "unknown")) + "\n"
+                            + _kv("Expected digest", _restore_decision.get("expected_digest", "(none)")) + "\n"
+                            + _kv("Live digest", _restore_decision.get("live_digest", "(none)")) + "\n"
+                            + _kv("First diff", _restore_decision.get("first_diff_path", "(none)")) + "\n"
+                            + "|  Genie Space state did not match pre-iteration snapshot.\n"
+                            + "|  Failing the run terminally; subsequent AGs cannot trust live state.\n"
+                            + _bar("-")
                         )
-                        logger.warning(
-                            "Stopping lever loop because quarantine removed unresolved patchable hard failures: %s",
-                            _q_decision["blocking_qids"],
+                        _rollback_state_trusted_for_quarantine = False
+                        update_run_status(
+                            spark,
+                            run_id,
+                            catalog,
+                            schema,
+                            status="FAILED",
+                            convergence_reason="failed_rollback_verification",
                         )
-                        break
-                    if _q_decision["action"] == "diagnostic_lane":
-                        logger.warning(
-                            "Quarantined patchable hard qids remain in diagnostic lane: %s",
-                            _q_decision["blocking_qids"],
+                        raise FailedRollbackVerification(
+                            json.dumps(_restore_decision, default=str)[:1000]
                         )
+                except FailedRollbackVerification:
+                    raise
                 except Exception:
-                    logger.debug(
-                        "decide_quarantine_continuation failed (non-fatal)",
-                        exc_info=True,
-                    )
-                if not clusters and not soft_signal_clusters:
-                    logger.info("All clusters emptied after quarantine — stopping at iteration %d", _iter_num)
-                    break
-
-        _total_q = len(benchmarks)
-        # Tier 2.4: include soft-cluster questions in the "failing" set when
-        # computing passing_q. Previously this only subtracted hard-cluster
-        # qids, so the success-summary line fed to the strategist read
-        # "N of M pass all judges" while the prompt's own soft_signal_clusters
-        # block showed judge failures — the two statements contradicted each
-        # other and the strategist would under-prioritise soft-cluster work.
-        _hard_qids = {
-            q for c in clusters for q in c.get("question_ids", []) if q
-        }
-        _soft_qids = {
-            q for c in (soft_signal_clusters or [])
-            for q in c.get("question_ids", []) if q
-        }
-        _passing_q = _total_q - len(_hard_qids | _soft_qids)
-
-        # ── Open a strategy MLflow run for this iteration ──────────
-        # Tier 4: v2 naming — ``<run_short>/iter_NN_strategy/<pending>``.
-        # We don't know the AG id yet (strategist is called next); use a
-        # ``pending`` detail until the strategist returns, then update
-        # tags with the concrete ag_id once known.
-        import mlflow as _mlflow
-
-        from genie_space_optimizer.common.mlflow_names import (
-            default_tags as _v2_tags_strat,
-            strategy_run_name,
-        )
-
-        try:
-            _mlflow.end_run()
-        except Exception:
-            pass
-        _mlflow.start_run(
-            run_name=strategy_run_name(run_id, iteration_counter, "pending"),
-        )
-        try:
-            _mlflow.set_tags({
-                **_v2_tags_strat(
-                    run_id,
-                    space_id=space_id,
-                    stage="strategy",
-                    iteration=iteration_counter,
-                ),
-                "genie.domain": domain,
-                "genie.optimization_run_id": run_id,
-                "genie.run_type": "strategy",
-            })
-
-            # Phase 1.3: try buffered AG first.  We re-validate against
-            # the current cluster set so a buffered AG whose source
-            # clusters have been resolved (or split) by a prior
-            # iteration is dropped and the strategist is re-called.
-            ag = None
-            strategy = pending_strategy if _process_all_ags else None
-            if _process_all_ags and pending_action_groups:
-                # Track D — revalidate buffered AGs by stable signature
-                # rather than by the unstable H00N cluster_id label.
-                # An AG's signature stays constant across iterations;
-                # cluster_id re-numbers. Drop AGs whose signature no
-                # longer overlaps the current iteration's cluster set
-                # with an explicit audit row.
-                _live_cluster_signatures = {
-                    str(c.get("cluster_signature") or "")
-                    for c in clusters + (soft_signal_clusters or [])
-                    if c.get("cluster_signature")
-                }
-                _src_ids: set[str] = set()
-                _dropped_for_drift: list[dict] = []
-                while pending_action_groups:
-                    _candidate = pending_action_groups.pop(0)
-                    _candidate_sig = _candidate.get("_stable_signature")
-                    _candidate_sig_set = (
-                        set(_candidate_sig[0]) if _candidate_sig else set()
-                    )
-                    if not _candidate_sig_set:
-                        # Backwards-compatible fallback: AGs created
-                        # before Track D's stamping landed do not have
-                        # a signature; fall through to the legacy
-                        # cluster-id check so the loop does not stall
-                        # on in-flight buffers.
-                        _src_ids = set(
-                            _candidate.get("source_cluster_ids", []) or []
-                        )
-                        _live_cluster_ids = {
-                            c.get("cluster_id", "")
-                            for c in clusters + (soft_signal_clusters or [])
-                        }
-                        if not _src_ids or (_src_ids & _live_cluster_ids):
-                            ag = _candidate
-                            break
-                        continue
-                    if _candidate_sig_set & _live_cluster_signatures:
-                        _src_ids = set(
-                            _candidate.get("source_cluster_ids", []) or []
-                        )
-                        ag = _candidate
-                        break
-                    # Signature drift — drop and audit.
-                    _dropped_for_drift.append(_candidate)
-                if _dropped_for_drift:
-                    for _drop in _dropped_for_drift:
-                        print(
-                            _section(
-                                "DROPPING BUFFERED AG (signature drift)", "-"
-                            ) + "\n"
-                            + _kv("AG id", _drop.get("id", "?")) + "\n"
-                            + _kv(
-                                "Stale signatures",
-                                sorted(
-                                    set((_drop.get("_stable_signature") or ((),))[0])
-                                ),
-                            ) + "\n"
-                            + _kv(
-                                "Live signatures",
-                                sorted(_live_cluster_signatures),
-                            ) + "\n"
-                            + _bar("-")
-                        )
-                if ag is not None:
-                    print(
-                        _section(
-                            f"REUSING BUFFERED AG (skipping strategist call) — "
-                            f"{len(pending_action_groups)} more queued",
-                            "-",
-                        ) + "\n"
-                        + _kv("AG id", ag.get("id", "?")) + "\n"
-                        + _kv("Source clusters", sorted(_src_ids)) + "\n"
-                        + _bar("-")
-                    )
-                    # Task 8 — if regression debt is outstanding, drop any
-                    # buffered AG that does not target debt qids and force a
-                    # fresh strategist call instead.
-                    if _regression_debt_qids_for_next_iteration:
-                        _debt_set = set(_regression_debt_qids_for_next_iteration)
-                        _ag_qids = {
-                            str(q)
-                            for q in (ag.get("affected_questions", []) or [])
-                            if str(q)
-                        }
-                        if not (_debt_set & _ag_qids):
-                            ag = None
-                            pending_action_groups.clear()
-                            pending_strategy = None
-                            strategy = None
-                else:
-                    pending_strategy = None
-                    strategy = None
-
-            if ag is None:
-                # Task 8 — pass debt qids into the strategist context and
-                # promote any live hard cluster covering them to the front.
-                if _regression_debt_qids_for_next_iteration:
-                    metadata_snapshot["_mandatory_regression_debt_qids"] = list(
-                        _regression_debt_qids_for_next_iteration
-                    )
-                    _debt_set = set(_regression_debt_qids_for_next_iteration)
-                    _debt_clusters = [
-                        c for c in _strategy_hard_clusters
-                        if _debt_set & {
-                            str(q) for q in (c.get("question_ids", []) or [])
-                            if str(q)
-                        }
-                    ]
-                    _debt_cluster_ids = {
-                        str(c.get("cluster_id") or "") for c in _debt_clusters
-                    }
-                    _strategy_hard_clusters = _debt_clusters + [
-                        c for c in _strategy_hard_clusters
-                        if str(c.get("cluster_id") or "") not in _debt_cluster_ids
-                    ]
-                _live_cluster_ids = {
-                    str(c.get("cluster_id") or "")
-                    for c in _strategy_hard_clusters + list(_strategy_soft_clusters or [])
-                    if c.get("cluster_id")
-                }
-                _live_diag_signatures = {
-                    str(c.get("cluster_signature") or "")
-                    for c in _strategy_hard_clusters + list(_strategy_soft_clusters or [])
-                    if c.get("cluster_signature")
-                }
-                _diag_preempt: dict | None = None
-                while diagnostic_action_queue and _diag_preempt is None:
-                    _candidate = diagnostic_action_queue.pop(0)
-                    _candidate_sig = _candidate.get("_stable_signature")
-                    _candidate_sig_set = (
-                        set(_candidate_sig[0]) if _candidate_sig else set()
-                    )
-                    # Derive _src_ids once per candidate so the audit
-                    # print and the "USING DIAGNOSTIC AG" print can
-                    # reference it regardless of which match path
-                    # (signature vs id-fallback) was taken.
-                    _src_ids = {
-                        str(cid)
-                        for cid in (_candidate.get("source_cluster_ids") or [])
-                        if str(cid)
-                    }
-                    # Track D — prefer signature match; fall back to
-                    # cluster-id only when the AG predates this PR.
-                    if _candidate_sig_set:
-                        _matches_live = bool(
-                            _candidate_sig_set & _live_diag_signatures
-                        )
-                    else:
-                        _matches_live = bool(_src_ids & _live_cluster_ids)
-                    if not _matches_live:
-                        print(
-                            _section(
-                                "SKIPPING DIAGNOSTIC AG BECAUSE CLUSTER RESOLVED", "-"
-                            ) + "\n"
-                            + _kv("AG id", _candidate.get("id", "?")) + "\n"
-                            + _kv(
-                                "Stale signatures",
-                                sorted(_candidate_sig_set) if _candidate_sig_set
-                                else sorted(_src_ids),
-                            ) + "\n"
-                            + _bar("-")
-                        )
-                        continue
-                    _diag_preempt = _candidate
-                    print(
-                        _section("USING DIAGNOSTIC AG FROM COVERAGE GAP", "-")
-                        + "\n"
-                        + _kv("AG id", _diag_preempt.get("id", "?"))
-                        + "\n"
-                        + _kv("Source clusters", sorted(_src_ids))
-                        + "\n"
-                        + _bar("-")
-                    )
-
-                # v2 Task 23 — fingerprint sql_shape_deltas accumulated in
-                # reflection_buffer so rollbacks invalidate the memo cache.
-                _memo_sql_deltas = [
-                    _delta
-                    for _rb in reflection_buffer
-                    for _delta in (_rb.get("sql_shape_deltas") or [])
-                ]
-                _memo_key = _strategist_memo_key(
-                    list(_strategy_hard_clusters), metadata_snapshot,
-                    sql_shape_deltas=_memo_sql_deltas,
-                )
-                from genie_space_optimizer.optimization.intent_disambiguation import (
-                    detect_intent_collisions,
-                )
-
-                _intent_collisions = detect_intent_collisions(_strategy_hard_clusters)
-                if _intent_collisions:
                     logger.warning(
-                        "Detected %d intent collision(s) across active clusters: %s",
-                        len(_intent_collisions),
-                        [
-                            {
-                                "term": c["term"],
-                                "columns": sorted(c["column_choices"]),
-                            }
-                            for c in _intent_collisions
+                        "verify_rollback_restored raised — treating as non-fatal "
+                        "but flagging for operator review",
+                        exc_info=True,
+                    )
+                mark_patches_rolled_back(
+                    spark, run_id, iteration_counter, reason, catalog, schema,
+                )
+                ags_rolled_back.append(ag_id)
+                # Cycle 9 W4 — capture every applied patch from this AG into
+                # the per-run DOA fingerprint buffer when the post-eval
+                # acceptance decision still reports unresolved target qids.
+                # The buffer is later read by the strategist preprocessing
+                # step (commit 3) to prune any candidate whose retry
+                # signature is already known dead-on-arrival in this run.
+                try:
+                    from types import SimpleNamespace as _DoaDecisionAdapter
+                    _accept_dict = gate_result.get("acceptance_decision") or {}
+                    _doa_decision = _DoaDecisionAdapter(
+                        accepted=bool(_accept_dict.get("accepted", False)),
+                        target_still_hard_qids=tuple(
+                            _accept_dict.get("target_still_hard_qids") or ()
+                        ),
+                    )
+                    _capture_doa_fingerprints_on_rollback(
+                        buffer=_doa_fingerprint_buffer,
+                        decision=_doa_decision,
+                        ag_id=str(ag_id),
+                        applied_patches=[
+                            (e.get("patch") or {})
+                            for e in (apply_log.get("applied") or [])
                         ],
                     )
-                    # Task 13 — record collision touches for every qid
-                    # implicated in any column branch of the collision.
-                    try:
-                        for _coll in _intent_collisions:
-                            _term = str(_coll.get("term") or "")
-                            _qbycol = _coll.get("questions_by_column") or {}
-                            _all_qids: list[str] = []
-                            for _qids_list in _qbycol.values():
-                                _all_qids.extend(
-                                    str(q) for q in (_qids_list or []) if q
-                                )
-                            if _all_qids:
-                                _journey_emit(
-                                    "intent_collision_detected",
-                                    question_ids=list(dict.fromkeys(_all_qids)),
-                                    reason=f"term={_term}",
-                                )
-                    except Exception:
-                        logger.debug(
-                            "Task 13: intent collision journey emit failed",
-                            exc_info=True,
-                        )
-                if _diag_preempt is not None:
-                    strategy = {
-                        "action_groups": [_diag_preempt],
-                        "_memoized": False,
-                        "_diagnostic_preempt": True,
-                    }
-                elif _memo_key in strategist_memo_cache:
-                    strategy = copy.deepcopy(strategist_memo_cache[_memo_key])
-                    strategy["_memoized"] = True
-                else:
-                    # Cycle 9 T5: surface accumulated forbid_tables
-                    # constraints to the strategist via metadata_snapshot.
-                    # The prompt-renderer pickup is a future task; the
-                    # data is already observable in the replay fixture.
-                    if _strategist_constraints.to_strategist_context():
-                        metadata_snapshot["_strategist_constraints"] = (
-                            _strategist_constraints.to_strategist_context()
-                        )
-                    # Cycle 5 T2 closeout — when the flag is on, surface
-                    # the prior iteration's gate-drops of causal-target
-                    # patches to the strategist's prompt context so the
-                    # LLM can propose a narrower variant or shift levers
-                    # instead of re-emitting the same dropped pattern.
-                    # With the flag off, pass None — the strategist
-                    # prompt block is omitted (byte-stable).
-                    from genie_space_optimizer.common.config import (
-                        causal_drop_feedback_to_strategist_enabled,
-                    )
-                    _t2_drops_for_strategist = (
-                        list(_prior_iteration_dropped_causal_patches)
-                        if causal_drop_feedback_to_strategist_enabled()
-                        else None
-                    )
-                    strategy = _call_llm_for_adaptive_strategy(
-                        clusters=_strategy_hard_clusters,
-                        soft_signal_clusters=_strategy_soft_clusters,
-                        metadata_snapshot=metadata_snapshot,
-                        reflection_buffer=reflection_buffer,
-                        priority_ranking=ranked,
-                        tried_patches=tried_patches,
-                        w=w,
-                        total_benchmarks=_total_q,
-                        passing_benchmarks=max(0, _passing_q),
-                        verdict_history=_verdict_history,
-                        skill_exemplars=skill_exemplars or None,
-                        human_suggestions=_human_suggestions or None,
-                        iq_scan_summary=(
-                            iq_scan_summary if _iq_scan_strategist_enabled() else None
-                        ),
-                        max_ag_patches=MAX_AG_PATCHES,
-                        intent_collisions=_intent_collisions,
-                        prior_iteration_dropped_causal_patches=(
-                            _t2_drops_for_strategist
-                        ),
-                    )
-                    strategist_memo_cache[_memo_key] = copy.deepcopy(strategy)
-                    strategy["_memoized"] = False
-                logger.info(
-                    "Strategist memoization: key=%s hit=%s",
-                    _memo_key[:120],
-                    strategy.get("_memoized"),
-                )
-                strategy["_source_clusters"] = (
-                    list(_strategy_hard_clusters) + list(_strategy_soft_clusters)
-                )
-                _l3_diagnostics = _diagnose_lever3_directive_emission(
-                    list(_strategy_hard_clusters), strategy,
-                )
-                if _l3_diagnostics:
-                    logger.warning(
-                        "Lever 3 directive diagnostics: %s",
-                        json.dumps(_l3_diagnostics, default=str),
-                    )
-                    strategy["lever3_directive_diagnostics"] = _l3_diagnostics
-                action_groups = strategy.get("action_groups", [])
-                # Task 8 — strategist coverage enforcement. Any patchable
-                # hard cluster the LLM dropped gets a deterministic
-                # diagnostic AG so the loop attempts it before declaring
-                # "exhausted".
-                try:
-                    from genie_space_optimizer.optimization.control_plane import (
-                        diagnostic_action_group_for_cluster,
-                        uncovered_patchable_clusters,
-                    )
-
-                    _uncovered = uncovered_patchable_clusters(
-                        clusters,
-                        action_groups,
-                    )
-                    if _uncovered:
-                        # Task 6 — log a structured diagnostic so the next
-                        # operator can tell the difference between "no RCA
-                        # card", "RCA card present but strategist returned
-                        # nothing", and "output truncated".
-                        try:
-                            _uncovered_ids = [
-                                str(c.get("cluster_id"))
-                                for c in _uncovered
-                                if c.get("cluster_id")
-                            ]
-                            _log_strategist_coverage_gap(
-                                iteration=iteration_counter,
-                                uncovered_cluster_ids=_uncovered_ids,
-                                cluster_question_counts={
-                                    str(c.get("cluster_id")): len(
-                                        c.get("question_ids") or []
-                                    )
-                                    for c in clusters or []
-                                    if c.get("cluster_id")
-                                },
-                                rca_cards_present={
-                                    str(c.get("cluster_id")): bool(c.get("rca_card"))
-                                    for c in clusters or []
-                                    if c.get("cluster_id")
-                                },
-                                strategist_action_groups=len(
-                                    (strategy or {}).get("action_groups") or []
-                                ),
-                                strategist_input_token_estimate=(strategy or {}).get(
-                                    "_input_token_estimate"
-                                ),
-                                strategist_output_truncated=bool(
-                                    (strategy or {}).get("_output_truncated")
-                                ),
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to log strategist coverage gap diagnostic",
-                                exc_info=True,
-                            )
-                        logger.warning(
-                            "Strategist did not cover %d patchable hard cluster(s); "
-                            "appending diagnostic AGs: %s",
-                            len(_uncovered),
-                            [c.get("cluster_id") for c in _uncovered],
-                        )
-                        from genie_space_optimizer.optimization.control_plane import (
-                            compute_ag_stable_signature,
-                        )
-
-                        for _c in _uncovered:
-                            _diag_ag = diagnostic_action_group_for_cluster(_c)
-                            # Track D — stamp a stable signature derived
-                            # from cluster_signature, qid set, and root
-                            # cause so revalidation in later iterations
-                            # does not depend on the unstable H00N
-                            # cluster_id label.
-                            _diag_ag["_stable_signature"] = compute_ag_stable_signature(
-                                _diag_ag, [_c]
-                            )
-                            # Cycle 5 T3 — when the cluster has no parent
-                            # RCA AND ``GSO_DIAGNOSTIC_AG_RCA_REGEN`` is
-                            # on, the AG enters the regeneration branch:
-                            # emit ``RCA_REGENERATION_TRIGGERED``,
-                            # attempt regen (no-op until the regen
-                            # helper lands), then emit
-                            # ``RCA_REGENERATION_EXHAUSTED`` and skip the
-                            # AG so we don't generate empty proposals.
-                            # With the flag off, every AG flows through
-                            # as before — byte-stable.
-                            try:
-                                from genie_space_optimizer.common.config import (
-                                    diagnostic_ag_rca_regen_enabled,
-                                )
-                                if (
-                                    diagnostic_ag_rca_regen_enabled()
-                                    and _diag_ag.get("needs_rca_regeneration")
-                                ):
-                                    from genie_space_optimizer.optimization.decision_emitters import (
-                                        rca_regeneration_triggered_record,
-                                        rca_regeneration_exhausted_record,
-                                    )
-                                    _t3_cluster_id = str(
-                                        _diag_ag.get("primary_cluster_id")
-                                        or _c.get("cluster_id") or ""
-                                    )
-                                    _t3_target_qids = tuple(
-                                        str(q)
-                                        for q in (_c.get("question_ids") or [])
-                                        if q
-                                    )
-                                    # Cycle 6 F-7 — emit diagnostic_ag
-                                    # trunk events so the journey
-                                    # classifier picks
-                                    # HARD_FAILURE_UNRESOLVED rather
-                                    # than TERMINAL_UNACTIONABLE for
-                                    # T3-regen-exhausted hard qids.
-                                    _emit_diagnostic_ag_trunk_events(
-                                        journey_emit=_journey_emit,
-                                        cluster_qids=_t3_target_qids,
-                                        cluster_id=_t3_cluster_id,
-                                    )
-                                    _t3_trig = rca_regeneration_triggered_record(
-                                        run_id=str(run_id),
-                                        iteration=int(iteration_counter),
-                                        cluster_id=_t3_cluster_id,
-                                        target_qids=_t3_target_qids,
-                                    )
-                                    # Cycle 6 F-1 — gate duplicate emits.
-                                    _t3_trig_key = _emit_idempotency_key(
-                                        _t3_trig.to_dict()
-                                    )
-                                    if _t3_trig_key not in _iter_emitted_keys:
-                                        _iter_emitted_keys.add(_t3_trig_key)
-                                        _decision_emit(_t3_trig)
-                                        _current_iter_inputs.setdefault(
-                                            "decision_records", []
-                                        ).append(_t3_trig.to_dict())
-                                    # Regen helper is a follow-up; for
-                                    # now every regen attempt fails so
-                                    # the AG retires here.
-                                    _t3_exh = rca_regeneration_exhausted_record(
-                                        run_id=str(run_id),
-                                        iteration=int(iteration_counter),
-                                        cluster_id=_t3_cluster_id,
-                                        attempted_evidence_sources=(),
-                                    )
-                                    _t3_exh_key = _emit_idempotency_key(
-                                        _t3_exh.to_dict()
-                                    )
-                                    if _t3_exh_key not in _iter_emitted_keys:
-                                        _iter_emitted_keys.add(_t3_exh_key)
-                                        _decision_emit(_t3_exh)
-                                        _current_iter_inputs.setdefault(
-                                            "decision_records", []
-                                        ).append(_t3_exh.to_dict())
-                                        # Cycle 6 F-7 — also emit the
-                                        # rca_exhausted trunk event so
-                                        # the classifier can
-                                        # distinguish tried-and-
-                                        # exhausted from never-tried.
-                                        for _q in _t3_target_qids:
-                                            try:
-                                                _journey_emit(
-                                                    "rca_exhausted",
-                                                    question_id=str(_q),
-                                                    cluster_id=_t3_cluster_id,
-                                                )
-                                            except Exception:
-                                                logger.debug(
-                                                    "F-7: rca_exhausted "
-                                                    "trunk emit failed "
-                                                    "(non-fatal)",
-                                                    exc_info=True,
-                                                )
-                                    # Skip this AG entirely — do not
-                                    # append to action_groups or the
-                                    # diagnostic queue.
-                                    continue
-                            except Exception:
-                                logger.debug(
-                                    "Cycle 5 T3: RCA regen branch failed "
-                                    "(non-fatal); proceeding with the "
-                                    "original diagnostic AG",
-                                    exc_info=True,
-                                )
-                            action_groups.append(_diag_ag)
-                            diagnostic_action_queue.append(_diag_ag)
-                            # Task 13 — diagnostic AG covers all qids in
-                            # the uncovered cluster.
-                            try:
-                                _diag_qids = [
-                                    str(q)
-                                    for q in (_c.get("question_ids") or [])
-                                    if q
-                                ]
-                                _diag_ag_id = str(
-                                    _diag_ag.get("id")
-                                    or _diag_ag.get("ag_id")
-                                    or ""
-                                )
-                                if _diag_qids:
-                                    _journey_emit(
-                                        "diagnostic_ag",
-                                        question_ids=_diag_qids,
-                                        ag_id=_diag_ag_id,
-                                        cluster_id=str(
-                                            _c.get("cluster_id") or ""
-                                        ),
-                                        root_cause=str(
-                                            _c.get("root_cause")
-                                            or _c.get("asi_failure_type")
-                                            or ""
-                                        ),
-                                    )
-                            except Exception:
-                                logger.debug(
-                                    "Task 13: diagnostic_ag journey emit failed",
-                                    exc_info=True,
-                                )
                 except Exception:
                     logger.debug(
-                        "Strategist coverage enforcement raised (non-fatal)",
+                        "Cycle 9 W4: DOA fingerprint capture wiring failed "
+                        "(non-fatal)",
                         exc_info=True,
                     )
-                # Sort by priority (lower = higher priority); fall back
-                # to source-cluster impact_score when priority is
-                # missing or tied.
-                _impact_by_cid = {
-                    c.get("cluster_id", ""): float(c.get("impact_score", 0.0))
-                    for c in clusters + (soft_signal_clusters or [])
-                }
-
-                def _ag_sort_key(_ag: dict) -> tuple:
-                    _pri = _ag.get("priority")
-                    _pri_v = float(_pri) if isinstance(_pri, (int, float)) else 999.0
-                    _src = _ag.get("source_cluster_ids", []) or []
-                    _impact = max(
-                        (_impact_by_cid.get(_cid, 0.0) for _cid in _src),
-                        default=0.0,
+                # Phase 1.3: drop the AG buffer when an AG rolls back.  The
+                # buffered AGs were produced from the same strategist call
+                # and tend to share the same flawed root-cause hypothesis;
+                # forcing a fresh strategist call gives the next iteration
+                # a clean slate informed by the rollback in reflection_buffer.
+                if pending_action_groups:
+                    logger.info(
+                        "Dropping %d buffered AG(s) after rollback of %s",
+                        len(pending_action_groups), ag_id,
                     )
-                    return (_pri_v, -_impact)
-
-                # Track 4 (Phase A burn-down) — decompose any
-                # heterogeneous AG spanning multiple root-cause
-                # families or tables when the bundle lacks a shared
-                # direct fix. Per-cluster diagnostic AGs replace the
-                # parent so cap budget can preserve a direct fix per
-                # cluster.
-                from genie_space_optimizer.optimization.control_plane import (
-                    decompose_overbroad_ag,
-                )
-                _all_clusters_for_decomposition = list(clusters or []) + list(
-                    soft_signal_clusters or []
-                )
-                _decomposed_action_groups: list[dict] = []
-                for _ag_in in action_groups:
-                    _decomposed_action_groups.extend(
-                        decompose_overbroad_ag(
-                            _ag_in, _all_clusters_for_decomposition
-                        )
-                    )
-                if len(_decomposed_action_groups) != len(action_groups):
-                    print(
-                        _section(
-                            f"AG DECOMPOSITION GUARDRAIL — {len(action_groups)} -> "
-                            f"{len(_decomposed_action_groups)} AGs",
-                            "-",
-                        ) + "\n"
-                        + _kv(
-                            "Original AG ids",
-                            ", ".join(_a.get("id", "?") for _a in action_groups),
-                        ) + "\n"
-                        + _kv(
-                            "Decomposed AG ids",
-                            ", ".join(
-                                _a.get("id", "?") for _a in _decomposed_action_groups
-                            ),
-                        ) + "\n"
-                        + _bar("-")
-                    )
-                action_groups = _decomposed_action_groups
-                action_groups = sorted(action_groups, key=_ag_sort_key)
-                # Cycle 10 W8 — emit AG_LEVERS_UNIONED for each AG
-                # whose lever set was widened by Cycle 10 W2 union.
-                # The pre-union snapshot lives on the AG dict as
-                # ``_levers_before_union`` (see
-                # ``union_ag_levers_with_recommended``).
-                try:
-                    for _ag_w8 in (action_groups or []):
-                        _ag_id_w8 = str(_ag_w8.get("id") or "")
-                        _before_w8 = tuple(
-                            str(k) for k in
-                            (_ag_w8.get("_levers_before_union") or ())
-                        )
-                        _after_w8 = tuple(
-                            str(k) for k in
-                            ((_ag_w8.get("lever_directives") or {}).keys())
-                        )
-                        if _before_w8 and set(_before_w8) < set(_after_w8):
-                            emit_ag_levers_unioned_if_widened(
-                                run_id=str(run_id),
-                                iteration=int(iteration_counter),
-                                ag_id=_ag_id_w8,
-                                cluster_id=str(
-                                    (_ag_w8.get("source_cluster_ids") or ["?"])[0]
-                                ),
-                                levers_before=_before_w8,
-                                levers_after=_after_w8,
-                                iter_inputs=_current_iter_inputs,
-                            )
-                except Exception:
-                    logger.debug(
-                        "Cycle 10 W8: ag_levers_unioned wiring failed (non-fatal)",
-                        exc_info=True,
-                    )
-                ag = action_groups[0] if action_groups else None
-                if _process_all_ags and len(action_groups) > 1:
-                    pending_action_groups = list(
-                        action_groups[1:_MAX_AGS_PER_STRATEGIST_CALL]
-                    )
-                    pending_strategy = strategy
-                    # Track D — stamp the stable signature on every
-                    # buffered AG before queueing. The signature is
-                    # computed against the clusters present at
-                    # buffering time so revalidation in later
-                    # iterations checks "does this AG's signature
-                    # still appear in the live cluster set" rather
-                    # than "does the H00N label still match".
-                    from genie_space_optimizer.optimization.control_plane import (
-                        compute_ag_stable_signature,
-                    )
-
-                    _all_clusters_for_signature = list(clusters or []) + list(
-                        soft_signal_clusters or []
-                    )
-                    for _buffered_ag in pending_action_groups:
-                        _buffered_ag["_stable_signature"] = compute_ag_stable_signature(
-                            _buffered_ag, _all_clusters_for_signature
-                        )
-                    print(
-                        _section(
-                            f"BUFFERING {len(pending_action_groups)} ADDITIONAL AG(S) "
-                            f"FOR LATER ITERATION(S)",
-                            "-",
-                        ) + "\n"
-                        + _kv(
-                            "Buffered AGs",
-                            ", ".join(
-                                _a.get("id", "?") for _a in pending_action_groups
-                            ),
-                        ) + "\n"
-                        + _bar("-")
-                    )
-                else:
                     pending_action_groups = []
                     pending_strategy = None
-
-            _global_rewrite = strategy.get("global_instruction_rewrite")
-            if isinstance(_global_rewrite, dict):
-                non_empty = {k: v for k, v in _global_rewrite.items() if v is not None}
-                if non_empty and ag is not None:
-                    ld = ag.setdefault("lever_directives", {})
-                    l5 = ld.setdefault("5", {})
-                    l5["instruction_sections"] = non_empty
-            elif isinstance(_global_rewrite, str) and _global_rewrite.strip():
-                if ag is not None:
-                    ld = ag.setdefault("lever_directives", {})
-                    l5 = ld.setdefault("5", {})
-                    l5["instruction_guidance"] = _global_rewrite.strip()
-
-            if ag is None and _iter_num == 1:
-                logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
-                fallback_strategy = _generate_holistic_strategy(
-                    clusters=clusters,
-                    soft_signal_clusters=soft_signal_clusters,
-                    metadata_snapshot=metadata_snapshot,
-                    w=w,
+                for lk in lever_keys:
+                    levers_rolled_back.append(int(lk))
+                # Phase E2: include rollback_class in stage detail so the
+                # run summary can break rollbacks down by class.
+                from genie_space_optimizer.optimization.rollback_class import (
+                    classify_rollback_reason as _classify_rb,
                 )
-                _fb_ags = fallback_strategy.get("action_groups", [])
-                _fb_ags.sort(key=lambda a: a.get("priority", 999))
-                if _fb_ags:
-                    ag = _fb_ags[0]
-                    strategy = fallback_strategy
-        finally:
-            _mlflow.end_run()
-
-        if ag is None and clusters:
-            _remaining_qids = set()
-            for c in clusters:
-                _remaining_qids.update(c.get("question_ids", []))
-            if _remaining_qids and _iter_num <= max_iterations - 1:
-                logger.info(
-                    "Strategist returned 0 AGs but %d clusters with %d questions remain — "
-                    "constructing diagnostic fallback AG",
-                    len(clusters), len(_remaining_qids),
-                )
-                _top_cluster = ranked[0] if ranked else clusters[0]
-                ag = {
-                    "id": f"AG{iteration_counter}_fallback",
-                    "root_cause_summary": _top_cluster.get("root_cause", "unresolved_failures"),
-                    "affected_questions": _top_cluster.get("question_ids", []),
-                    "source_cluster_ids": [_top_cluster.get("cluster_id", "")],
-                    "lever_directives": {
-                        "5": {"instruction_guidance": "Add example SQLs and routing instructions for remaining failure patterns"},
-                        "6": {"generate_expressions": True},
+                _rb_class = _classify_rb(reason).value
+                write_stage(
+                    spark, run_id, f"AG_{ag_id}_STARTED", "ROLLED_BACK",
+                    task_key="lever_loop", iteration=iteration_counter,
+                    detail={
+                        "reason": reason,
+                        "levers": lever_keys,
+                        "rollback_class": _rb_class,
                     },
-                    "rationale": (
-                        f"Diagnostic fallback: {len(_remaining_qids)} question(s) still failing. "
-                        f"Trying Lever 5 (instructions/examples) + Lever 6 (SQL expressions) "
-                        f"as a broad-spectrum fix."
-                    ),
-                    "coordination_notes": "Fallback AG — strategist returned empty, applying broad-spectrum lever 5+6",
+                    catalog=catalog, schema=schema,
+                )
+                _failed_eval = gate_result.get("failed_eval_result", {})
+                _fail_tmap = _failed_eval.get("trace_map", {})
+                _fail_qids = set(_failed_eval.get("failure_question_ids", []))
+                all_failure_question_ids.extend(_fail_qids)
+                for qid, tid in _fail_tmap.items():
+                    question_trace_map.setdefault(qid, []).append(tid)
+                    if qid in _fail_qids:
+                        all_failure_trace_ids.append(tid)
+                    elif "regressions" in gate_result:
+                        all_regression_trace_ids.append(tid)
+                _fail_run_id = _failed_eval.get("mlflow_run_id") or _failed_eval.get("run_id", "")
+                if _fail_run_id:
+                    all_eval_mlflow_run_ids.append(_fail_run_id)
+
+                _failed_scores = gate_result.get("full_scores", best_scores)
+                _rb_fail_qids = set(
+                    gate_result.get("failed_eval_result", {}).get("failure_question_ids", [])
+                )
+                _affected_set = set(ag.get("affected_questions", []))
+                _any_target_improved = bool(
+                    _affected_set and prev_failure_qids
+                    and (_affected_set & prev_failure_qids) - (_rb_fail_qids or prev_failure_qids)
+                )
+                _rb_refinement = "in_plan" if _any_target_improved else "out_of_plan"
+                _rb_acc_delta = (
+                    sum(_failed_scores.values()) / max(len(_failed_scores), 1)
+                    - sum(best_scores.values()) / max(len(best_scores), 1)
+                )
+                _regressions = gate_result.get("regressions", [])
+                _rb_patch_types = sorted({p.get("patch_type", "?") for p in patches})
+                _control_plane_reason_for_reflection = ""
+                for _r in _regressions:
+                    if _r.get("judge") == "control_plane_acceptance":
+                        _control_plane_reason_for_reflection = str(
+                            _r.get("reason") or ""
+                        )
+                        break
+                _rb_reflection = _format_rollback_reflection(
+                    rollback_reason=reason,
+                    control_plane_reason=_control_plane_reason_for_reflection,
+                    any_target_improved=_any_target_improved,
+                    regressions=_regressions,
+                    patch_types=_rb_patch_types,
+                    root_cause_summary=str(ag.get("root_cause_summary", "")),
+                    accuracy_delta_pp=float(_rb_acc_delta),
+                )
+
+                # Task 19 — record SQL-shape deltas on the rolled-back AG
+                # so the strategist can see what the candidate accomplished
+                # vs. ground truth, and where shape work still remains.
+                from genie_space_optimizer.optimization.sql_shape_delta import (
+                    compute_sql_shape_delta,
+                )
+
+                def _row_qid(row: dict) -> str:
+                    return str(
+                        row.get("inputs.question_id")
+                        or row.get("inputs/question_id")
+                        or row.get("question_id")
+                        or (row.get("inputs") or {}).get("question_id", "")
+                    )
+
+                def _row_sql(row: dict) -> str:
+                    return str(
+                        row.get("outputs.predictions.sql")
+                        or row.get("outputs/predictions/sql")
+                        or row.get("generated_sql")
+                        or row.get("genie_sql")
+                        or (row.get("outputs") or {}).get("genie_sql", "")
+                        or ""
+                    )
+
+                def _row_count(row: dict) -> int | None:
+                    for k in ("genie_row_count", "outputs.genie_row_count", "outputs/genie_row_count"):
+                        v = row.get(k)
+                        if isinstance(v, (int, float)):
+                            return int(v)
+                    v = (row.get("outputs") or {}).get("genie_row_count")
+                    return int(v) if isinstance(v, (int, float)) else None
+
+                _accepted_by_qid = {
+                    _row_qid(r): r
+                    for r in (_accepted_baseline_rows_for_control_plane or [])
+                    if _row_qid(r)
                 }
-                strategy = strategy or {}
-                strategy["action_groups"] = [ag]
-                print(
-                    _section(f"DIAGNOSTIC FALLBACK AG — {len(_remaining_qids)} questions remain", "!") + "\n"
-                    + _kv("Cluster", _top_cluster.get("cluster_id", "?")) + "\n"
-                    + _kv("Root cause", _top_cluster.get("root_cause", "?")) + "\n"
-                    + _kv("Questions", len(_top_cluster.get("question_ids", []))) + "\n"
-                    + _bar("!")
-                )
-
-        if ag is None:
-            logger.info("Strategist produced 0 action groups — ending lever loop")
-            print(
-                _section("Strategy produced 0 action groups — nothing to do", "-") + "\n"
-                + _bar("-")
-            )
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="strategy_zero_ags",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=strategy_zero_ags skipped (non-fatal)",
-                    exc_info=True,
-                )
-            break
-
-        ag_id = ag.get("id", f"AG{iteration_counter}")
-        ags_attempted.append(ag_id)
-        lever_keys = sorted(ag.get("lever_directives", {}).keys())
-
-        # Phase A — capture strategist AG snapshot for replay-fixture export.
-        try:
-            _current_iter_inputs["strategist_response"]["action_groups"].append({
-                "id": str(ag_id),
-                "affected_questions": [
-                    str(q) for q in (ag.get("affected_questions") or []) if q
-                ],
-                "patches": [],
-            })
-        except Exception:
-            logger.debug(
-                "Phase A: strategist AG capture failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Tier 3.3: relabel header so the scorecard is clearly identified
-        # as "best (post last accepted iter)" rather than conflated with
-        # the latest eval. After Tier 1.3, ``prev_accuracy`` is refreshed
-        # by the post-enrichment eval, so the two blocks now represent
-        # the same reality (current space state), but the label clarifies
-        # intent for operators reading stale runs.
-        print(
-            _section(f"ACTION GROUP {ag_id} — Iteration ({_iteration_label(iteration_counter)})") + "\n"
-            + _kv("Root cause", ag.get("root_cause_summary", "?")[:120]) + "\n"
-            + _kv("Levers", ", ".join(lever_keys)) + "\n"
-            + _kv("Affected questions", len(ag.get("affected_questions", []))) + "\n"
-            + _kv("Best accuracy (post last accepted)", f"{best_accuracy:.1f}%") + "\n"
-            + _scorecard(best_scores) + "\n"
-            + _kv(
-                "Failure analysis source",
-                f"iter {iteration_counter - 1} full eval (current space state)",
-            ) + "\n"
-            + _bar("=")
-        )
-
-        _ag_source_cids = list(ag.get("source_cluster_ids", []))
-        _ag_cluster_info: dict = {}
-        # Phase C2: derive identity fields used by DO-NOT-RETRY (D1-D3)
-        # from the first source cluster. Action groups can span multiple
-        # clusters but in practice they share a root cause (the strategist
-        # is instructed to merge clusters with the same blame set). The
-        # first cluster's root_cause / blame_set is representative enough
-        # for collision detection.
-        _ag_root_cause: str = ""
-        _ag_blame_set: Any = None
-        # T2.1: collect iteration-independent cluster signatures for
-        # every source cluster this AG targets. Reflection buffer stamps
-        # them so the next iteration can detect "this signature has
-        # been tried before" even if the pretty cluster_id changed.
-        _ag_source_signatures: list[str] = []
-        for _rc_idx, _rc in enumerate(ranked):
-            _rc_cid = _rc.get("cluster_id", "")
-            if _ag_source_cids and _rc_cid not in set(_ag_source_cids):
-                continue
-            _rc_sig = _rc.get("cluster_signature")
-            if _rc_sig and _rc_sig not in _ag_source_signatures:
-                _ag_source_signatures.append(_rc_sig)
-            if not _ag_cluster_info:
-                _ag_cluster_info = {
-                    "cluster_id": _rc_cid,
-                    "impact_score": _rc.get("impact_score"),
-                    "rank": _rc_idx + 1,
-                    "question_count": len(_rc.get("question_ids", [])),
-                    "root_cause": _rc.get("root_cause") or _rc.get("asi_failure_type"),
-                    "affected_questions": _rc.get("question_ids", [])[:20],
-                    "cluster_signature": _rc_sig,
+                _candidate_by_qid_for_delta = {
+                    _row_qid(r): r
+                    for r in (_failed_eval.get("rows") or [])
+                    if _row_qid(r)
                 }
-                _ag_root_cause = (
-                    _rc.get("asi_failure_type")
-                    or _rc.get("root_cause")
-                    or ""
-                )
-                _ag_blame_set = _rc.get("asi_blame_set")
-
-        # Phase C2: reusable identity kwargs for every _build_reflection_entry
-        # call in this AG iteration. Keeps call sites DRY while guaranteeing
-        # the forbidden-set / tried-cluster bookkeeping downstream always
-        # sees the same root_cause / blame_set / source_cluster_ids.
-        _ag_identity_kwargs = {
-            "root_cause": _ag_root_cause,
-            "blame_set": _ag_blame_set,
-            "source_cluster_ids": list(_ag_source_cids),
-            "source_cluster_signatures": list(_ag_source_signatures),
-        }
-
-        # Phase D2: collision guard. The strategist occasionally re-proposes
-        # a previously-rejected (root_cause, blame_set, lever_set) tuple
-        # despite the DO NOT RETRY hint in its prompt (see Q004 regression).
-        # When that happens, skip this AG rather than deploying the same
-        # patch again. The reflection entry is logged with rollback_class
-        # OTHER so this skip doesn't count against any budget — it's
-        # purely a routing correction.
-        _forbidden = _compute_forbidden_ag_set(reflection_buffer)
-        _collision_key = _ag_collision_key(
-            ag, _ag_root_cause, _ag_blame_set, lever_keys,
-        )
-        if _collision_key is not None and _collision_key in _forbidden:
-            _rc_k, _blame_k, _lever_k = _collision_key
-            print(
-                _section(f"[{ag_id}] AG COLLISION — skipping", "!") + "\n"
-                + _kv("Root cause", _rc_k) + "\n"
-                + _kv("Blame", _blame_k) + "\n"
-                + _kv("Lever set", sorted(_lever_k)) + "\n"
-                + _kv(
-                    "Reason",
-                    "strategist re-proposed a (root_cause, blame, lever_set) "
-                    "tuple previously rolled back for content regression",
-                ) + "\n"
-                + _bar("!")
-            )
-            write_stage(
-                spark, run_id, f"AG_{ag_id}_COLLISION_SKIPPED", "SKIPPED",
-                task_key="lever_loop", iteration=iteration_counter,
-                detail={
-                    "root_cause": _rc_k,
-                    "blame_set": list(_blame_k) if isinstance(_blame_k, tuple) else _blame_k,
-                    "lever_set": sorted(_lever_k),
-                },
-                catalog=catalog, schema=schema,
-            )
-            reflection_buffer.append(_build_reflection_entry(
-                iteration=iteration_counter, ag_id=ag_id, accepted=False,
-                levers=[int(lk) for lk in lever_keys], target_objects=[],
-                prev_scores=best_scores, new_scores=best_scores,
-                rollback_reason="ag_collision_with_forbidden_set",
-                patches=[],
-                affected_question_ids=ag.get("affected_questions", []),
-                prev_failure_qids=prev_failure_qids,
-                new_failure_qids=prev_failure_qids,
-                **_ag_identity_kwargs,
-            ))
-            _render_current_journey()
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="ag_identity_skip",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=ag_identity_skip skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        _ag_cluster_info["rationale"] = ag.get("rationale", strategy.get("rationale", "") if strategy else "")
-        _ag_cluster_info["escalation"] = ag.get("escalation") or None
-        _global_rewrite = strategy.get("global_instruction_rewrite", "") if strategy else ""
-        _ag_cluster_info["instruction_rewrite_preview"] = str(_global_rewrite)[:500] if _global_rewrite else ""
-
-        write_stage(
-            spark, run_id, f"AG_{ag_id}_STARTED", "STARTED",
-            task_key="lever_loop", iteration=iteration_counter,
-            detail=_ag_cluster_info if _ag_cluster_info else None,
-            catalog=catalog, schema=schema,
-        )
-
-        # ── 3B.4a+: Persist improvement proposals from strategist ───
-        _ag_proposals = ag.get("proposals", [])
-        if _ag_proposals and isinstance(_ag_proposals, list):
-            for _prop in _ag_proposals:
-                if not isinstance(_prop, dict):
-                    continue
                 try:
-                    write_suggestion(spark, catalog, schema, {
-                        "run_id": run_id,
-                        "space_id": space_id,
-                        "iteration": iteration_counter,
-                        "lever": None,
-                        "type": _prop.get("type", "METRIC_VIEW"),
-                        "title": _prop.get("title", "Untitled proposal"),
-                        "rationale": _prop.get("rationale"),
-                        "definition": _prop.get("definition"),
-                        "affected_questions": _prop.get("affected_questions", []),
-                        "estimated_impact": _prop.get("estimated_impact"),
-                    })
+                    _gt_by_qid = dict(reference_sqls or {})
                 except Exception:
-                    logger.debug("Failed to write suggestion from AG %s", ag_id, exc_info=True)
-            if _ag_proposals:
-                logger.info("Wrote %d improvement proposals from AG %s", len(_ag_proposals), ag_id)
+                    _gt_by_qid = {}
+                _sql_deltas: list[dict] = []
+                for _qid, _cand_row in _candidate_by_qid_for_delta.items():
+                    _gt_sql = str(_gt_by_qid.get(_qid, ""))
+                    if not _gt_sql:
+                        continue
+                    _acc_row = _accepted_by_qid.get(_qid, {})
+                    try:
+                        _delta = compute_sql_shape_delta(
+                            target_qid=_qid,
+                            accepted_sql=_row_sql(_acc_row),
+                            candidate_sql=_row_sql(_cand_row),
+                            ground_truth_sql=_gt_sql,
+                            accepted_row_count=_row_count(_acc_row),
+                            candidate_row_count=_row_count(_cand_row),
+                        )
+                    except Exception:
+                        continue
+                    if _delta.get("improved") or _delta.get("remaining"):
+                        _sql_deltas.append(_delta)
 
-        # ── 3B.4b: Handle escalation if present ─────────────────────
-        _escalation = ag.get("escalation", "")
-        if _escalation:
-            print(
-                _section(f"ESCALATION: {_escalation}", "!") + "\n"
-                + _kv("Type", _escalation) + "\n"
-                + _kv("Affected questions", ag.get("affected_questions", [])) + "\n"
-                + _bar("!")
-            )
-            _esc_result = _handle_escalation(
-                _escalation, ag,
-                w=w, spark=spark, run_id=run_id,
-                catalog=catalog, schema=schema, domain=domain,
-                iteration=iteration_counter,
-                benchmarks=benchmarks,
-                verdict_history=_verdict_history,
-                reflection_buffer=reflection_buffer,
-                metadata_snapshot=metadata_snapshot,
-            )
-            logger.info("Escalation result: %s", _esc_result)
-
-            write_stage(
-                spark, run_id, f"AG_{ag_id}_ESCALATION", "COMPLETE",
-                task_key="lever_loop", iteration=iteration_counter,
-                detail={
-                    "escalation_type": _escalation,
-                    "handled": _esc_result.get("handled", False),
-                    "detail": _esc_result.get("detail", {}),
-                    "affected_questions": ag.get("affected_questions", [])[:20],
-                },
-                catalog=catalog, schema=schema,
-            )
-
-            _esc_tier = _esc_result.get("detail", {}).get("tier_action", "")
-
-            if _escalation == "flag_for_review" or (
-                _escalation == "remove_tvf" and _esc_tier == "flagged_only"
-            ):
-                reflection_buffer.append(_build_reflection_entry(
+                reflection = _build_reflection_entry(
                     iteration=iteration_counter, ag_id=ag_id, accepted=False,
-                    levers=[], target_objects=ag.get("affected_questions", []),
-                    prev_scores=best_scores, new_scores=best_scores,
-                    rollback_reason=f"escalation:{_escalation}",
-                    patches=[],
+                    levers=[int(lk) for lk in lever_keys],
+                    target_objects=_target_objects,
+                    prev_scores=best_scores, new_scores=_failed_scores,
+                    rollback_reason=reason, patches=patches,
                     affected_question_ids=ag.get("affected_questions", []),
                     prev_failure_qids=prev_failure_qids,
-                    new_failure_qids=prev_failure_qids,
-                    escalation_handled=True,
+                    new_failure_qids=_rb_fail_qids or prev_failure_qids,
+                    reflection_text=_rb_reflection,
+                    refinement_mode=_rb_refinement,
                     **_ag_identity_kwargs,
-                ))
-                continue
-
-            if _escalation == "gt_repair":
-                _gt_repair_corrections = _esc_result.get("detail", {}).get("corrections_applied", 0)
-                if _gt_repair_corrections > 0:
-                    reflection_buffer.append(_build_reflection_entry(
-                        iteration=iteration_counter, ag_id=ag_id, accepted=True,
-                        levers=[], target_objects=ag.get("affected_questions", []),
-                        prev_scores=best_scores, new_scores=best_scores,
-                        rollback_reason=None,
-                        patches=[],
-                        affected_question_ids=ag.get("affected_questions", []),
-                        prev_failure_qids=prev_failure_qids,
-                        new_failure_qids=prev_failure_qids,
-                        reflection_text=f"GT repair applied {_gt_repair_corrections} benchmark correction(s)",
-                        escalation_handled=True,
-                        **_ag_identity_kwargs,
-                    ))
-                else:
-                    _unfixed = set(ag.get("affected_questions", [])) - set(
-                        _esc_result.get("detail", {}).get("corrected_qids", [])
-                    ) - set(
-                        _esc_result.get("detail", {}).get("quarantined_qids", [])
-                    )
-                    escalated_gt_repair_qids.update(_unfixed)
-                    reflection_buffer.append(_build_reflection_entry(
-                        iteration=iteration_counter, ag_id=ag_id, accepted=False,
-                        levers=[], target_objects=ag.get("affected_questions", []),
-                        prev_scores=best_scores, new_scores=best_scores,
-                        rollback_reason="escalation:gt_repair (delegated to arbiter)",
-                        patches=[],
-                        affected_question_ids=ag.get("affected_questions", []),
-                        prev_failure_qids=prev_failure_qids,
-                        new_failure_qids=prev_failure_qids,
-                        escalation_handled=True,
-                        **_ag_identity_kwargs,
-                    ))
-                continue
-
-            if _escalation == "remove_tvf" and _esc_tier in ("auto_apply", "apply_and_flag"):
-                _tvf_id = _esc_result.get("detail", {}).get("tvf_id", "")
-                _prev_asset = _esc_result.get("detail", {}).get("previous_tvf_asset", {})
-                if _tvf_id:
-                    _synthetic_patch = {
-                        "type": "remove_tvf",
-                        "target": _tvf_id,
-                        "new_text": "",
-                        "old_text": "",
-                        "previous_tvf_asset": _prev_asset,
-                        "lever": 3,
-                        "risk_level": "high",
-                        "predicted_affected_questions": len(ag.get("affected_questions", [])),
-                        "rationale": (
-                            f"TVF {_tvf_id} auto-removed by tiered confidence model "
-                            f"(tier={_esc_tier})"
-                        ),
-                    }
-                    _tvf_conf = _esc_result.get("detail", {}).get("confidence", "?")
-                    print(
-                        _section(f"[{ag_id}] SYNTHETIC remove_tvf PATCH", "!") + "\n"
-                        + _kv("TVF", _tvf_id) + "\n"
-                        + _kv("Confidence", _tvf_conf) + "\n"
-                        + _kv("Tier action", _esc_tier) + "\n"
-                        + _bar("!")
-                    )
-                    _tvf_apply_log = apply_patch_set(
-                        w, space_id, [_synthetic_patch], metadata_snapshot,
-                        apply_mode=apply_mode,
-                        force_apply=True,
-                    )
-                    _tvf_lever = 3
-                    for idx, entry in enumerate(_tvf_apply_log.get("applied", [])):
-                        write_patch(
-                            spark, run_id, iteration_counter, _tvf_lever, idx,
-                            _build_patch_record(entry, _tvf_lever, apply_mode),
-                            catalog, schema,
-                        )
-                    if _tvf_apply_log.get("patch_deployed", False):
-                        logger.info("TVF %s removed successfully (tier=%s)", _tvf_id, _esc_tier)
-                        metadata_snapshot = _tvf_apply_log.get("post_snapshot", metadata_snapshot)
-                        if _original_instruction_sections:
-                            metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
-                    else:
-                        logger.warning(
-                            "TVF removal patch deploy failed: %s",
-                            _tvf_apply_log.get("patch_error", "unknown"),
-                        )
-                else:
-                    logger.warning(
-                        "remove_tvf escalation with tier %s but no tvf_id — skipping",
-                        _esc_tier,
-                    )
-
-        try:
-            from genie_space_optimizer.optimization.rca_execution import (
-                forced_levers_from_reflections,
-                next_grounding_remediation,
-                plans_for_action_group,
-                required_levers_for_action_group,
-                union_execution_levers,
-            )
-
-            _source_clusters_for_execution = strategy.get("_source_clusters", [])
-            _rca_plans_for_ag = plans_for_action_group(
-                ag,
-                metadata_snapshot.get("_rca_execution_plans") or [],
-                source_clusters=_source_clusters_for_execution,
-            )
-            _rca_required_levers = required_levers_for_action_group(
-                ag,
-                metadata_snapshot.get("_rca_execution_plans") or [],
-                source_clusters=_source_clusters_for_execution,
-            )
-            _forced_from_reflections = forced_levers_from_reflections(
-                reflection_buffer,
-                target_rca_ids=tuple(p.rca_id for p in _rca_plans_for_ag),
-                min_repeats=2,
-            )
-            _grounding_remediation = next_grounding_remediation(
-                reflection_buffer,
-                target_rca_ids=tuple(p.rca_id for p in _rca_plans_for_ag),
-            )
-            _forced_from_grounding = tuple(
-                int(x)
-                for x in (_grounding_remediation.get("forced_levers") or ())
-            )
-            _all_required_rca_levers = tuple(dict.fromkeys(
-                list(_rca_required_levers)
-                + list(_forced_from_reflections)
-                + list(_forced_from_grounding)
-            ))
-            if _all_required_rca_levers:
-                ag["_rca_execution"] = {
-                    "rca_ids": [p.rca_id for p in _rca_plans_for_ag],
-                    "required_levers": list(_all_required_rca_levers),
-                    "defect_keys": [p.defect_key for p in _rca_plans_for_ag],
-                    "grounding_terms": sorted({
-                        term for p in _rca_plans_for_ag for term in p.grounding_terms
-                    }),
-                    "forced_from_reflections": list(_forced_from_reflections),
-                    "grounding_remediation": _grounding_remediation.get("action", "none"),
-                }
-                lever_keys = union_execution_levers(
-                    lever_keys,
-                    _all_required_rca_levers,
                 )
-                logger.info(
-                    "[%s] RCA execution required levers=%s final_levers=%s rca_ids=%s",
-                    ag_id,
-                    list(_all_required_rca_levers),
-                    lever_keys,
-                    ag["_rca_execution"]["rca_ids"],
-                )
-        except Exception:
-            logger.debug("Failed to union RCA-required levers", exc_info=True)
-
-        if "6" in lever_keys:
-            try:
-                from genie_space_optimizer.optimization.control_plane import (
-                    rows_for_qids,
-                    target_qids_from_action_group,
-                )
-                from genie_space_optimizer.optimization.feature_mining import (
-                    extract_failed_row_sql_expression_candidates,
-                )
-
-                _all_rows_for_structural_learning = _get_failure_rows(
-                    spark, run_id, catalog, schema,
-                )
-                _structural_target_qids = target_qids_from_action_group(
-                    ag,
-                    strategy.get("_source_clusters", []),
-                )
-                _structural_rows = rows_for_qids(
-                    _all_rows_for_structural_learning,
-                    _structural_target_qids,
-                )
-                _structural_candidates: list[dict] = []
-                for _row in _structural_rows:
-                    for _candidate in extract_failed_row_sql_expression_candidates(_row):
-                        _structural_candidates.append(_candidate.as_dict())
-                if _structural_candidates:
-                    ag["_lever6_structural_candidates"] = _structural_candidates
-                    logger.info(
-                        "[%s] Lever 6 structural candidates from failed GT SQL: %d",
-                        ag_id,
-                        len(_structural_candidates),
-                    )
-                    print(
-                        _section(
-                            f"LEVER 6 STRUCTURAL SQL LEARNING [{ag_id}]",
-                            "-",
-                        )
-                        + "\n"
-                        + _kv("Scoped rows", len(_structural_rows))
-                        + "\n"
-                        + _kv("Candidates", len(_structural_candidates))
-                        + "\n"
-                        + _kv(
-                            "Source",
-                            "arbiter-approved failed question expected_sql",
-                        )
-                        + "\n"
-                        + _bar("-")
-                    )
-            except Exception:
-                logger.debug(
-                    "Failed to attach Lever 6 structural candidates",
-                    exc_info=True,
-                )
-
-        # ── 3B.5: Generate proposals + apply patches ─────────────────
-        # Task 4 — initialize per-AG patch-survival snapshots. They get
-        # filled in at each handoff gate (proposed → normalized →
-        # applyable → capped → applied) and printed after the applier so
-        # operators can see exactly where patches were dropped.
-        _survival_proposed: list[dict] = []
-        _survival_normalized: list[dict] = []
-        _survival_applyable: list[dict] = []
-        _survival_capped: list[dict] = []
-        all_proposals: list[dict] = []
-        for lever_key in lever_keys:
-            lever_int = int(lever_key)
-            levers_attempted.append(lever_int)
-            lever_proposals = generate_proposals_from_strategy(
-                strategy=strategy,
-                action_group=ag,
-                metadata_snapshot=metadata_snapshot,
-                target_lever=lever_int,
-                apply_mode=apply_mode,
-                w=w,
-                spark=spark,
-                catalog=catalog,
-                gold_schema=schema,
-                warehouse_id=resolve_warehouse_id(""),
-                benchmarks=benchmarks,
-                # Cycle 9 W4 — pass the per-run DOA fingerprint buffer so
-                # the strategist's end-of-function prune drops candidates
-                # whose retry signature was already captured as
-                # target_still_hard in this run.
-                doa_fingerprint_buffer=_doa_fingerprint_buffer,
-            )
-            all_proposals.extend(lever_proposals)
-
-        # P4 task 5 — stdout marker when an AG produced zero proposals.
-        # Distinct from STRUCTURAL_GATE_DROPPED (proposal existed but
-        # was dropped) and NO_STRUCTURAL_CANDIDATE (synthesis attempted
-        # but no archetype matched). Emitted before the L5-drop block
-        # so the empty-proposals signal fires regardless of L5 state.
-        if not all_proposals:
-            try:
-                from genie_space_optimizer.optimization.run_analysis_contract import (
-                    proposal_generation_empty_marker,
-                )
-                print(proposal_generation_empty_marker(
-                    ag_id=str(ag_id),
-                    iteration=iteration_counter,
-                    target_qids=tuple(
-                        str(q) for q in (ag.get("affected_questions") or [])
-                        if str(q)
-                    ),
-                ), flush=True)
-            except Exception:
-                logger.debug(
-                    "P4: proposal_generation_empty_marker emit failed (non-fatal)",
-                    exc_info=True,
-                )
-
-        # Cycle 8 Bug 1 Phase 3b Task B — drain Lever 5 structural-gate
-        # drops for this AG into the iteration's decision_records. The
-        # gate fires inside generate_proposals_from_strategy and stashes
-        # one record per drop on optimizer._LEVER5_GATE_DROPS; we snapshot
-        # here, filter to this AG, and build a typed GATE_DECISION
-        # DecisionRecord. The full ledger is reset at the end of the
-        # iteration alongside the Bug-4 counters.
-        try:
-            from genie_space_optimizer.optimization.optimizer import (
-                get_lever5_gate_drops as _get_lever5_gate_drops,
-            )
-            from genie_space_optimizer.optimization.decision_emitters import (
-                lever5_structural_gate_records as _lever5_structural_gate_records,
-            )
-
-            _l5_all_drops = _get_lever5_gate_drops()
-            _l5_ag_drops = [
-                d for d in _l5_all_drops
-                if str(d.get("ag_id") or "") == str(ag_id)
-            ]
-            if _l5_ag_drops:
-                _l5_ag_root_cause = ""
-                _l5_ag_rca_id = ""
-                for _cid in (ag.get("source_cluster_ids") or []):
-                    _l5_ag_rca_id = str(
-                        _iter_rca_id_by_cluster.get(str(_cid)) or ""
-                    )
-                    _src_cluster = _iter_source_clusters_by_id.get(str(_cid))
-                    if isinstance(_src_cluster, dict) and not _l5_ag_root_cause:
-                        _l5_ag_root_cause = str(
-                            _src_cluster.get("root_cause") or ""
-                        )
-                    if _l5_ag_rca_id and _l5_ag_root_cause:
-                        break
-                _l5_records = _lever5_structural_gate_records(
+                reflection["sql_shape_deltas"] = _sql_deltas
+                _attach_rca_theme_attribution(
+                    spark=spark,
                     run_id=run_id,
-                    iteration=iteration_counter,
-                    ag_id=str(ag_id),
-                    rca_id=_l5_ag_rca_id,
-                    root_cause=_l5_ag_root_cause,
-                    target_qids=tuple(
-                        str(q) for q in (ag.get("affected_questions") or [])
-                        if str(q)
-                    ),
-                    drops=_l5_ag_drops,
-                )
-                _current_iter_inputs.setdefault(
-                    "decision_records", []
-                ).extend([r.to_dict() for r in _l5_records])
-
-                # P4 task 5 — stdout marker for the L5 structural-gate
-                # drop. Aggregates root_causes across the AG's drops.
-                try:
-                    from genie_space_optimizer.optimization.run_analysis_contract import (
-                        structural_gate_dropped_marker,
-                    )
-                    _l5_marker_root_causes: list[str] = []
-                    for _md in _l5_ag_drops:
-                        for _rc in (_md.get("root_causes") or ()):
-                            _rc_s = str(_rc)
-                            if _rc_s and _rc_s not in _l5_marker_root_causes:
-                                _l5_marker_root_causes.append(_rc_s)
-                    print(structural_gate_dropped_marker(
-                        ag_id=str(ag_id),
-                        iteration=iteration_counter,
-                        root_causes=_l5_marker_root_causes,
-                        target_qids=tuple(
-                            str(q) for q in (ag.get("affected_questions") or [])
-                            if str(q)
-                        ),
-                    ), flush=True)
-                except Exception:
-                    logger.debug(
-                        "P4: structural_gate_dropped_marker emit failed (non-fatal)",
-                        exc_info=True,
-                    )
-
-                # P3 task 3+4 wiring — force structural synthesis when
-                # the lever-5 structural gate drops an instruction-only
-                # proposal for a SQL-shape root cause. Closes the iter-2
-                # / iter-5 silent-skip path in run
-                # 2423b960-16e8-41d4-a0cb-74c563378e05. Same-iteration
-                # injection: a synthesized add_example_sql is appended
-                # to ``all_proposals`` so it flows through the existing
-                # normalization / applyability / applier pipeline. On
-                # failure, a NO_STRUCTURAL_CANDIDATE record is emitted
-                # so the transcript shows synthesis was attempted.
-                try:
-                    from genie_space_optimizer.optimization.cluster_driven_synthesis import (
-                        run_cluster_driven_synthesis_for_single_cluster,
-                    )
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        no_structural_candidate_record,
-                    )
-
-                    for _drop in _l5_ag_drops:
-                        _drop_cluster: dict | None = None
-                        _drop_root_cause = ""
-                        for _rc in (_drop.get("root_causes") or ()):
-                            if not _should_force_structural_synthesis(
-                                gate_drop_reason=(
-                                    "lever5_structural_sql_shape_no_example_sql"
-                                ),
-                                cluster_root_cause=str(_rc),
-                            ):
-                                continue
-                            for _cid in (_drop.get("source_clusters") or ()):
-                                _cand = _iter_source_clusters_by_id.get(str(_cid))
-                                if isinstance(_cand, dict) and str(
-                                    _cand.get("root_cause") or ""
-                                ) == str(_rc):
-                                    _drop_cluster = _cand
-                                    _drop_root_cause = str(_rc)
-                                    break
-                            if _drop_cluster is not None:
-                                break
-                        if _drop_cluster is None:
-                            continue
-                        _synth_result = run_cluster_driven_synthesis_for_single_cluster(
-                            _drop_cluster,
-                            metadata_snapshot,
-                            benchmarks=benchmarks,
-                            catalog=catalog,
-                            gold_schema=schema,
-                            warehouse_id=resolve_warehouse_id(""),
-                            w=w,
-                            spark=spark,
-                        )
-                        if _synth_result.proposal is not None:
-                            _sp = _synth_result.proposal
-                            _forced_proposal = {
-                                "proposal_id": f"P{len(all_proposals) + 1:03d}",
-                                "cluster_id": f"{ag_id}_FORCED_SYN",
-                                "lever": 5,
-                                "scope": "genie_config",
-                                "patch_type": "add_example_sql",
-                                "change_description": (
-                                    f"[{ag_id}] Forced structural synthesis: "
-                                    f"{str(_sp.get('example_question', ''))[:80]}"
-                                ),
-                                "proposed_value": _sp.get("example_question", ""),
-                                "example_question": _sp.get("example_question", ""),
-                                "example_sql": _sp.get("example_sql", ""),
-                                "parameters": _sp.get("parameters", []) or [],
-                                "usage_guidance": _sp.get("usage_guidance", ""),
-                                "rationale": (
-                                    f"Forced structural synthesis at L5 gate "
-                                    f"drop (archetype="
-                                    f"{_sp.get('_archetype_name', '?')}). "
-                                    f"Root cause: {_drop_root_cause}."
-                                ),
-                                "confidence": 0.85,
-                                "questions_fixed": 1,
-                                "questions_at_risk": 0,
-                                "net_impact": 0.85,
-                                "kit_id": _sp.get("kit_id", ""),
-                                "target_qids": _sp.get("target_qids", []),
-                                "rca_id": _sp.get("rca_id", ""),
-                                "_archetype_name": _sp.get("_archetype_name", ""),
-                                "_cluster_id": _sp.get("_cluster_id", ""),
-                                "provenance": {
-                                    "synthesis_source": "forced_lever5_drop",
-                                    "drop_root_cause": _drop_root_cause,
-                                    "kit_id": _sp.get("kit_id", ""),
-                                    "target_qids": _sp.get("target_qids", []),
-                                },
-                            }
-                            all_proposals.append(_forced_proposal)
-                            logger.info(
-                                "P3: forced structural synthesis succeeded "
-                                "for AG=%s root_cause=%s archetype=%s",
-                                ag_id, _drop_root_cause,
-                                _sp.get("_archetype_name", "?"),
-                            )
-                        else:
-                            _nsc = no_structural_candidate_record(
-                                run_id=run_id,
-                                iteration=iteration_counter,
-                                ag_id=str(ag_id),
-                                cluster_id=str(
-                                    _drop_cluster.get("cluster_id") or ""
-                                ),
-                                rca_id=_l5_ag_rca_id,
-                                root_cause=_drop_root_cause,
-                                target_qids=tuple(
-                                    str(q) for q in (
-                                        ag.get("affected_questions") or []
-                                    )
-                                    if str(q)
-                                ),
-                                attempted_archetypes=(
-                                    _synth_result.attempted_archetypes
-                                ),
-                            )
-                            _current_iter_inputs.setdefault(
-                                "decision_records", []
-                            ).append(_nsc.to_dict())
-                            try:
-                                from genie_space_optimizer.optimization.run_analysis_contract import (
-                                    no_structural_candidate_marker,
-                                )
-                                print(no_structural_candidate_marker(
-                                    ag_id=str(ag_id),
-                                    iteration=iteration_counter,
-                                    attempted_archetypes=(
-                                        _synth_result.attempted_archetypes
-                                    ),
-                                ), flush=True)
-                            except Exception:
-                                logger.debug(
-                                    "P4: no_structural_candidate_marker emit "
-                                    "failed (non-fatal)",
-                                    exc_info=True,
-                                )
-                            logger.info(
-                                "P3: forced structural synthesis produced no "
-                                "candidate for AG=%s root_cause=%s "
-                                "skipped=%s archetypes=%s",
-                                ag_id, _drop_root_cause,
-                                _synth_result.skipped_reason,
-                                _synth_result.attempted_archetypes,
-                            )
-                except Exception:
-                    _phase_b_producer_exceptions[
-                        "forced_structural_synthesis"
-                    ] = (
-                        _phase_b_producer_exceptions.get(
-                            "forced_structural_synthesis", 0
-                        ) + 1
-                    )
-                    logger.debug(
-                        "P3: forced-structural-synthesis at L5 drop "
-                        "site failed (non-fatal)",
-                        exc_info=True,
-                    )
-                    if _phase_b_strict_mode():
-                        raise
-        except Exception as _lever5_structural_gate_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="lever5_structural_gate",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_lever5_structural_gate_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for lever5_structural_gate",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["lever5_structural_gate"] = (
-                _phase_b_producer_exceptions.get("lever5_structural_gate", 0) + 1
-            )
-            logger.debug(
-                "Cycle 8 3b: lever5_structural_gate_records failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Cycle 7 N3: force one Lever-6 add_sql_snippet_* candidate
-        # when the AG's source cluster has a SQL-shape root cause,
-        # ``recommended_levers`` includes 6, and no L6 patch is
-        # already in this AG's slate. Closes the run-to-run variance
-        # on gs_009 missing_filter between attempts 596465849524605
-        # (no L6, terminal 95.8%) and 993610879088298 (L6 emitted,
-        # 100% in 2 iters). Default off behind
-        # ``GSO_REQUIRE_LEVER6_FOR_SQL_SHAPE_RCA``.
-        try:
-            from genie_space_optimizer.optimization.optimizer import (
-                _generate_lever6_proposal,
-            )
-            for _force_cid in (ag.get("source_cluster_ids") or ()):
-                _force_cluster = _iter_source_clusters_by_id.get(
-                    str(_force_cid)
-                )
-                if not isinstance(_force_cluster, dict):
-                    continue
-                # Cycle 9 W1: AG_DECOMPOSED_* AGs (Cycle 6
-                # decompose_overbroad_ag) populate ``affected_questions``
-                # but leave ``target_qids`` empty. The legacy reader
-                # silently disabled Cycle 7 N3 for those AGs in
-                # production runs (run 1099b152). Fall back to
-                # ``affected_questions`` when the flag is on.
-                from genie_space_optimizer.common.config import (
-                    force_l6_reads_affected_questions_enabled
-                    as _force_l6_fallback_on,
-                )
-                _force_target_qids_legacy = tuple(
-                    str(q) for q in (ag.get("target_qids") or ())
-                    if str(q)
-                )
-                if (
-                    _force_target_qids_legacy
-                    or not _force_l6_fallback_on()
-                ):
-                    _force_target_qids = _force_target_qids_legacy
-                else:
-                    _force_target_qids = tuple(
-                        str(q)
-                        for q in (ag.get("affected_questions") or ())
-                        if str(q)
-                    )
-                # Cycle 10 W3.4 — narrow try/except around the inner
-                # call so we can attribute None vs raise outcomes to a
-                # typed decision record instead of the legacy DEBUG-
-                # swallow at the outer except.
-                _force_outcome = "ok"
-                _force_exception_repr = ""
-                _forced_l6 = None
-                try:
-                    _forced_l6 = _force_lever6_proposal_for_ag(
-                        run_id=str(run_id),
-                        iteration=int(iteration_counter),
-                        ag_id=str(ag_id),
-                        cluster=dict(_force_cluster),
-                        ag_target_qids=_force_target_qids,
-                        ag_proposals_so_far=list(all_proposals),
-                        metadata_snapshot=metadata_snapshot,
-                        decision_emit=lambda _rec: (
-                            _current_iter_inputs.setdefault(
-                                "decision_records", []
-                            ).append(_rec.to_dict())
-                        ),
-                        generate_lever6=_generate_lever6_proposal,
-                        w=w,
-                        spark=spark,
-                        catalog=catalog,
-                        gold_schema=schema,
-                        warehouse_id=resolve_warehouse_id(""),
-                        benchmarks=benchmarks,
-                    )
-                    if _forced_l6 is None:
-                        _force_outcome = "declined"
-                except Exception as _force_exc:
-                    _force_outcome = "raised"
-                    _force_exception_repr = repr(_force_exc)[:512]
-                    try:
-                        from genie_space_optimizer.common.config import (
-                            phase_b_producer_typed_exceptions_enabled as _typed_on,
-                        )
-                        if _typed_on():
-                            from genie_space_optimizer.optimization.decision_emitters import (
-                                producer_exception_record as _producer_exception_record,
-                            )
-                            _pe_rec = _producer_exception_record(
-                                run_id=run_id,
-                                iteration=iteration_counter,
-                                producer="forced_lever6_n3",
-                                ag_id=str((ag or {}).get("id") or ""),
-                                exception=_force_exc,
-                            )
-                            _current_iter_inputs.setdefault(
-                                "decision_records", []
-                            ).append(_pe_rec.to_dict())
-                    except Exception:
-                        logger.debug(
-                            "Phase B: producer_exception_record emission failed for forced_lever6_n3",
-                            exc_info=True,
-                        )
-                    _phase_b_producer_exceptions["forced_lever6_n3"] = (
-                        _phase_b_producer_exceptions.get(
-                            "forced_lever6_n3", 0
-                        ) + 1
-                    )
-                    logger.debug(
-                        "Cycle 7 N3: forced Lever-6 emit raised (non-fatal)",
-                        exc_info=True,
-                    )
-                    if _phase_b_strict_mode():
-                        raise
-
-                if _forced_l6 is not None:
-                    _forced_l6 = dict(_forced_l6)
-                    _forced_l6["proposal_id"] = (
-                        f"P{len(all_proposals) + 1:03d}"
-                    )
-                    _forced_l6.setdefault(
-                        "cluster_id",
-                        _force_cluster.get("cluster_id", ag_id),
-                    )
-                    _forced_l6.setdefault("scope", "genie_config")
-                    _forced_l6["change_description"] = (
-                        f"[{ag_id}] FORCED Lever-6 SQL Expression: "
-                        f"{_forced_l6.get('display_name', 'unnamed')} "
-                        f"({_forced_l6.get('snippet_type', '?')})"
-                    )
-                    _forced_l6.setdefault(
-                        "proposed_value", _forced_l6.get("sql", "")
-                    )
-                    _forced_l6.setdefault(
-                        "rationale",
-                        f"Cycle 7 N3 forced Lever-6 for "
-                        f"{_force_cluster.get('root_cause', '?')}",
-                    )
-                    _forced_l6.setdefault("questions_at_risk", 0)
-                    _forced_l6.setdefault(
-                        "net_impact",
-                        max(
-                            _forced_l6.get("questions_fixed", 0) * 0.7,
-                            1.0,
-                        ),
-                    )
-                    all_proposals.append(_forced_l6)
-                    logger.info(
-                        "Cycle 7 N3: forced Lever-6 candidate succeeded "
-                        "for AG=%s cluster=%s root_cause=%s",
-                        ag_id,
-                        _force_cluster.get("cluster_id", "?"),
-                        _force_cluster.get("root_cause", "?"),
-                    )
-                else:
-                    # Cycle 10 W3.4 — typed outcome instead of silent
-                    # absorption when force-L6 declined or raised.
-                    _emit_force_l6_outcome(
-                        outcome=_force_outcome,
-                        run_id=str(run_id),
-                        iteration=int(iteration_counter),
-                        ag_id=str(ag_id),
-                        cluster_id=str(
-                            _force_cluster.get("cluster_id", "?")
-                        ),
-                        root_cause=str(
-                            _force_cluster.get("root_cause", "?")
-                        ),
-                        target_qids=_force_target_qids,
-                        exception_repr=_force_exception_repr,
-                        iter_inputs=_current_iter_inputs,
-                    )
-        except Exception as _forced_lever6_n3_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="forced_lever6_n3",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_forced_lever6_n3_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for forced_lever6_n3",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["forced_lever6_n3"] = (
-                _phase_b_producer_exceptions.get(
-                    "forced_lever6_n3", 0
-                ) + 1
-            )
-            logger.debug(
-                "Cycle 7 N3: forced Lever-6 outer scope failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Task 4 — patch-survival snapshot: proposed gate.
-        _survival_proposed = list(all_proposals)
-
-        # ── T2.2: Reflection-as-validator ────────────────────────────
-        # Build a per-patch forbidden set from prior rolled-back iterations
-        # and drop any proposal whose (patch_type, target) signature was
-        # already rolled back. Without this the strategist routinely
-        # re-proposes the same patch type against the same table after a
-        # content regression (observed: iter-1 + iter-3 of a real run
-        # both patched ``mv_<domain>_fact_<entity>.description`` →
-        # rolled back → iter-3 re-proposed ``update_description`` on
-        # the same table).
-        #
-        # Escape hatch: a proposal carrying
-        # ``escalation_justification: <non-empty>`` bypasses the filter,
-        # and every rejection is logged so operators can see what was
-        # dropped and why. The existing cluster-level DO-NOT-RETRY
-        # (_compute_forbidden_ag_set) covers lever/root-cause combos;
-        # this new per-patch guard covers patch-type/target combos.
-        # Task 18 — precise reflection retry. Build the forbidden set
-        # using ``patch_retry_signature`` (column-/section-level) so a
-        # rolled-back patch on column ``A`` of table ``T`` does not
-        # block a fresh patch on column ``B`` of the same table. The
-        # coarse ``(ptype, target)`` set is kept in parallel for the
-        # rewrite-bypass emission below.
-        from genie_space_optimizer.optimization.reflection_retry import (
-            patch_retry_signature,
-            retry_allowed_after_rollback,
-        )
-
-        _patch_forbidden: set[tuple[str, str]] = set()
-        _patch_forbidden_signatures: set[tuple] = set()
-        _rolled_back_patches_for_retry: list[dict] = []
-        _content_rollback_cause: str = ""
-        for _rb in reflection_buffer:
-            if _rb.get("accepted"):
-                continue
-            # CONTENT_REGRESSION rollbacks are the ones that signal "the
-            # patch made things worse". Other classes (infra, schema)
-            # don't indicate the patch was wrong, only that applying it
-            # blew up.
-            from genie_space_optimizer.optimization.rollback_class import (
-                RollbackClass as _RC,
-            )
-            if _rb.get("rollback_class") != _RC.CONTENT_REGRESSION.value:
-                continue
-            _content_rollback_cause = str(_rb.get("rollback_class") or "")
-            for _dnr in _rb.get("do_not_retry", []):
-                _s = str(_dnr).strip()
-                if " on " not in _s:
-                    continue
-                _ptype, _target = _s.split(" on ", 1)
-                _patch_forbidden.add((_ptype.strip(), _target.strip()))
-            # Task 18 — precise patch signatures for the rolled-back
-            # patches stored on the reflection entry.
-            for _rb_patch in _rb.get("do_not_retry_patches", []) or []:
-                if isinstance(_rb_patch, dict):
-                    _rolled_back_patches_for_retry.append(_rb_patch)
-                    _patch_forbidden_signatures.add(
-                        patch_retry_signature(_rb_patch)
-                    )
-
-        # B1.3 — diagnostics so an empty ``_patch_forbidden`` is
-        # debuggable: distinguish (a) no rollbacks yet, (b) all
-        # rollbacks classified non-CONTENT_REGRESSION, (c)
-        # CONTENT_REGRESSION rollbacks but empty ``do_not_retry``.
-        from genie_space_optimizer.optimization.rollback_class import (
-            RollbackClass as _RC_DIAG,
-        )
-        _total_rb = sum(
-            1 for r in reflection_buffer if not r.get("accepted")
-        )
-        _content_rb = sum(
-            1 for r in reflection_buffer
-            if not r.get("accepted")
-            and r.get("rollback_class") == _RC_DIAG.CONTENT_REGRESSION.value
-        )
-        _content_rb_with_dnr = sum(
-            1 for r in reflection_buffer
-            if not r.get("accepted")
-            and r.get("rollback_class") == _RC_DIAG.CONTENT_REGRESSION.value
-            and r.get("do_not_retry")
-        )
-        logger.info(
-            "[%s] T2.2 forbidden set: size=%d  rollbacks_total=%d  "
-            "content_rollbacks=%d  with_do_not_retry=%d",
-            ag_id, len(_patch_forbidden), _total_rb, _content_rb,
-            _content_rb_with_dnr,
-        )
-
-        # PR-E Task 3 — content-fingerprint dedup runs irrespective of
-        # rollback_class so byte-identical re-proposals get blocked even
-        # when the rollback was infra/insufficient-gain (which leaves
-        # ``do_not_retry`` empty and lets the existing _patch_forbidden
-        # match miss the duplicate). Build the all-rollbacks list inline
-        # because _rolled_back_patches_for_retry filters to
-        # CONTENT_REGRESSION only.
-        _all_rolled_back_patches_for_dedup: list[dict] = []
-        for _rb in reflection_buffer:
-            if _rb.get("accepted"):
-                continue
-            for _rb_patch in _rb.get("do_not_retry_patches", []) or []:
-                if isinstance(_rb_patch, dict):
-                    _all_rolled_back_patches_for_dedup.append(_rb_patch)
-        all_proposals, _content_dedup_dropped = (
-            _drop_proposals_matching_rolled_back_content_fingerprints(
-                proposals=all_proposals,
-                rolled_back_patches=_all_rolled_back_patches_for_dedup,
-            )
-        )
-        if _content_dedup_dropped:
-            logger.info(
-                "[%s] PR-E content-fingerprint dedup dropped %d proposals",
-                ag_id, len(_content_dedup_dropped),
-            )
-
-        if _patch_forbidden:
-            from genie_space_optimizer.common.config import (
-                ENFORCE_REFLECTION_REVALIDATION,
-            )
-            _kept: list[dict] = []
-            _dropped: list[tuple[str, str, str]] = []  # (ptype, target, reason)
-            _reflection_rewrites: list[dict] = []  # for audit emission below
-            # Map ``(ptype, target)`` → previous proposal_id so we can
-            # link parent_proposal_id when a rewrite passes the bypass.
-            _prev_proposal_ids: dict[tuple[str, str], str] = {}
-            for _rb in reflection_buffer:
-                if _rb.get("accepted"):
-                    continue
-                for _entry in _rb.get("do_not_retry", []) or []:
-                    _es = str(_entry).strip()
-                    if " on " in _es:
-                        _ept, _etgt = _es.split(" on ", 1)
-                        _prev_proposal_ids.setdefault(
-                            (_ept.strip(), _etgt.strip()),
-                            str(_rb.get("ag_id") or ""),
-                        )
-            for _p in all_proposals:
-                _ptype = str(_p.get("type") or _p.get("patch_type") or "")
-                # B1.1 — raw proposals carry ``table`` (column-level
-                # patches) before ``proposals_to_patches`` populates
-                # ``target``. Without reading ``table`` here, T2.2
-                # extracts ``"?"`` and never matches the forbidden
-                # set entries (which use the FQN target string).
-                _target = str(
-                    _p.get("target") or _p.get("target_object")
-                    or _p.get("target_table")
-                    or _p.get("table")
-                    or "?"
-                )
-                _key = (_ptype, _target)
-                _justification = str(_p.get("escalation_justification") or "").strip()
-                # Task 18 — precise signature short-circuit. If the
-                # patch's column-/section-level ``patch_retry_signature``
-                # is NOT in the rolled-back set, ``retry_allowed_after_rollback``
-                # returns ``allowed=True`` and we keep the proposal even if
-                # the coarse ``(ptype, target)`` key matches.
-                _precise_sig = patch_retry_signature(_p)
-                if (
-                    _key in _patch_forbidden
-                    and _precise_sig not in _patch_forbidden_signatures
-                ):
-                    _retry_decision = retry_allowed_after_rollback(
-                        current_patch=_p,
-                        rolled_back_patches=_rolled_back_patches_for_retry,
-                        rollback_cause=_content_rollback_cause,
-                    )
-                    if _retry_decision.allowed:
-                        logger.info(
-                            "[%s] T2.2 precise retry allowed: ptype=%s target=%s "
-                            "reason=%s",
-                            ag_id, _ptype, _target, _retry_decision.reason,
-                        )
-                        _kept.append(_p)
-                        continue
-                if _key in _patch_forbidden:
-                    if not _justification:
-                        _dropped.append((_ptype, _target,
-                                         "rolled back previously (no escalation_justification)"))
-                        continue
-                    if (
-                        ENFORCE_REFLECTION_REVALIDATION
-                        and len(_justification) < 16
-                    ):
-                        # Task 10: a one-word justification is not
-                        # enough evidence. Require concrete reasoning
-                        # so the bypass is auditable, not free.
-                        _dropped.append((_ptype, _target,
-                                         "escalation_justification too short to be concrete"))
-                        continue
-                    # Task 10: this is a reflection rewrite. Treat as
-                    # a brand-new proposal: stamp fresh proposal_id,
-                    # link parent_proposal_id for attribution, mark
-                    # the rewrite flag so downstream gates and the
-                    # audit trail can recognise it.
-                    _orig_pid = str(_p.get("proposal_id") or "")
-                    _parent_pid = (
-                        _prev_proposal_ids.get(_key) or _orig_pid or ""
-                    )
-                    _new_pid = f"{_orig_pid or 'rewrite'}:rev{iteration_counter}"
-                    _p["parent_proposal_id"] = _parent_pid
-                    _p["proposal_id"] = _new_pid
-                    _p["is_reflection_rewrite"] = True
-                    _p["requires_full_revalidation"] = True
-                    _reflection_rewrites.append({
-                        "ptype": _ptype,
-                        "target": _target,
-                        "parent_proposal_id": _parent_pid,
-                        "proposal_id": _new_pid,
-                        "justification": _justification[:240],
-                        "cluster_id": _p.get("cluster_id"),
-                    })
-                    _kept.append(_p)
-                else:
-                    _kept.append(_p)
-            if _dropped:
-                logger.warning(
-                    "[%s] T2.2 reflection-as-validator dropped %d proposal(s) "
-                    "that were rolled back in prior iterations without an "
-                    "escalation_justification:",
-                    ag_id, len(_dropped),
-                )
-                for _ptype, _target, _reason in _dropped:
-                    logger.warning("  - %s on %s (%s)", _ptype, _target, _reason)
-                print(
-                    _section(
-                        f"[{ag_id}] T2.2 Reflection validator: dropped "
-                        f"{len(_dropped)} re-proposal(s)",
-                        "-",
-                    )
-                )
-                for _ptype, _target, _reason in _dropped:
-                    print(f"|  - {_ptype} on {_target} ({_reason})")
-                print(_bar("-"))
-            # Task 10: emit a ``reflection_rewrite`` decision audit
-            # row for every rewrite that survived the bypass. Lets
-            # operators query "show me every AG where the strategist
-            # re-tried a previously-rolled-back patch with a fresh
-            # justification" without log scraping.
-            if _reflection_rewrites:
-                try:
-                    from genie_space_optimizer.optimization.state import (
-                        write_lever_loop_decisions as _t10_audit,
-                    )
-                    _t10_rows: list[dict] = []
-                    for _idx, _rw in enumerate(_reflection_rewrites, start=1):
-                        _t10_rows.append({
-                            "run_id": run_id,
-                            "iteration": iteration_counter,
-                            "ag_id": ag_id,
-                            "decision_order": _idx,
-                            "stage_letter": "G",
-                            "gate_name": "reflection_rewrite",
-                            "decision": "accepted",
-                            "reason_code": "escalation_justification_supplied",
-                            "reason_detail": (
-                                f"{_rw['ptype']} on {_rw['target']}: "
-                                f"{_rw['justification']}"
-                            )[:2000],
-                            "proposal_ids": [_rw["proposal_id"]],
-                            "source_cluster_ids": (
-                                [_rw["cluster_id"]] if _rw.get("cluster_id") else []
-                            ),
-                            "metrics": {
-                                "patch_type": _rw["ptype"],
-                                "target": _rw["target"],
-                                "parent_proposal_id": _rw["parent_proposal_id"],
-                            },
-                        })
-                    if _t10_rows:
-                        _t10_audit(
-                            spark, _t10_rows,
-                            catalog=catalog, schema=schema,
-                        )
-                except Exception:
-                    logger.debug(
-                        "Task 10 reflection_rewrite audit emission "
-                        "failed (non-fatal)",
-                        exc_info=True,
-                    )
-                logger.info(
-                    "[%s] T2.2 reflection-as-validator accepted %d "
-                    "rewrite(s) with escalation_justification; each will "
-                    "re-run grounding (Task 5) + counterfactual + apply "
-                    "gates as a brand-new proposal.",
-                    ag_id, len(_reflection_rewrites),
-                )
-            all_proposals = _kept
-
-            # Phase A — Lossless contract: stamp dropped_at_reflection for
-            # patches the reflection retry signature filtered out. Per-qid
-            # attribution falls back to the AG's affected_questions because
-            # the reflection drop tuples carry only (ptype, target, reason).
-            try:
-                if _dropped:
-                    _ag_affected = [
-                        str(q) for q in (ag.get("affected_questions") or []) if q
-                    ]
-                    _emit_gate_drop_journey(
-                        emit=_journey_emit,
-                        gate="reflection",
-                        dropped=[
-                            {
-                                "proposal_id": "",
-                                "patch_type": str(_ptype or ""),
-                                "cluster_id": "",
-                                "target_qids": list(_ag_affected),
-                                "_drop_reason": str(_reason or ""),
-                            }
-                            for (_ptype, _target, _reason) in _dropped
-                        ],
-                    )
-            except Exception:
-                logger.debug(
-                    "Phase A: reflection-gate journey emit failed (non-fatal)",
-                    exc_info=True,
-                )
-
-        # ── T2.4: Counterfactual asset-impact scan ───────────────────
-        # Before applying, identify passing benchmarks that reference
-        # each patch's target asset. If a patch touches an asset that
-        # many passing questions depend on, we're rolling the dice on
-        # those questions — stamp ``high_collateral_risk`` on the
-        # proposal and warn prominently. Downstream the slice-gate
-        # (once T3.1 lands) should prioritise the at-risk set.
-        _passing_qids = set(b.get("id") for b in benchmarks if b.get("id")) - (prev_failure_qids or set())
-        _affected_qids = set(ag.get("affected_questions", []) or [])
-        _affected_n = max(len(_affected_qids), 1)
-        # Phase 3c Task A: scan body extracted into _t24_counterfactual_scan
-        # so the per-proposal stamp logic can be exercised in isolation.
-        # The helper stamps ``passing_dependents`` on every visited
-        # proposal (including instruction rewrites with no target table)
-        # and returns the legacy ``_collateral_details`` shape used by
-        # the summary print below.
-        _collateral_details = _t24_counterfactual_scan(
-            all_proposals=all_proposals,
-            benchmarks=benchmarks,
-            ag=ag,
-            prev_failure_qids=prev_failure_qids or set(),
-        )
-        # B2 — ALWAYS print a summary so operators can distinguish
-        # "scan ran, nothing flagged" from "scan didn't run".
-        _total_with_metadata = sum(
-            1 for _b in benchmarks if _b.get("required_tables")
-        )
-        logger.info(
-            "[%s] T2.4 counterfactual scan: %d/%d proposal(s) high-risk; "
-            "benchmarks_with_required_tables=%d/%d (SQL-text fallback used otherwise)",
-            ag_id, len(_collateral_details), len(all_proposals),
-            _total_with_metadata, len(benchmarks),
-        )
-        print(
-            _section(
-                f"[{ag_id}] T2.4 Counterfactual scan: "
-                f"{len(_collateral_details)} high-risk proposal(s)",
-                "-",
-            )
-        )
-        print(
-            _kv(
-                "Benchmarks with required_tables",
-                f"{_total_with_metadata}/{len(benchmarks)}",
-            )
-        )
-        if _collateral_details:
-            for _ptype, _target, _deps in _collateral_details:
-                print(
-                    f"|  - {_ptype} on {_target}  "
-                    f"(passing dependents: {len(_deps)}+, "
-                    f"affected: {_affected_n})"
-                )
-                print(f"|    sample deps: {', '.join(_deps[:5])}")
-        print(_bar("-"))
-
-        # ── Log proposals ────────────────────────────────────────────
-        _n_valid = 0
-        _n_failed = 0
-        proposal_lines = [_section(f"[{ag_id}] Proposals ({len(all_proposals)} total)", "-"), "|"]
-        for pi, p in enumerate(all_proposals, 1):
-            cluster_id = p.get("cluster_id", "?")
-            ptype = p.get("type", p.get("patch_type", "?"))
-            rationale = str(p.get("rationale", ""))
-            proposed_value = str(p.get("proposed_value", ""))
-            table = p.get("table", "")
-            column = p.get("column", "")
-            status = _classify_proposal_log_status(p)
-            if status == "FAILED (non-JSON)":
-                _n_failed += 1
-            elif status == "INVALID_TARGET":
-                _n_failed += 1
-            else:
-                _n_valid += 1
-
-            proposal_lines.append(f"|  Proposal {pi} / {len(all_proposals)}  [{cluster_id}]")
-            proposal_lines.append(f"|    {'Type:':<24s} {ptype}")
-            proposal_lines.append(f"|    {'Lever:':<24s} {p.get('lever', '?')}")
-            if table:
-                proposal_lines.append(f"|    {'Table:':<24s} {table}")
-            if column:
-                proposal_lines.append(f"|    {'Column:':<24s} {column}")
-            proposal_lines.append(f"|    {'Rationale:':<24s} {rationale[:200]}")
-            _p_col_sect = p.get("column_sections")
-            _p_tbl_sect = p.get("table_sections")
-            if isinstance(_p_col_sect, dict) and _p_col_sect:
-                proposal_lines.append(f"|    Sections proposed:")
-                for _sk, _sv in _p_col_sect.items():
-                    _sv_str = str(_sv).replace("\n", " ")
-                    proposal_lines.append(f"|      {_sk}: \"{_sv_str[:100]}\"")
-            elif isinstance(_p_tbl_sect, dict) and _p_tbl_sect:
-                proposal_lines.append(f"|    Table sections proposed:")
-                for _sk, _sv in _p_tbl_sect.items():
-                    _sv_str = str(_sv).replace("\n", " ")
-                    proposal_lines.append(f"|      {_sk}: \"{_sv_str[:100]}\"")
-            elif proposed_value:
-                _val_preview = proposed_value.replace("\n", "\\n")
-                proposal_lines.append(f"|    {'Value (preview):':<24s} {_val_preview[:300]}")
-            proposal_lines.append(f"|    {'Status:':<24s} {status}")
-            proposal_lines.append("|")
-
-        proposal_lines.append("|  --- Summary ---")
-        proposal_lines.append(f"|    {'Valid proposals:':<24s} {_n_valid} of {len(all_proposals)}")
-        if _n_failed:
-            proposal_lines.append(f"|    {'Failed (non-JSON):':<24s} {_n_failed}")
-        proposal_lines.append(f"|    Proceeding with {_n_valid} patch(es)")
-        proposal_lines.append(_bar("-"))
-        print("\n".join(proposal_lines))
-
-        # ── Provenance log ───────────────────────────────────────────
-        _prov_patch_lines = ["\n-- Patch Provenance " + "-" * 58]
-        for pi, p in enumerate(all_proposals, 1):
-            prov = p.get("provenance", {})
-            if not prov:
-                continue
-            cid = prov.get("cluster_id", "?")
-            rc = prov.get("root_cause", "?")
-            lv = prov.get("lever", "?")
-            ln = prov.get("lever_name", "?")
-            pt = prov.get("patch_type", "?")
-            _prov_patch_lines.append(f"|  P{pi:03d} [{cid}] lever={lv} ({ln}) type={pt} root_cause={rc}")
-        _prov_patch_lines.append("-" * 78)
-        print("\n".join(_prov_patch_lines))
-
-        _prop_mappings = [
-            {"cluster_id": p.get("cluster_id"), "proposal_id": p.get("proposal_id"), "patch_type": p.get("patch_type"), "lever": p.get("lever")}
-            for p in all_proposals if p.get("cluster_id")
-        ]
-        try:
-            update_provenance_proposals(spark, run_id, iteration_counter - 1, _prop_mappings, catalog, schema)
-        except Exception:
-            logger.debug("Failed to update provenance proposals", exc_info=True)
-
-        if not all_proposals:
-            print(_section(f"[{ag_id}] No proposals — SKIPPING iteration", "-"))
-            write_stage(
-                spark, run_id, f"AG_{ag_id}_STARTED", "SKIPPED",
-                task_key="lever_loop", iteration=iteration_counter,
-                detail={"reason": "no_proposals", "levers": lever_keys},
-                catalog=catalog, schema=schema,
-            )
-            reflection_buffer.append(_build_reflection_entry(
-                iteration=iteration_counter, ag_id=ag_id, accepted=False,
-                levers=[], target_objects=[], prev_scores=best_scores,
-                new_scores=best_scores, rollback_reason="no_proposals", patches=[],
-                affected_question_ids=ag.get("affected_questions", []),
-                prev_failure_qids=prev_failure_qids,
-                new_failure_qids=prev_failure_qids,
-                **_ag_identity_kwargs,
-            ))
-            _render_current_journey()
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="proposals_empty",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=proposals_empty skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        # Task 6A — RCA/patch-type compatibility gate. Drop proposals
-        # whose patch type cannot fix the cluster's RCA defect (e.g. a
-        # measure patch for a missing-filter defect).
-        try:
-            from genie_space_optimizer.optimization.proposal_grounding import (
-                proposal_is_defect_compatible,
-            )
-
-            _compatible_proposals: list[dict] = []
-            _incompatible_proposals: list[dict] = []
-            for _p in all_proposals:
-                _decision = proposal_is_defect_compatible(_p)
-                if _decision["compatible"]:
-                    _compatible_proposals.append(_p)
-                else:
-                    _incompatible_proposals.append({
-                        "proposal_id": str(_p.get("proposal_id") or _p.get("id") or "?"),
-                        "patch_type": str(_p.get("patch_type") or _p.get("type") or "?"),
-                        "rca_kind": _decision.get("rca_kind"),
-                        "reason": _decision["reason"],
-                    })
-            if _incompatible_proposals:
-                print(
-                    _section(f"[{ag_id}] DEFECT-COMPATIBILITY GATE", "-") + "\n"
-                    + _kv("Proposals dropped", len(_incompatible_proposals)) + "\n"
-                    + "\n".join(
-                        f"|  - {d['proposal_id']} ({d['patch_type']}): "
-                        f"rca={d['rca_kind']} reason={d['reason']}"
-                        for d in _incompatible_proposals
-                    ) + "\n"
-                    + _bar("-")
-                )
-                logger.warning(
-                    "AG %s defect-compatibility gate dropped %d proposal(s)",
-                    ag_id,
-                    len(_incompatible_proposals),
-                )
-            all_proposals = _compatible_proposals
-        except Exception:
-            logger.debug(
-                "Defect-compatibility gate failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # ── Apply coordinated patch set ──────────────────────────────
-        try:
-            from genie_space_optimizer.optimization.proposal_shape import (
-                normalize_column_proposals,
-            )
-
-            _uc_columns_for_shape = (
-                metadata_snapshot.get("_uc_columns", [])
-                if isinstance(metadata_snapshot, dict)
-                else []
-            )
-            # Phase A — capture pre-normalize proposals so the journey
-            # emit can map dropped proposal_ids back to their target qids.
-            _pre_normalize_proposals = list(all_proposals)
-            all_proposals, _shape_decisions = normalize_column_proposals(
-                all_proposals,
-                uc_columns=_uc_columns_for_shape,
-            )
-            if _shape_decisions:
-                print(
-                    _section(f"[{ag_id}] RCA COLUMN SHAPE NORMALIZATION", "-") + "\n"
-                    + _kv("Decisions", len(_shape_decisions)) + "\n"
-                    + "\n".join(
-                        f"|  - {d['proposal_id']} ({d['patch_type']}): "
-                        f"{d['decision']} reason={d['reason']} outputs={d['output_count']}"
-                        for d in _shape_decisions[:12]
-                    ) + "\n"
-                    + _bar("-")
-                )
-                _rca_shape_drop_reasons = {
-                    "missing_table_for_column",
-                    "missing_column",
-                    "invalid_column_target",
-                    "ambiguous_table_for_column",
-                }
-                _rca_shape_drops = [
-                    d for d in _shape_decisions
-                    if d.get("decision") == "dropped"
-                    and d.get("reason") in _rca_shape_drop_reasons
-                ]
-                if _rca_shape_drops:
-                    logger.warning(
-                        "[%s] rca_theme_shape_dropped: %d malformed column "
-                        "proposal(s) dropped during normalization; reasons=%s",
-                        ag_id,
-                        len(_rca_shape_drops),
-                        sorted({str(d.get("reason")) for d in _rca_shape_drops}),
-                    )
-                    for _drop in _rca_shape_drops:
-                        _audit_emit(
-                            stage_letter="G",
-                            gate_name="rca_column_shape_normalization",
-                            decision="reject",
-                            reason_code="rca_theme_shape_dropped",
-                            reason_detail=(
-                                f"proposal_id={_drop.get('proposal_id')} "
-                                f"reason={_drop.get('reason')}"
-                            ),
-                            affected_qids=[],
-                            metrics={
-                                "proposal_id": _drop.get("proposal_id"),
-                                "patch_type": _drop.get("patch_type"),
-                                "reason": _drop.get("reason"),
-                                "output_count": _drop.get("output_count"),
-                            },
-                        )
-        except Exception:
-            logger.debug(
-                "RCA column proposal normalization failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase A — Lossless contract: stamp dropped_at_normalize for
-        # every proposal that was filtered by normalize_column_proposals.
-        try:
-            _shape_dropped_ids = {
-                str(d.get("proposal_id") or "")
-                for d in (locals().get("_shape_decisions") or [])
-                if d.get("decision") == "dropped" and d.get("proposal_id")
-            }
-            if _shape_dropped_ids:
-                _proposals_by_id = {
-                    str(p.get("proposal_id") or p.get("id") or ""): p
-                    for p in (locals().get("_pre_normalize_proposals") or [])
-                }
-                _dropped_normalize_proposals = [
-                    {
-                        "proposal_id": pid,
-                        "patch_type": str(
-                            (_proposals_by_id.get(pid) or {}).get("patch_type")
-                            or (_proposals_by_id.get(pid) or {}).get("type")
-                            or ""
-                        ),
-                        "cluster_id": str(
-                            (_proposals_by_id.get(pid) or {}).get("cluster_id") or ""
-                        ),
-                        "target_qids": list(
-                            (_proposals_by_id.get(pid) or {}).get("target_qids") or []
-                        ),
-                        "_grounding_target_qids": list(
-                            (_proposals_by_id.get(pid) or {}).get("_grounding_target_qids") or []
-                        ),
-                        "_drop_reason": next(
-                            (
-                                str(d.get("reason") or "")
-                                for d in (_shape_decisions or [])
-                                if str(d.get("proposal_id") or "") == pid
-                                and d.get("decision") == "dropped"
-                            ),
-                            "",
-                        ),
-                    }
-                    for pid in _shape_dropped_ids
-                ]
-                _emit_gate_drop_journey(
-                    emit=_journey_emit,
-                    gate="normalize",
-                    dropped=_dropped_normalize_proposals,
-                )
-        except Exception:
-            logger.debug(
-                "Phase A: normalize-gate journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        patches = proposals_to_patches(all_proposals)
-
-        # Phase A — populate ``patches`` on the matching AG snapshot for
-        # replay-fixture export. Match by ag_id; use the most recent
-        # snapshot (this iteration's append).
-        try:
-            _ag_snapshots = (
-                _current_iter_inputs["strategist_response"]["action_groups"]
-            )
-            for _snap in reversed(_ag_snapshots):
-                if str(_snap.get("id")) == str(ag_id):
-                    _ag_affected_qids = [
-                        str(q) for q in (ag.get("affected_questions") or []) if q
-                    ]
-                    _snap["patches"] = [
-                        {
-                            "proposal_id": str(_p.get("proposal_id") or _p.get("id") or ""),
-                            "patch_type": str(_p.get("patch_type") or _p.get("type") or ""),
-                            "target_qids": _patch_snapshot_target_qids(
-                                _p, _ag_affected_qids,
-                            ),
-                            "cluster_id": str(_p.get("cluster_id") or ""),
-                        }
-                        for _p in (all_proposals or [])
-                    ]
-                    break
-        except Exception:
-            logger.debug(
-                "Phase A: patch capture for replay fixture failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase A — Lossless contract: stamp ag_assigned for every qid
-        # this AG targets, before any 'proposed' event fires. The
-        # contract requires AG_ASSIGNED between CLUSTERED and PROPOSED.
-        try:
-            _ag_assigned_qids = sorted({
-                str(q)
-                for _p in (all_proposals or [])
-                for q in (
-                    _p.get("_grounding_target_qids")
-                    or _p.get("target_qids")
-                    or []
-                )
-                if q
-            })
-            if not _ag_assigned_qids:
-                _ag_assigned_qids = [
-                    str(q) for q in (ag.get("affected_questions") or []) if q
-                ]
-            _emit_ag_assignment_journey(
-                emit=_journey_emit,
-                ag_id=str(ag_id),
-                affected_qids=_ag_assigned_qids,
-            )
-        except Exception:
-            logger.debug(
-                "Phase A: ag_assigned journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase F+H A2 (v2): F4 action_groups — additive observability
-        # with atomic dedup. Replaces inline _strategist_ag_records with
-        # the stage call which emits the same STRATEGIST_AG_EMITTED
-        # records via ctx.decision_emit per stages/action_groups.py:
-        # 83-84.
-        #
-        # Verified against: stages/action_groups.py:32-51 (Input), 68-89
-        # (select body), harness.py:12280-12291 (_iter_rca_id_by_cluster),
-        # harness:567 (_build_ag_alternatives_by_id helper).
-        #
-        # Phase D.5 Task 6 alternatives builder hoisted out of the inline
-        # producer try-block (v1 stayed inside; v2 needs the result for
-        # F4's ag_alternatives_by_id input).
-        _ag_alts_by_id = _build_ag_alternatives_by_id(
-            strategist_returned_ags=(
-                list(strategist_returned_ags)
-                if "strategist_returned_ags" in locals()
-                else [ag]
-            ),
-            emitted_ag_ids=[str(ag.get("id") or ag.get("ag_id") or "")],
-        )
-
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                is_strict_mode as _phase_b_strict_mode,
-            )
-            from genie_space_optimizer.optimization.stages import (
-                StageContext as _StageCtx,
-            )
-            from genie_space_optimizer.optimization.stages import (
-                action_groups as _ags_stage,
-            )
-
-            _stage_ctx_a2 = _StageCtx(
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                space_id=str(space_id),
-                domain=str(domain),
-                catalog=str(catalog),
-                schema=str(schema),
-                apply_mode=str(apply_mode),
-                journey_emit=_journey_emit,
-                decision_emit=_decision_emit,
-                mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
-                feature_flags={},
-            )
-            # Spine stage 4 — Action Group Selection. Consumes the
-            # carry-over from the prior iteration's spine stage 10
-            # (Learning) via ``prior_buckets_by_qid``. When the bucket
-            # map is non-empty, ``select`` drops MODEL_CEILING qids
-            # from each AG's target set and tags AGs whose remaining
-            # qids are all EVIDENCE_GAP with ``ag_kind=
-            # "evidence_gathering"``. Iter 1 sees an empty map (no
-            # carry-over yet), so the slate is unfiltered.
-            _ags_inp = _ags_stage.ActionGroupsInput(
-                action_groups=tuple([ag]),
-                source_clusters_by_id={
-                    str(_c.get("cluster_id") or ""): _c
-                    for _c in (clusters or [])
-                    if _c.get("cluster_id")
-                },
-                rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
-                ag_alternatives_by_id={
-                    k: tuple(v) for k, v in (_ag_alts_by_id or {}).items()
-                },
-                prior_buckets_by_qid=dict(_prior_buckets_by_qid),
-                # Cycle 5 T2 — gate-drops carrying a causal-target
-                # patch from the prior iteration. Threaded
-                # unconditionally (the dataclass field accepts an empty
-                # tuple as default); the strategist prompt-builder
-                # consumer surfaces these only when
-                # GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST is on, so
-                # passing the tuple here with the flag off is byte-
-                # stable. Iter 1 sees ().
-                prior_iteration_dropped_causal_patches=tuple(
-                    _prior_iteration_dropped_causal_patches
-                ),
-            )
-            # Phase F+H Commit B11: wrap F4 with stage_io_capture
-            # decorator. Replay-byte-stable — wrap_with_io_capture
-            # returns the stage output unchanged; MLflow log_text
-            # calls are no-ops while mlflow_anchor_run_id is None
-            # (C17 wires the anchor on real runs).
-            from genie_space_optimizer.optimization.stage_io_capture import (
-                wrap_with_io_capture as _wrap_with_io_capture_a2,
-            )
-            _ags_wrapped = _wrap_with_io_capture_a2(
-                execute=_ags_stage.execute,
-                stage_key="action_group_selection",
-            )
-            _ag_slate = _ags_wrapped(_stage_ctx_a2, _ags_inp)
-            # NOTE: F4 stage emits the same records the inline producer
-            # did, but ActionGroupSlate does NOT expose them as a tuple.
-            # The pre-A2 harness incremented _phase_b_target_qids_missing_
-            # count from _ag_records here. After A2, the counter stays at
-            # 0 for this iteration (records still flow into Optimization
-            # Trace via _decision_emit; only the counter aggregation is
-            # lost). TODO follow-up: extend ActionGroupSlate with a
-            # records tuple OR re-derive from _current_iter_inputs[
-            # "decision_records"] tail.
-        except Exception as _strategist_ag_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="strategist_ag",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_strategist_ag_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for strategist_ag",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["strategist_ag"] += 1
-            _phase_b_producer_exceptions["strategist_ag"] = (
-                _phase_b_producer_exceptions.get("strategist_ag", 0) + 1
-            )
-            logger.debug(
-                "Phase F+H A2 v2: action_groups stage failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Phase C Task 5 — RCA-groundedness gate at AG level.
-        # Observability-first: emits one GATE_DECISION/DROPPED record
-        # per AG that fails the groundedness predicate, but does NOT
-        # remove the AG from the iteration's pipeline. Existing patch-
-        # cap and blast-radius gates remain authoritative.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                groundedness_gate_records as _groundedness_gate_records,
-            )
-            from genie_space_optimizer.optimization.rca import (
-                rca_findings_from_clusters as _rca_findings_from_clusters_c5,
-            )
-            from genie_space_optimizer.optimization.rca_groundedness import (
-                is_rca_grounded as _is_rca_grounded_c5,
-            )
-
-            _phase_c_findings_ag = _rca_findings_from_clusters_c5(clusters or [])
-            _ag_verdict = _is_rca_grounded_c5(
-                ag, _phase_c_findings_ag, target_kind="ag",
-            )
-            if not _ag_verdict.accepted:
-                _ag_root_cause_c5 = ""
-                _ag_rca_id_c5 = ""
-                for _cid in (ag.get("source_cluster_ids") or []):
-                    _ag_rca_id_c5 = str(
-                        _iter_rca_id_by_cluster.get(str(_cid)) or ""
-                    )
-                    if _ag_rca_id_c5:
-                        break
-                _gate_records_ag = _groundedness_gate_records(
-                    run_id=run_id,
-                    iteration=iteration_counter,
-                    drops=[{
-                        "ag_id": str(ag.get("id") or ag.get("ag_id") or ""),
-                        "proposal_id": "",
-                        "target_qids": list(ag.get("affected_questions") or []),
-                        "rca_id": _ag_rca_id_c5,
-                        "root_cause": _ag_root_cause_c5,
-                        "target_kind": "ag",
-                        "verdict": _ag_verdict,
-                    }],
-                )
-                _current_iter_inputs.setdefault(
-                    "decision_records", []
-                ).extend([r.to_dict() for r in _gate_records_ag])
-        except Exception as _groundedness_ag_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="groundedness_ag",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_groundedness_ag_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for groundedness_ag",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["groundedness_ag"] = (
-                _phase_b_producer_exceptions.get("groundedness_ag", 0) + 1
-            )
-            logger.debug(
-                "Phase C: AG groundedness gate failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Task 13 — emit ``proposed`` events for every proposal that
-        # survived to ``proposals_to_patches``. Use both
-        # ``_grounding_target_qids`` and ``target_qids`` so we capture
-        # the full causal target set even when one is empty.
-        try:
-            for _p in (all_proposals or []):
-                _ptids = list(_p.get("_grounding_target_qids") or [])
-                if not _ptids:
-                    _ptids = list(_p.get("target_qids") or [])
-                _ptids = [str(q) for q in _ptids if q]
-                if not _ptids:
-                    continue
-                # Plan N1 Task 4 — stamp parent_proposal_id so the
-                # validator's lane-key collapses this ``proposed``
-                # event into the same lane as the matching ``applied_*``
-                # / ``dropped_at_cap`` events keyed on the expanded
-                # child id. ``_p`` is at the proposal level so its
-                # ``proposal_id`` is the parent today.
-                _proposed_pid = str(
-                    _p.get("proposal_id") or _p.get("id") or ""
-                )
-                _journey_emit(
-                    "proposed",
-                    question_ids=_ptids,
-                    proposal_id=_proposed_pid,
-                    parent_proposal_id=str(
-                        _p.get("parent_proposal_id")
-                        or _p.get("source_proposal_id")
-                        or _proposed_pid
-                    ),
-                    patch_type=str(
-                        _p.get("patch_type") or _p.get("type") or ""
-                    ),
-                    cluster_id=str(_p.get("cluster_id") or ""),
-                )
-        except Exception:
-            logger.debug(
-                "Task 13: proposed journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase F+H A3 (v2): F5 proposals — additive observability with
-        # atomic dedup. Replaces inline _proposal_generated_records (in
-        # the deleted block) with the stage call which emits
-        # PROPOSAL_GENERATED via ctx.decision_emit per
-        # stages/proposals.py:128-129 and stamps content_fingerprint per
-        # :108-115 using the SAME reflection_retry.patch_retry_signature
-        # function the harness already used at :14311 (algorithm parity
-        # confirmed — NO all_proposals replacement needed).
-        #
-        # Verified against: stages/proposals.py:39-55 (Input), 95-135
-        # (generate body), harness.py:14311 (PR-E content_fingerprint
-        # stamping site, same algorithm), harness.py:12280-12291
-        # (_iter_rca_id_by_cluster).
-        #
-        # Phase D.5 Task 7 alternatives builder hoisted out of the
-        # deleted inline producer try-block (v1 stayed inside; v2 needs
-        # the result for F5's proposal_alternatives_by_ag input).
-        _proposal_alts = _build_proposal_alternatives_for_ag(
-            raw_proposals=(
-                list(_raw_proposals_for_ag)
-                if "_raw_proposals_for_ag" in locals()
-                else (all_proposals or [])
-            ),
-            surviving_proposal_ids=[
-                str(p.get("proposal_id") or p.get("id") or "")
-                for p in (all_proposals or [])
-            ],
-        )
-
-        try:
-            from genie_space_optimizer.optimization.stages import (
-                StageContext as _StageCtx,
-            )
-            from genie_space_optimizer.optimization.stages import (
-                proposals as _prop_stage,
-            )
-
-            _stage_ctx_a3 = _StageCtx(
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                space_id=str(space_id),
-                domain=str(domain),
-                catalog=str(catalog),
-                schema=str(schema),
-                apply_mode=str(apply_mode),
-                journey_emit=_journey_emit,
-                decision_emit=_decision_emit,
-                mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
-                feature_flags={},
-            )
-            _cluster_root_cause_by_id = {
-                str(_c.get("cluster_id") or ""): str(_c.get("root_cause") or "")
-                for _c in (clusters or [])
-                if _c.get("cluster_id")
-            }
-            _prop_inp = _prop_stage.ProposalsInput(
-                proposals_by_ag={
-                    str(ag_id): tuple(all_proposals or []),
-                },
-                rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
-                cluster_root_cause_by_id=_cluster_root_cause_by_id,
-                proposal_alternatives_by_ag={
-                    str(ag_id): tuple(_proposal_alts or []),
-                },
-            )
-            # Phase F+H Commit B12: wrap F5 with stage_io_capture
-            # decorator. Replay-byte-stable — wrap_with_io_capture
-            # returns the stage output unchanged; MLflow log_text
-            # calls are no-ops while mlflow_anchor_run_id is None
-            # (C17 wires the anchor on real runs).
-            from genie_space_optimizer.optimization.stage_io_capture import (
-                wrap_with_io_capture as _wrap_with_io_capture_a3,
-            )
-            _prop_wrapped = _wrap_with_io_capture_a3(
-                execute=_prop_stage.execute,
-                stage_key="proposal_generation",
-            )
-            _prop_slate = _prop_wrapped(_stage_ctx_a3, _prop_inp)
-            # _prop_slate is observability-only: F6 (deferred) would
-            # consume _prop_slate.proposals_by_ag (fingerprint-stamped)
-            # when wired. Until F6 lands, the harness's all_proposals
-            # (already fingerprinted by :14311) is the canonical input
-            # to downstream gates — DO NOT replace.
-        except Exception as _proposal_generated_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="proposal_generated",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_proposal_generated_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for proposal_generated",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["proposal_generated"] += 1
-            _phase_b_producer_exceptions["proposal_generated"] = (
-                _phase_b_producer_exceptions.get("proposal_generated", 0) + 1
-            )
-            logger.debug(
-                "Phase F+H A3 v2: proposals stage failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Phase C Task 5 — RCA-groundedness gate at proposal level.
-        # Same observability-first contract as the AG-level gate above.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                groundedness_gate_records as _groundedness_gate_records_p,
-            )
-            from genie_space_optimizer.optimization.rca import (
-                rca_findings_from_clusters as _rca_findings_from_clusters_c5p,
-            )
-            from genie_space_optimizer.optimization.rca_groundedness import (
-                is_rca_grounded as _is_rca_grounded_c5p,
-            )
-
-            _phase_c_findings_p = _rca_findings_from_clusters_c5p(clusters or [])
-            _proposal_drops_c5: list[dict] = []
-            for _prop in (all_proposals or []):
-                _prop_id = str(_prop.get("proposal_id") or "")
-                if not _prop_id:
-                    continue
-                _verdict_p = _is_rca_grounded_c5p(
-                    _prop, _phase_c_findings_p, target_kind="proposal",
-                )
-                if _verdict_p.accepted:
-                    continue
-                _proposal_drops_c5.append({
-                    "ag_id": str(ag.get("id") or ""),
-                    "proposal_id": _prop_id,
-                    "target_qids": list(_prop.get("target_qids") or []),
-                    "rca_id": str(_prop.get("rca_id") or ""),
-                    "root_cause": str(_prop.get("root_cause") or ""),
-                    "target_kind": "proposal",
-                    "verdict": _verdict_p,
-                })
-            if _proposal_drops_c5:
-                _gate_records_p = _groundedness_gate_records_p(
-                    run_id=run_id,
-                    iteration=iteration_counter,
-                    drops=_proposal_drops_c5,
-                )
-                _current_iter_inputs.setdefault(
-                    "decision_records", []
-                ).extend([r.to_dict() for r in _gate_records_p])
-        except Exception as _groundedness_proposal_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="groundedness_proposal",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_groundedness_proposal_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for groundedness_proposal",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["groundedness_proposal"] = (
-                _phase_b_producer_exceptions.get("groundedness_proposal", 0) + 1
-            )
-            logger.debug(
-                "Phase C: proposal groundedness gate failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Task 4 — patch-survival snapshot: normalized gate.
-        _survival_normalized = list(patches)
-
-        # Phase 4.3: expand ``rewrite_instruction`` proposals into
-        # ``update_instruction_section`` children BEFORE the cap so a
-        # single rewrite_instruction proposal does not balloon past the
-        # cap inside ``apply_patch_set``. Idempotent — applier will not
-        # re-split children that already carry ``_split_from``.
-        try:
-            from genie_space_optimizer.optimization.applier import (
-                _expand_rewrite_splits as _harness_expand_splits,
-            )
-            _pre_split_count = len(patches)
-            patches = _harness_expand_splits(patches)
-            if len(patches) > _pre_split_count:
-                logger.info(
-                    "Phase 4.3: rewrite splits expanded patch list "
-                    "%d -> %d before diversity-aware cap",
-                    _pre_split_count, len(patches),
-                )
-        except Exception:
-            logger.debug(
-                "Phase 4.3: pre-cap rewrite split expansion failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Task 5: ground proposals against failing-question surfaces.
-        # AG2 in the retail run shipped 8-patch bundles whose targets
-        # (e.g. ``zone_combination``) did not appear in the failing
-        # questions' SQL or NL surface. Drop patches that cannot
-        # plausibly affect any failing question before the diversity
-        # cap so the resulting bundle is causally auditable.
-        _dominant_grounding_category = ""
-        try:
-            from genie_space_optimizer.common.config import (
-                MIN_PROPOSAL_RELEVANCE,
-            )
-            from genie_space_optimizer.optimization.control_plane import (
-                rows_for_qids,
-                target_qids_from_action_group,
-            )
-            from genie_space_optimizer.optimization.proposal_grounding import (
-                causal_relevance_score as _patch_relevance,
-                explain_causal_relevance as _explain_patch_relevance,
-            )
-
-            _all_rows_for_grounding = _get_failure_rows(
-                spark, run_id, catalog, schema,
-            )
-            _ag_target_qids = target_qids_from_action_group(
-                ag,
-                strategy.get("_source_clusters", []),
-            )
-            _rows_for_grounding = (
-                rows_for_qids(_all_rows_for_grounding, _ag_target_qids)
-                if _ag_target_qids else list(_all_rows_for_grounding)
-            )
-            _audit_decisions_grounding: list[tuple[dict, float, str]] = []
-            _grounded: list[dict] = []
-            _grounding_debug_by_idx: list[dict] = []
-            _grounding_debug_rows: list[dict] = []
-            for _patch in patches:
-                try:
-                    _rca_exec = ag.get("_rca_execution") or {}
-                    if isinstance(_rca_exec, dict):
-                        _patch["_rca_grounding_terms"] = sorted(set(
-                            list(_patch.get("_rca_grounding_terms") or [])
-                            + list(_rca_exec.get("grounding_terms") or [])
-                        ))
-                except Exception:
-                    logger.debug("Failed to stamp RCA grounding terms", exc_info=True)
-                _debug = _explain_patch_relevance(
-                    _patch,
-                    _rows_for_grounding,
-                    target_qids=_ag_target_qids,
-                    min_relevance=MIN_PROPOSAL_RELEVANCE,
-                )
-                _score = float(_debug.get("score", 0.0))
-                _patch["_grounding_target_qids"] = list(_ag_target_qids)
-                _patch["relevance_score"] = round(_score, 3)
-                _patch["_grounding_failure_category"] = _debug.get("failure_category")
-                if _score >= MIN_PROPOSAL_RELEVANCE:
-                    _grounded.append(_patch)
-                    _audit_decisions_grounding.append((_patch, _score, "kept"))
-                else:
-                    _audit_decisions_grounding.append((_patch, _score, "dropped"))
-                _grounding_debug_by_idx.append(_debug)
-                _grounding_debug_rows.append({
-                    "patch_type": _patch.get("type") or _patch.get("patch_type"),
-                    "target": (
-                        _patch.get("column")
-                        or _patch.get("target")
-                        or _patch.get("section_name")
-                        or "?"
-                    ),
-                    "score": round(_score, 3),
-                    "category": _debug.get("failure_category"),
-                    "scoped_row_count": len(_rows_for_grounding),
-                    "surface_size": _debug.get("surface_size"),
-                    "overlap": list(_debug.get("overlap") or [])[:8],
-                    "rca_overlap": list(_debug.get("rca_overlap") or [])[:8],
-                })
-
-            _dropped = [d for d in _audit_decisions_grounding if d[2] == "dropped"]
-            _dropped_grounding_patches = [
-                patch for patch, _score, decision in _audit_decisions_grounding
-                if decision == "dropped"
-            ]
-            _grounding_categories = [
-                str(patch.get("_grounding_failure_category") or "")
-                for patch in _dropped_grounding_patches
-                if str(patch.get("_grounding_failure_category") or "")
-            ]
-            _dominant_grounding_category = (
-                max(set(_grounding_categories), key=_grounding_categories.count)
-                if _grounding_categories else ""
-            )
-            if _dropped:
-                logger.info(
-                    "Task 5 grounding [%s]: dropped %d/%d ungrounded patches "
-                    "(min_relevance=%.2f)",
-                    ag_id, len(_dropped), len(patches), MIN_PROPOSAL_RELEVANCE,
-                )
-                print(
-                    _section(
-                        f"PROPOSAL GROUNDING [{ag_id}]: kept {len(_grounded)} of "
-                        f"{len(patches)}", "-",
-                    ) + "\n"
-                    + _kv(
-                        "Dropped (ungrounded)",
-                        ", ".join(
-                            f"{p.get('type', '?')}:{p.get('column', p.get('target', '?'))}"
-                            f" (rel={s:.2f})"
-                            for p, s, _d in _dropped[:5]
-                        ) + (
-                            f" (+{len(_dropped) - 5} more)" if len(_dropped) > 5 else ""
-                        ),
-                    ) + "\n"
-                    + _kv(
-                        "Grounding debug",
-                        "; ".join(
-                            f"{d['patch_type']}:{d['target']} cat={d['category']} "
-                            f"rows={d['scoped_row_count']} surface={d['surface_size']} "
-                            f"overlap={d['overlap']} rca={d['rca_overlap']}"
-                            for d in _grounding_debug_rows[:3]
-                        ),
-                    ) + "\n"
-                    + _bar("-")
-                )
-            patches = _grounded
-
-            # Phase A — Lossless contract: stamp dropped_at_grounding for
-            # every dropped patch's target qids so the validator sees a
-            # legal proposed → dropped_at_grounding transition.
-            try:
-                _emit_gate_drop_journey(
-                    emit=_journey_emit,
-                    gate="grounding",
-                    dropped=[
-                        {
-                            "proposal_id": str(p.get("proposal_id") or p.get("id") or ""),
-                            "patch_type": str(p.get("patch_type") or p.get("type") or ""),
-                            "cluster_id": str(p.get("cluster_id") or ""),
-                            "target_qids": list(p.get("target_qids") or []),
-                            "_grounding_target_qids": list(
-                                p.get("_grounding_target_qids") or []
-                            ),
-                            "_drop_reason": "ungrounded",
-                        }
-                        for p in (_dropped_grounding_patches or [])
-                    ],
-                )
-            except Exception:
-                logger.debug(
-                    "Phase A: grounding-gate journey emit failed (non-fatal)",
-                    exc_info=True,
-                )
-
-            try:
-                from genie_space_optimizer.optimization.rca_decision_trace import (
-                    format_patch_inventory,
-                )
-
-                print(
-                    _section(f"PROPOSAL INVENTORY [{ag_id}]", "-") + "\n"
-                    + _kv("AG target QIDs", list(_ag_target_qids)) + "\n"
-                    + _kv("Grounded patch count", len(patches)) + "\n"
-                    + _kv("Patches", format_patch_inventory(patches)) + "\n"
-                    + _bar("-")
-                )
-            except Exception:
-                logger.debug("Failed to print proposal inventory", exc_info=True)
-
-            # Emit a per-patch ``proposal_grounding`` decision row for
-            # each kept/dropped decision so the Task-3 audit chain
-            # ``cluster -> proposal -> grounding -> apply -> accept``
-            # is queryable end-to-end.
-            try:
-                from genie_space_optimizer.optimization.state import (
-                    write_lever_loop_decisions as _write_decisions,
-                )
-                _grounding_rows: list[dict] = []
-                for _idx, (_patch, _score, _dec) in enumerate(
-                    _audit_decisions_grounding, start=1,
-                ):
-                    _debug_for_row = (
-                        _grounding_debug_by_idx[_idx - 1]
-                        if _idx - 1 < len(_grounding_debug_by_idx)
-                        else _explain_patch_relevance(
-                            _patch,
-                            _rows_for_grounding,
-                            target_qids=_ag_target_qids,
-                            min_relevance=MIN_PROPOSAL_RELEVANCE,
-                        )
-                    )
-                    _category_for_row = _debug_for_row.get("failure_category")
-                    _grounding_rows.append({
-                        "run_id": run_id,
-                        "iteration": iteration_counter,
-                        "ag_id": ag_id,
-                        "decision_order": _idx,
-                        "stage_letter": "H",
-                        "gate_name": "proposal_grounding",
-                        "decision": (
-                            "accepted" if _dec == "kept" else "dropped"
-                        ),
-                        "reason_code": (
-                            None if _dec == "kept" else (_category_for_row or "below_min_relevance")
-                        ),
-                        "metrics": {
-                            "relevance_score": round(float(_score), 3),
-                            "min_relevance": MIN_PROPOSAL_RELEVANCE,
-                            "patch_type": _patch.get("type"),
-                            "target": (
-                                _patch.get("column")
-                                or _patch.get("target")
-                                or _patch.get("metric")
-                                or _patch.get("instruction_section")
-                            ),
-                            "lever": _patch.get("lever"),
-                            "rca_id": _patch.get("rca_id"),
-                            "patch_family": _patch.get("patch_family"),
-                            "target_qids": _patch.get("target_qids", []),
-                            "ag_target_qids": list(_ag_target_qids),
-                            "scoped_row_count": len(_rows_for_grounding),
-                            "failure_category": _category_for_row,
-                            "debug": _debug_for_row,
-                        },
-                        "proposal_ids": (
-                            [_patch.get("proposal_id")]
-                            if _patch.get("proposal_id") else []
-                        ),
-                        "source_cluster_ids": (
-                            [_patch.get("cluster_id")]
-                            if _patch.get("cluster_id") else []
-                        ),
-                    })
-                if _grounding_rows:
-                    _write_decisions(
-                        spark, _grounding_rows, catalog=catalog, schema=schema,
-                    )
-            except Exception:
-                logger.debug(
-                    "Failed to persist proposal_grounding decision rows",
-                    exc_info=True,
-                )
-        except Exception:
-            logger.debug(
-                "Task 5 proposal grounding failed (non-fatal); proceeding with "
-                "all patches.",
-                exc_info=True,
-            )
-
-        _grounding_skip = _should_skip_eval_for_patch_bundle(
-            patches=patches,
-            apply_log=None,
-            stage="post_grounding",
-        )
-        if _grounding_skip.skip:
-            logger.warning(
-                "[%s] Skipping acceptance eval: %s",
-                ag_id,
-                _grounding_skip.reason_detail,
-            )
-            print(
-                _section(f"[{ag_id}] SKIP EVAL: NO GROUNDED PATCHES", "!") + "\n"
-                + _kv("Reason", _grounding_skip.reason_detail) + "\n"
-                + _bar("!")
-            )
-            write_stage(
-                spark,
-                run_id,
-                f"AG_{ag_id}_NO_GROUNDED_PATCHES",
-                "SKIPPED",
-                task_key="lever_loop",
-                iteration=iteration_counter,
-                detail={"reason_code": _grounding_skip.reason_code},
-                catalog=catalog,
-                schema=schema,
-            )
-            reflection_buffer.append(_build_reflection_entry(
-                iteration=iteration_counter,
-                ag_id=ag_id,
-                accepted=False,
-                levers=[int(lk) for lk in lever_keys],
-                target_objects=[],
-                prev_scores=best_scores,
-                new_scores=best_scores,
-                rollback_reason=_grounding_skip.reason_code,
-                patches=[],
-                affected_question_ids=ag.get("affected_questions", []),
-                prev_failure_qids=prev_failure_qids,
-                new_failure_qids=prev_failure_qids,
-                extra={
-                    "rca_execution": ag.get("_rca_execution", {}),
-                    "grounding_failure_stage": "post_grounding",
-                    "grounding_failure_reason": _grounding_skip.reason_code,
-                    "grounding_failure_category": _dominant_grounding_category,
-                    "rca_next_action": _next_grounding_action_payload(
-                        rollback_reason=_grounding_skip.reason_code,
-                        grounding_failure_category=_dominant_grounding_category,
-                        repeated_count=1,
-                    ),
-                },
-                **_ag_identity_kwargs,
-            ))
-            _render_current_journey()
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="post_grounding_skip",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=post_grounding_skip skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        # Task 2 — Blast-radius gate. The counterfactual scan above stamps
-        # ``passing_dependents`` and ``high_collateral_risk`` on each
-        # proposal; turn those informational stamps into a deterministic
-        # gate so high-blast-radius patches are dropped before they reach
-        # the patch cap and ship.
-        try:
-            from genie_space_optimizer.optimization.proposal_grounding import (
-                instruction_patch_scope_is_safe as _instruction_scope_is_safe,
-                patch_blast_radius_is_safe,
-            )
-            from genie_space_optimizer.optimization.control_plane import (
-                target_qids_from_action_group as _target_qids_for_blast,
-            )
-
-            _blast_target_qids = _target_qids_for_blast(
-                ag,
-                strategy.get("_source_clusters", []),
-            )
-            # Cycle 2 Task 2: collect every currently-hard qid across
-            # all clusters so blast-radius can downgrade rejects whose
-            # outside-target dependents are themselves hard (shared-
-            # cause beneficiaries).
-            _live_hard_qids_for_blast = tuple(
-                str(q)
-                for cluster in (clusters or [])
-                for q in (cluster.get("question_ids") or [])
-                if str(q)
-            )
-            _blast_kept: list[dict] = []
-            _blast_dropped: list[dict] = []
-            for _candidate in patches:
-                _decision = patch_blast_radius_is_safe(
-                    _candidate,
-                    ag_target_qids=_blast_target_qids,
-                    max_outside_target=0,
-                    live_hard_qids=_live_hard_qids_for_blast,
-                )
-                if not _decision["safe"]:
-                    _blast_dropped.append({
-                        "proposal_id": str(
-                            _candidate.get("proposal_id")
-                            or _candidate.get("id")
-                            or "?"
-                        ),
-                        "patch_type": str(
-                            _candidate.get("type")
-                            or _candidate.get("patch_type")
-                            or "?"
-                        ),
-                        "reason": _decision["reason"],
-                        "passing_dependents_outside_target": _decision.get(
-                            "passing_dependents_outside_target", []
-                        ),
-                        # Cycle 9 T5: surface the patch's target table
-                        # so record_blast_radius_drop can capture it
-                        # for cross-iteration forbid_tables.
-                        "target": str(
-                            _candidate.get("target")
-                            or _candidate.get("table")
-                            or ""
-                        ),
-                        # Cycle 9 W3: stash the source patch so the
-                        # narrow-replacement loop has the full dict
-                        # (where_predicate, qid_predicate_column, ...).
-                        "original_patch": _candidate,
-                    })
-                    continue
-                # Task 2A — second classifier for broad instruction rewrites
-                # that have no counterfactual dependents.
-                _scope_decision = _instruction_scope_is_safe(
-                    _candidate,
-                    ag_target_qids=_blast_target_qids,
-                )
-                if not _scope_decision["safe"]:
-                    _blast_dropped.append({
-                        "proposal_id": str(
-                            _candidate.get("proposal_id")
-                            or _candidate.get("id")
-                            or "?"
-                        ),
-                        "patch_type": str(
-                            _candidate.get("type")
-                            or _candidate.get("patch_type")
-                            or "?"
-                        ),
-                        "reason": _scope_decision["reason"],
-                        "passing_dependents_outside_target": [],
-                        "target": str(
-                            _candidate.get("target")
-                            or _candidate.get("table")
-                            or ""
-                        ),
-                        # Cycle 9 W3: see comment above; same rationale.
-                        "original_patch": _candidate,
-                    })
-                    continue
-                _blast_kept.append(_candidate)
-            # Cycle 9 W3 / Cycle 10 W4.4: synthesize narrow-scope
-            # variants for any L6 patches dropped at HCRF and re-test
-            # through the same gate; appending survivors back to
-            # _blast_kept. When the builder declines, emit a typed
-            # NARROW_NOT_APPLICABLE record so the L5-fallback path is
-            # observable in the trace.
-            _narrow_kept = _run_narrow_l6_replacement_loop(
-                blast_dropped=_blast_dropped,
-                blast_target_qids=tuple(_blast_target_qids),
-                ag_root_cause=str(ag.get("root_cause") or ""),
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                ag_id=str(ag_id),
-                cluster_id=str(
-                    (ag.get("source_cluster_ids") or ["?"])[0]
-                ),
-                iter_inputs=_current_iter_inputs,
-            )
-            if _narrow_kept:
-                _blast_kept = list(_blast_kept) + _narrow_kept
-            if _blast_dropped:
-                print(
-                    _section(f"[{ag_id}] BLAST-RADIUS GATE", "-") + "\n"
-                    + _kv("Patches dropped", len(_blast_dropped)) + "\n"
-                    + _kv(
-                        "AG target QIDs",
-                        list(_blast_target_qids) or "(none)",
-                    ) + "\n"
-                    + "\n".join(
-                        f"|  - {d['proposal_id']} ({d['patch_type']}): "
-                        f"reason={d['reason']}, "
-                        f"outside_target={d['passing_dependents_outside_target']}"
-                        for d in _blast_dropped
-                    ) + "\n"
-                    + _bar("-")
-                )
-                logger.warning(
-                    "AG %s blast-radius gate dropped %d/%d patches: %s",
-                    ag_id,
-                    len(_blast_dropped),
-                    len(patches),
-                    [d["proposal_id"] for d in _blast_dropped[:8]],
-                )
-                # Cycle 9 T5: record the dropped tables as forbidden for
-                # the next strategist call on this AG so it doesn't
-                # re-propose the same shape against the same table.
-                try:
-                    from genie_space_optimizer.optimization.strategist_constraints import (
-                        record_blast_radius_drop,
-                    )
-                    record_blast_radius_drop(
-                        constraints=_strategist_constraints,
-                        ag_id=str(ag_id),
-                        dropped_patches=_blast_dropped,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Cycle9 T5: strategist_constraints update skipped "
-                        "(non-fatal)",
-                        exc_info=True,
-                    )
-                # Cycle 9 T6: emit one DecisionRecord per blast-radius
-                # drop so the iteration's decision_records is non-empty
-                # even when no patches survive to the patch-cap.
-                try:
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        blast_radius_decision_records,
-                        is_strict_mode,
-                    )
-                    _br_root_cause = ""
-                    _br_rca_id = ""
-                    for _cid in (ag.get("source_cluster_ids") or []):
-                        _br_cluster = (
-                            _iter_source_clusters_by_id.get(str(_cid)) or {}
-                        )
-                        if not _br_root_cause:
-                            _br_root_cause = str(
-                                _br_cluster.get("root_cause") or ""
-                            )
-                        if not _br_rca_id:
-                            _br_rca_id = str(
-                                _iter_rca_id_by_cluster.get(str(_cid)) or ""
-                            )
-                        if _br_root_cause and _br_rca_id:
-                            break
-                    _br_target_qids = [
-                        str(q)
-                        for q in (ag.get("affected_questions") or [])
-                        if q
-                    ]
-                    _br_records = blast_radius_decision_records(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        ag_id=str(ag_id),
-                        rca_id=_br_rca_id,
-                        root_cause=_br_root_cause,
-                        target_qids=_br_target_qids,
-                        dropped=_blast_dropped,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).extend([r.to_dict() for r in _br_records])
-                except Exception as _blast_radius_exc:
-                    try:
-                        from genie_space_optimizer.common.config import (
-                            phase_b_producer_typed_exceptions_enabled as _typed_on,
-                        )
-                        if _typed_on():
-                            from genie_space_optimizer.optimization.decision_emitters import (
-                                producer_exception_record as _producer_exception_record,
-                            )
-                            _pe_rec = _producer_exception_record(
-                                run_id=run_id,
-                                iteration=iteration_counter,
-                                producer="blast_radius",
-                                ag_id=str((ag or {}).get("id") or ""),
-                                exception=_blast_radius_exc,
-                            )
-                            _current_iter_inputs.setdefault(
-                                "decision_records", []
-                            ).append(_pe_rec.to_dict())
-                    except Exception:
-                        logger.debug(
-                            "Phase B: producer_exception_record emission failed for blast_radius",
-                            exc_info=True,
-                        )
-                    _phase_b_producer_exceptions["blast_radius"] = (
-                        _phase_b_producer_exceptions.get("blast_radius", 0)
-                        + 1
-                    )
-                    logger.debug(
-                        "blast-radius DecisionRecord emission failed "
-                        "(non-fatal)",
-                        exc_info=True,
-                    )
-                    if is_strict_mode():
-                        raise
-
-                # Cycle 5 T2 — capture every blast-radius drop whose
-                # target_qids overlap the AG's causal target as a typed
-                # DroppedCausalPatch so the next iteration's strategist
-                # can see what was rejected. Capture is unconditional
-                # (cheap; just appends to ``_iter_dropped_causal``);
-                # consumption by the strategist prompt is gated by the
-                # flag at the AG construction site, preserving byte-
-                # stability with the flag off.
-                try:
-                    from genie_space_optimizer.optimization.stages.gates import (
-                        DroppedCausalPatch as _DroppedCausalPatch,
-                    )
-                    _t2_target_qids = tuple(
-                        str(q) for q in (ag.get("target_qids") or ()) if q
-                    )
-                    if _t2_target_qids:
-                        for _drop in _blast_dropped or ():
-                            _t2_dependents = tuple(
-                                str(q)
-                                for q in (
-                                    _drop.get("passing_dependents_outside_target")
-                                    or ()
-                                )
-                            )
-                            _iter_dropped_causal.append(_DroppedCausalPatch(
-                                gate="blast_radius",
-                                reason=str(_drop.get("reason") or ""),
-                                proposal_id=str(_drop.get("proposal_id") or ""),
-                                patch_type=str(_drop.get("patch_type") or ""),
-                                target=str(_drop.get("target") or ""),
-                                target_qids=_t2_target_qids,
-                                dependents_outside_target=_t2_dependents,
-                                rca_id=str(_br_rca_id or ""),
-                                root_cause=str(_br_root_cause or ""),
-                            ))
-                except Exception:
-                    logger.debug(
-                        "Cycle 5 T2: dropped-causal capture failed "
-                        "(non-fatal)",
-                        exc_info=True,
-                    )
-            patches = _blast_kept
-        except ImportError:
-            # instruction_patch_scope_is_safe not yet implemented (Task 2A
-            # lands separately) — proceed with blast-radius gate alone.
-            from genie_space_optimizer.optimization.proposal_grounding import (
-                patch_blast_radius_is_safe,
-            )
-            from genie_space_optimizer.optimization.control_plane import (
-                target_qids_from_action_group as _target_qids_for_blast,
-            )
-
-            _blast_target_qids = _target_qids_for_blast(
-                ag,
-                strategy.get("_source_clusters", []),
-            )
-            # Cycle 2 Task 2: shared-cause-aware blast radius — pass
-            # the full live-hard set so the gate can downgrade rejects
-            # whose outside-target dependents are themselves hard.
-            _live_hard_qids_for_blast = tuple(
-                str(q)
-                for cluster in (clusters or [])
-                for q in (cluster.get("question_ids") or [])
-                if str(q)
-            )
-            _blast_kept = []
-            _blast_dropped = []
-            for _candidate in patches:
-                _decision = patch_blast_radius_is_safe(
-                    _candidate,
-                    ag_target_qids=_blast_target_qids,
-                    max_outside_target=0,
-                    live_hard_qids=_live_hard_qids_for_blast,
-                )
-                if _decision["safe"]:
-                    _blast_kept.append(_candidate)
-                else:
-                    _blast_dropped.append({
-                        "proposal_id": str(
-                            _candidate.get("proposal_id") or "?"
-                        ),
-                        "patch_type": str(_candidate.get("type") or "?"),
-                        "reason": _decision["reason"],
-                        "passing_dependents_outside_target": _decision.get(
-                            "passing_dependents_outside_target", []
-                        ),
-                        # Cycle 9 W3: stash the source patch so the
-                        # narrow-replacement loop has the full dict.
-                        "original_patch": _candidate,
-                    })
-            # Cycle 9 W3 / Cycle 10 W4.4: same narrow-replacement pass
-            # as Site A but for the import-fallback path (when
-            # ``instruction_patch_scope_is_safe`` import fails).
-            _narrow_kept = _run_narrow_l6_replacement_loop(
-                blast_dropped=_blast_dropped,
-                blast_target_qids=tuple(_blast_target_qids),
-                ag_root_cause=str(ag.get("root_cause") or ""),
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                ag_id=str(ag_id),
-                cluster_id=str(
-                    (ag.get("source_cluster_ids") or ["?"])[0]
-                ),
-                iter_inputs=_current_iter_inputs,
-            )
-            if _narrow_kept:
-                _blast_kept = list(_blast_kept) + _narrow_kept
-            if _blast_dropped:
-                logger.warning(
-                    "AG %s blast-radius gate dropped %d/%d patches: %s",
-                    ag_id,
-                    len(_blast_dropped),
-                    len(patches),
-                    [d["proposal_id"] for d in _blast_dropped[:8]],
-                )
-            patches = _blast_kept
-
-        # Phase H Completion Task 4: wire F6 safety_gates as additive
-        # observability after the three harness inline gate sites
-        # (lever5_structural at the L5 emit site, rca_groundedness via
-        # _run_groundedness_gate inside _build_proposals, and
-        # blast_radius above). F6 sub-handlers emit zero DecisionRecords
-        # (verified at stages/gates.py — zero ctx.decision_emit calls);
-        # harness inline records remain authoritative. The wrap is purely
-        # additive — wrap_with_io_capture returns the GateOutcome
-        # unchanged; MLflow log_text calls are no-ops while
-        # mlflow_anchor_run_id is None. Replay-byte-stable.
-        try:
-            from genie_space_optimizer.optimization.stages import (
-                gates as _gates_stage,
-                StageContext as _StageCtx_f6,
-            )
-            from genie_space_optimizer.optimization.stage_io_capture import (
-                wrap_with_io_capture as _wrap_capture_f6,
-            )
-
-            _f6_inp = _gates_stage.GatesInput(
-                proposals_by_ag={str(ag_id): tuple(patches or [])},
-                ags=tuple([ag] if isinstance(ag, dict) else []),
-                rca_evidence=(
-                    dict(_rca_evidence_bundle.per_qid_evidence)
-                    if "_rca_evidence_bundle" in dir()
-                    and _rca_evidence_bundle is not None
-                    else {}
-                ),
-                applied_history=tuple(),
-                rolled_back_content_fingerprints=set(
-                    _rolled_back_content_fingerprints
-                ) if "_rolled_back_content_fingerprints" in dir() else set(),
-                forbidden_signatures=set(),
-                space_snapshot={},
-            )
-            _f6_stage_ctx = _StageCtx_f6(
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                space_id=str(space_id),
-                domain=str(domain),
-                catalog=str(catalog),
-                schema=str(schema),
-                apply_mode="real",
-                journey_emit=lambda *a, **k: None,
-                decision_emit=lambda r: None,
-                mlflow_anchor_run_id=_phase_h_anchor_run_id,
-                feature_flags={},
-            )
-            _f6_wrapped = _wrap_capture_f6(
-                execute=_gates_stage.filter,
-                stage_key="safety_gates",
-            )
-            _gate_outcome = _f6_wrapped(_f6_stage_ctx, _f6_inp)
-        except Exception:
-            logger.debug(
-                "Phase H Task 4: F6 safety_gates stage failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Task 5 — backfill AG/cluster causal metadata onto broad
-        # strategist proposals so the cap can distinguish RCA-attributed
-        # patches (tier 3) from broad AG-fallback patches (tier 1).
-        patches = _backfill_patch_causal_metadata(
-            patches=patches,
-            action_group=ag,
-            source_clusters=(
-                strategy.get("_source_clusters", [])
-                if isinstance(strategy, dict)
-                else []
-            ),
-        )
-
-        try:
-            # Dry-run applyability gate. Drops patches with applyable=False
-            # before the causal-first cap can rank them.
-            from genie_space_optimizer.optimization.patch_applyability import (
-                filter_applyable_patches,
-            )
-
-            _patches_before_applyability = list(patches)
-            patches, _applyability_decisions = filter_applyable_patches(
-                patches=_patches_before_applyability,
-                metadata_snapshot=metadata_snapshot,
-                space_id=space_id,
-            )
-            _non_applyable_decisions = [
-                d for d in _applyability_decisions if not d.applyable
-            ]
-            if _non_applyable_decisions:
-                print(
-                    _section(f"[{ag_id}] PATCH APPLYABILITY GATE", "-") + "\n"
-                    + _kv("Input patches", len(_patches_before_applyability)) + "\n"
-                    + _kv("Applyable patches", len(patches)) + "\n"
-                    + _kv("Dropped patches", len(_non_applyable_decisions)) + "\n"
-                    + "\n".join(
-                        f"|  - {d.expanded_patch_id or d.proposal_id} "
-                        f"{d.patch_type} target={d.target or '(none)'} "
-                        f"table={d.table or '(none)'} column={d.column or '(none)'} "
-                        f"applyable={d.applyable} reason={d.reason}"
-                        for d in _non_applyable_decisions[:12]
-                    ) + "\n"
-                    + _bar("-")
-                )
-                logger.warning(
-                    "AG %s patch applyability gate dropped %d/%d patch(es)",
-                    ag_id,
-                    len(_non_applyable_decisions),
-                    len(_patches_before_applyability),
-                )
-        except Exception:
-            logger.debug(
-                "Patch applyability gate failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Task 4 — patch-survival snapshot: applyable gate.
-        _survival_applyable = list(patches)
-
-        # Phase A — Lossless contract: stamp dropped_at_applyability for
-        # every patch the applyability gate dropped.
-        try:
-            _non_applyable = locals().get("_non_applyable_decisions") or []
-            if _non_applyable:
-                _emit_gate_drop_journey(
-                    emit=_journey_emit,
-                    gate="applyability",
-                    dropped=[
-                        {
-                            "proposal_id": str(
-                                getattr(d, "expanded_patch_id", None)
-                                or getattr(d, "proposal_id", "")
-                                or ""
-                            ),
-                            "patch_type": str(getattr(d, "patch_type", "") or ""),
-                            "cluster_id": "",
-                            "target_qids": list(getattr(d, "target_qids", []) or []),
-                            "_drop_reason": str(getattr(d, "reason", "") or ""),
-                        }
-                        for d in _non_applyable
-                    ],
-                )
-        except Exception:
-            logger.debug(
-                "Phase A: applyability-gate journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Task 17 — L5/L6 asset alignment gate. SQL-shape (L5) and
-        # sql-snippet (L6) patches must touch an asset that is in the
-        # source cluster's lineage; otherwise they are dropped before the
-        # cap so non-aligned patches don't burn cap slots.
-        from genie_space_optimizer.optimization.proposal_asset_alignment import (
-            l5_l6_patch_requires_asset_alignment,
-            proposal_aligns_with_cluster,
-        )
-
-        _ag_source_cluster_ids = {
-            str(cid).strip()
-            for cid in (ag.get("source_cluster_ids") or [])
-            if str(cid).strip()
-        }
-        _source_clusters_by_id = {
-            str(c.get("cluster_id") or "").strip(): c
-            for c in (strategy.get("_source_clusters") or [])
-            if str(c.get("cluster_id") or "").strip()
-        }
-        _aligned_patches: list[dict] = []
-        _alignment_drops: list[dict] = []
-        for _p in patches:
-            if not l5_l6_patch_requires_asset_alignment(_p):
-                _aligned_patches.append(_p)
-                continue
-            _matched_cluster = next(
-                (
-                    _source_clusters_by_id[c]
-                    for c in _ag_source_cluster_ids
-                    if c in _source_clusters_by_id
-                ),
-                None,
-            )
-            _decision = proposal_aligns_with_cluster(_p, _matched_cluster)
-            if _decision.get("aligned"):
-                _aligned_patches.append(_p)
-                continue
-            _alignment_drops.append({
-                "proposal_id": str(_p.get("proposal_id") or _p.get("id") or ""),
-                "patch_type": str(_p.get("type") or _p.get("patch_type") or ""),
-                "reason": _decision.get("reason"),
-                "proposal_assets": list(_decision.get("proposal_assets") or ()),
-                "cluster_assets": list(_decision.get("cluster_assets") or ()),
-            })
-        if _alignment_drops:
-            logger.info(
-                "[%s] asset_alignment_dropped: %d patch(es); reasons=%s",
-                ag_id, len(_alignment_drops),
-                [d["reason"] for d in _alignment_drops],
-            )
-        patches = _aligned_patches
-
-        # Phase A — Lossless contract: stamp dropped_at_alignment for
-        # every L5/L6 patch dropped by the asset-alignment gate.
-        try:
-            if _alignment_drops:
-                # _alignment_drops carries proposal_id but not target_qids;
-                # look them up in the pre-alignment patch list (the union
-                # of pre-cap patches captured into _aligned_patches +
-                # the dropped set).
-                _pre_alignment_patches_by_id = {
-                    str(_p.get("proposal_id") or _p.get("id") or ""): _p
-                    for _p in (
-                        list(_aligned_patches)
-                        + [
-                            _p
-                            for _p in (
-                                locals().get("_pre_normalize_proposals") or []
-                            )
-                            if isinstance(_p, dict)
-                        ]
-                    )
-                }
-                _emit_gate_drop_journey(
-                    emit=_journey_emit,
-                    gate="alignment",
-                    dropped=[
-                        {
-                            "proposal_id": str(d.get("proposal_id") or ""),
-                            "patch_type": str(d.get("patch_type") or ""),
-                            "cluster_id": str(
-                                (
-                                    _pre_alignment_patches_by_id.get(
-                                        str(d.get("proposal_id") or "")
-                                    )
-                                    or {}
-                                ).get("cluster_id")
-                                or ""
-                            ),
-                            "target_qids": list(
-                                (
-                                    _pre_alignment_patches_by_id.get(
-                                        str(d.get("proposal_id") or "")
-                                    )
-                                    or {}
-                                ).get("target_qids")
-                                or []
-                            ),
-                            "_drop_reason": str(d.get("reason") or ""),
-                        }
-                        for d in _alignment_drops
-                    ],
-                )
-        except Exception:
-            logger.debug(
-                "Phase A: alignment-gate journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Tier 2.6: cap AG patch-set size. A single failing patch in a
-        # large batch rolls back everything — including the patches that
-        # would have helped. If the cap is exceeded, keep the highest-
-        # confidence / highest-impact patches first (sorted by the
-        # caller); extras are dropped with a clear warning.
-        if len(patches) > MAX_AG_PATCHES:
-            from genie_space_optimizer.optimization.patch_selection import (
-                select_target_aware_causal_patch_cap,
-            )
-            from genie_space_optimizer.optimization.control_plane import (
-                target_qids_from_action_group as _target_qids_for_patch_cap,
-            )
-
-            _patch_cap_target_qids = tuple(
-                locals().get("_blast_target_qids")
-                or _target_qids_for_patch_cap(ag, strategy.get("_source_clusters", []))
-            )
-            _active_cluster_ids_for_cap = tuple(
-                str(cid).strip()
-                for cid in (ag.get("source_cluster_ids") or [])
-                if str(cid).strip()
-            )
-            _per_cluster_slot_floor = (
-                1 if len(_active_cluster_ids_for_cap) > 1 else 0
-            )
-
-            _before_cap = list(patches)
-
-            # Optimizer Control-Plane Hardening Plan — Task B: when
-            # GSO_NO_CAUSAL_APPLYABLE_HALT is on and every RCA-matched
-            # proposal in the AG has been dropped by upstream gates,
-            # halt with reason no_causal_applyable_patch instead of
-            # falling back to non-causal proposals. Default-off
-            # preserves legacy behaviour.
-            from genie_space_optimizer.common.config import (
-                no_causal_applyable_halt_enabled as _no_causal_halt,
-            )
-
-            if _no_causal_halt():
-                _causal_proposals, _had_rca_matched = (
-                    _filter_to_causal_applyable_proposals(
-                        ag=ag, proposals=_before_cap,
-                    )
-                )
-                if (
-                    not _causal_proposals
-                    and not _had_rca_matched
-                    and ag.get("rca_id")
-                ):
-                    logger.warning(
-                        "[%s] no_causal_applyable_patch: every RCA-"
-                        "matched proposal was dropped by upstream "
-                        "gates; halting AG before patch_cap",
-                        ag.get("id") or ag.get("ag_id"),
-                    )
-                    _audit_emit(
-                        stage_letter="L",
-                        gate_name="patch_cap",
-                        decision="skipped",
-                        reason_code="no_causal_applyable_patch",
-                        metrics={"input_count": len(_before_cap)},
-                    )
-                    patches = []
-                    _patch_cap_decisions = []
-                else:
-                    patches, _patch_cap_decisions = (
-                        select_target_aware_causal_patch_cap(
-                            _before_cap,
-                            target_qids=_patch_cap_target_qids,
-                            max_patches=MAX_AG_PATCHES,
-                            active_cluster_ids=_active_cluster_ids_for_cap,
-                            per_cluster_slot_floor=_per_cluster_slot_floor,
-                        )
-                    )
-            else:
-                patches, _patch_cap_decisions = (
-                    select_target_aware_causal_patch_cap(
-                        _before_cap,
-                        target_qids=_patch_cap_target_qids,
-                        max_patches=MAX_AG_PATCHES,
-                        active_cluster_ids=_active_cluster_ids_for_cap,
-                        per_cluster_slot_floor=_per_cluster_slot_floor,
-                    )
-                )
-            _selected_ids = {
-                str(p.get("proposal_id") or p.get("id") or "")
-                for p in patches
-            }
-            _dropped_decisions = [
-                d for d in _patch_cap_decisions
-                if d.get("decision") == "dropped"
-            ]
-            for _d in _dropped_decisions:
-                logger.info(
-                    "[%s] cap_dropped pid=%s type=%s cluster=%s "
-                    "rel=%.3f cluster_tier=%d direct=%s",
-                    ag_id,
-                    _d.get("proposal_id"),
-                    _d.get("patch_type"),
-                    _d.get("cluster_id"),
-                    float(_d.get("relevance_score") or 0.0),
-                    int(_d.get("active_cluster_match_tier") or 0),
-                    _d.get("is_direct_behavior"),
-                )
-
-            # Task 13 — emit ``dropped_at_cap`` per drop, looking up the
-            # target_qids of the original proposal in ``_before_cap``.
-            # The drop reason is derived from the active-cluster match
-            # tier (0 = not in active cluster).
-            try:
-                _by_pid: dict[str, dict] = {}
-                for _bp in (_before_cap or []):
-                    _bpid = str(
-                        _bp.get("proposal_id") or _bp.get("id") or ""
-                    )
-                    if _bpid:
-                        _by_pid[_bpid] = _bp
-                for _d in _dropped_decisions:
-                    _dpid = str(_d.get("proposal_id") or "")
-                    _orig = _by_pid.get(_dpid, {})
-                    _dt_qids = list(
-                        _orig.get("_grounding_target_qids") or []
-                    )
-                    if not _dt_qids:
-                        _dt_qids = list(_orig.get("target_qids") or [])
-                    _dt_qids = [str(q) for q in _dt_qids if q]
-                    _tier = int(_d.get("active_cluster_match_tier") or 0)
-                    _drop_reason = (
-                        "not_in_active_cluster" if _tier == 0
-                        else f"cap_overflow_tier={_tier}"
-                    )
-                    if _dt_qids:
-                        # Plan N1 Task 4 — parent_proposal_id collapse.
-                        _dpid_parent = str(
-                            _d.get("parent_proposal_id")
-                            or _d.get("source_proposal_id")
-                            or _orig.get("parent_proposal_id")
-                            or _orig.get("proposal_id")
-                            or _orig.get("id")
-                            or _dpid
-                        )
-                        _journey_emit(
-                            "dropped_at_cap",
-                            question_ids=_dt_qids,
-                            proposal_id=_dpid,
-                            parent_proposal_id=_dpid_parent,
-                            patch_type=str(_d.get("patch_type") or ""),
-                            cluster_id=str(_d.get("cluster_id") or ""),
-                            reason=_drop_reason,
-                        )
-            except Exception:
-                logger.debug(
-                    "Task 13: dropped_at_cap journey emit failed",
-                    exc_info=True,
-                )
-            logger.warning(
-                "AG %s patch cap (causal-first): kept %d of %d. "
-                "Dropped proposal_ids=%s.",
-                ag_id,
-                len(patches),
-                len(_before_cap),
-                [d.get("proposal_id") for d in _dropped_decisions[:8]],
-            )
-            print(
-                _section(f"[{ag_id}] PATCH CAP APPLIED (causal-first)", "-") + "\n"
-                + _kv("Original size", len(_before_cap)) + "\n"
-                + _kv("Kept", len(patches)) + "\n"
-                + _kv(
-                    "Selected proposal_ids",
-                    sorted(pid for pid in _selected_ids if pid) or "(none)",
-                ) + "\n"
-                + _kv("Dropped count", len(_dropped_decisions)) + "\n"
-                + _kv("Dropped shown", min(len(_dropped_decisions), 8)) + "\n"
-                + _kv("Dropped truncated", len(_dropped_decisions) > 8) + "\n"
-                + _kv(
-                    "Dropped proposal_ids",
-                    [d.get("proposal_id") for d in _dropped_decisions[:8]]
-                    if _dropped_decisions else "(none)",
-                ) + "\n"
-                + _kv(
-                    "Reason",
-                    "Causal-first cap: relevance_score ranks before lever diversity.",
-                ) + "\n"
-                + _bar("-")
-            )
-
-            try:
-                from genie_space_optimizer.optimization.rca_decision_trace import (
-                    OptimizationTrace,
-                    patch_cap_decision_records,
-                    patch_cap_decision_rows,
-                    render_operator_transcript,
-                )
-                from genie_space_optimizer.optimization.state import (
-                    write_lever_loop_decisions as _write_decisions,
-                )
-
-                # Phase B Trace Plan Task 7 — capture typed records first so
-                # the iteration snapshot persists them for replay/fixture.
-                # Then convert back to legacy rows for the existing Delta
-                # write path (write_lever_loop_decisions consumers haven't
-                # migrated yet).
-                _patch_cap_records = patch_cap_decision_records(
-                    run_id=run_id,
-                    iteration=iteration_counter,
+                    iteration_counter=iteration_counter,
                     ag_id=ag_id,
-                    decisions=_patch_cap_decisions,
-                )
-                _current_iter_inputs.setdefault("decision_records", []).extend(
-                    [r.to_dict() for r in _patch_cap_records]
-                )
-
-                _write_decisions(
-                    spark,
-                    patch_cap_decision_rows(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        ag_id=ag_id,
-                        decisions=_patch_cap_decisions,
-                    ),
+                    metadata_snapshot=metadata_snapshot,
+                    reflection=reflection,
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=_rb_fail_qids or set(),
                     catalog=catalog,
                     schema=schema,
                 )
-            except Exception:
-                logger.debug("Failed to persist patch-cap decision rows", exc_info=True)
+                reflection_buffer.append(reflection)
 
-        # Task 4 — patch-survival snapshot: capped gate. Capture in both
-        # branches so the ledger reflects the patch list that actually
-        # reaches the applier, regardless of whether the cap fired.
-        _survival_capped = list(patches)
-
-        _selected_patch_signature = tuple(sorted(
-            str(p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id") or "")
-            for p in patches
-            if (p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id"))
-        ))
-        # Cycle 2 Task 3: also compute the selected-proposal-ID
-        # signature so DOA replay can be caught even when blast-radius
-        # collapses the applied-patch signature to ``()``.
-        _doa_selected_proposal_signature = (
-            _compute_selected_proposal_signature(
-                (ag.get("proposals") or []) if isinstance(ag, dict) else []
-            )
-        )
-        _doa_selected_blocked = _is_doa_selected_signature_blocked(
-            seen=_doa_selected_proposal_signatures,
-            ag_id=str(ag_id),
-            signature=_doa_selected_proposal_signature,
-        )
-        if (
-            _selected_patch_signature in _dead_on_arrival_patch_signatures
-            or _doa_selected_blocked
-        ):
-            _doa_dedup_reason = (
-                "same selected proposal IDs already produced no applied patches"
-                if _doa_selected_blocked
-                else "same selected patch IDs already produced no applied patches"
-            )
-            logger.warning(
-                "Skipping dead-on-arrival AG retry for %s "
-                "(applied_sig=%s selected_sig=%s)",
-                ag_id,
-                _selected_patch_signature,
-                _doa_selected_proposal_signature,
-            )
-            print(
-                _section(f"[{ag_id}] DEAD-ON-ARRIVAL RETRY BLOCKED", "!") + "\n"
-                + _kv("Patch signature", _selected_patch_signature) + "\n"
-                + _kv("Selected proposal signature", _doa_selected_proposal_signature) + "\n"
-                + _kv("Reason", _doa_dedup_reason) + "\n"
-                + _bar("!")
-            )
-            # Phase A — Replay-fixture capture: the AG never reached the
-            # gate, so no accept/rollback path runs. Without this entry
-            # the iteration's ag_outcomes dict stays empty and the
-            # fixture loses the signal that an AG was even attempted.
-            try:
-                _current_iter_inputs["ag_outcomes"][str(ag_id)] = (
-                    "skipped_dead_on_arrival"
-                )
-            except Exception:
-                logger.debug(
-                    "Phase A: ag_outcome capture (dead-on-arrival) failed (non-fatal)",
-                    exc_info=True,
-                )
-            _phase_b_emit_ag_outcome_record(ag, "skipped_dead_on_arrival")
-            # Cycle 9 T1: selective drain — keep buffered AGs whose
-            # affected_questions are disjoint from the failed AG's.
-            _survivors, _dropped_buffered = _drain_buffered_action_groups(
-                failed_ag=ag,
-                buffered=pending_action_groups,
-                reason="dead_on_arrival",
-            )
-            pending_action_groups = _survivors
-            if not pending_action_groups:
-                pending_strategy = None
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="no_pending_ags_first_pass",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=no_pending_ags_first_pass skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        # T3.3: shadow apply. When enabled, the intent is to clone the
-        # space, apply patches to the clone, eval, and promote only on
-        # pass. The Genie SDK fork/promote primitives aren't wired yet,
-        # so for now we log the intent and fall back to in-place apply;
-        # the rollback path below still covers us. Leaving this here so
-        # operators can see the flag is respected by code and we have a
-        # single commit to wire the actual fork when available.
-        if SHADOW_APPLY:
-            logger.warning(
-                "[%s] T3.3 SHADOW_APPLY=True but the Genie fork/promote "
-                "API is not yet integrated in this harness; falling back "
-                "to in-place apply with rollback-on-regression.",
-                ag_id,
-            )
-            print(
-                _section(f"[{ag_id}] SHADOW_APPLY: fallback", "-") + "\n"
-                + _kv(
-                    "Reason",
-                    "Genie space-clone API not yet wired — rollback path "
-                    "still covers content regressions.",
-                ) + "\n"
-                + _bar("-")
-            )
-
-        # Task 2 — capture the live parsed Genie config immediately before
-        # patch application. This in-memory snapshot becomes the source of
-        # truth for both ``rollback`` and ``verify_rollback_restored`` so
-        # the rollback contract does not depend on Delta state that may be
-        # missing or stale.
-        from genie_space_optimizer.optimization.snapshot_contract import (
-            capture_pre_ag_snapshot,
-        )
-
-        _pre_ag_snapshot_capture = capture_pre_ag_snapshot(
-            w=w,
-            space_id=space_id,
-            ag_id=ag_id,
-        )
-        if not _pre_ag_snapshot_capture.get("captured"):
-            reason = _pre_ag_snapshot_capture.get("reason", "pre_ag_snapshot_failed")
-            logger.error(
-                "AG %s: could not capture pre-AG snapshot before apply "
-                "(reason=%s). Skipping patch application.",
-                ag_id,
-                reason,
-            )
-            print(
-                _section(f"[{ag_id}] SKIP APPLY: PRE-AG SNAPSHOT FAILED", "!") + "\n"
-                + _kv("Reason", reason) + "\n"
-                + _bar("!")
-            )
-            # Phase B observability follow-up — record the AG outcome so
-            # the ACCEPTANCE_DECIDED producer (and the cross-checker
-            # invariant "every STRATEGIST_AG_EMITTED has a matching
-            # ACCEPTANCE_DECIDED") can see this terminal path. Before
-            # this fix, the AG was silently discarded with no
-            # ag_outcomes write, leaving the trace blind to
-            # snapshot-capture failures.
-            try:
-                _current_iter_inputs["ag_outcomes"][str(ag_id)] = (
-                    "skipped_pre_ag_snapshot_failed"
-                )
-            except Exception:
-                logger.debug(
-                    "Phase B: ag_outcome capture (pre_ag_snapshot_failed) "
-                    "failed (non-fatal)",
-                    exc_info=True,
-                )
-            _phase_b_emit_ag_outcome_record(ag, "skipped_pre_ag_snapshot_failed")
-            # Cycle 9 T2: selective drain — keep buffered AGs whose
-            # affected_questions are disjoint from the failed AG's.
-            _survivors, _dropped_buffered = _drain_buffered_action_groups(
-                failed_ag=ag,
-                buffered=pending_action_groups,
-                reason="pre_ag_snapshot_failed",
-            )
-            pending_action_groups = _survivors
-            if not pending_action_groups:
-                pending_strategy = None
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="no_pending_ags_second_pass",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=no_pending_ags_second_pass skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        metadata_snapshot = _pre_ag_snapshot_capture["snapshot"]
-        logger.info(
-            "pre-AG snapshot captured for AG %s digest=%s",
-            ag_id,
-            _pre_ag_snapshot_capture.get("digest", ""),
-        )
-
-        apply_log = apply_patch_set(
-            w, space_id, patches, metadata_snapshot, apply_mode=apply_mode,
-        )
-
-        # Cycle 5 T1 — productive-iteration accounting. Accumulate the
-        # number of applied patches across ALL AGs in this iteration so
-        # the end-of-iteration budget decision can tell a productive
-        # iteration (≥1 applied) from a deterministic no-op (0 applied
-        # AND a typed P4 reason in the iteration's decision records).
-        try:
-            _iter_applied_count += len(apply_log.get("applied") or [])
-        except Exception:
-            logger.debug(
-                "Cycle 5 T1: _iter_applied_count update failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Task 4 (lever-loop-v2) — per-AG patch-survival ledger. Print a
-        # cluster-coverage table across the proposed → normalized →
-        # applyable → capped → applied gates so operators can see
-        # exactly where each cluster's patches were dropped.
-        try:
-            from genie_space_optimizer.optimization.patch_survival import (
-                PatchSurvivalSnapshot,
-                build_patch_survival_table,
-            )
-
-            _survival_applied = [
-                entry.get("patch", {})
-                for entry in (apply_log.get("applied") or [])
-                if isinstance(entry, dict) and entry.get("patch")
-            ]
-            _survival_snapshot = PatchSurvivalSnapshot(
-                ag_id=str(ag_id),
-                proposed=list(locals().get("_survival_proposed", []) or []),
-                normalized=list(locals().get("_survival_normalized", []) or []),
-                applyable=list(locals().get("_survival_applyable", []) or []),
-                capped=list(locals().get("_survival_capped", []) or []),
-                applied=_survival_applied,
-            )
-            _survival_table = build_patch_survival_table(_survival_snapshot)
-            if _survival_table:
-                print(_survival_table)
-        except Exception:
-            logger.debug("Patch-survival ledger failed (non-fatal)", exc_info=True)
-
-        # Task 4 — surface cap-selected vs applier-applied disagreement at
-        # WARN level so silent applier drops (an AG2 cap selecting
-        # ``['P002#3','P004#1','P005#1']`` but only applying the
-        # off-causal filter on a ``mv_<domain>_dim_<entity>`` patch)
-        # cannot recur unnoticed.
-        try:
-            from genie_space_optimizer.optimization.applier_audit import (
-                diff_selected_vs_applied,
-            )
-
-            _cap_selected_ids = [
-                str(p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id") or "")
-                for p in (patches or [])
-                if (p.get("expanded_patch_id") or p.get("id") or p.get("proposal_id"))
-            ]
-            _applier_applied_ids = [
-                str(
-                    entry.get("patch", {}).get("expanded_patch_id")
-                    or entry.get("patch", {}).get("id")
-                    or entry.get("patch", {}).get("proposal_id")
-                    or ""
-                )
-                for entry in (apply_log.get("applied") or [])
-                if entry.get("patch")
-            ]
-            _recon = diff_selected_vs_applied(
-                selected_ids=_cap_selected_ids,
-                applied_ids=_applier_applied_ids,
-            )
-            print(
-                _section("CAP-VS-APPLIED RECONCILIATION", "-") + "\n"
-                + _kv("Cap selected", ", ".join(_cap_selected_ids)[:200] or "(none)") + "\n"
-                + _kv(
-                    "Applier applied",
-                    ", ".join(_applier_applied_ids)[:200] or "(none)",
-                ) + "\n"
-                + _kv(
-                    "Selected but not applied",
-                    ", ".join(_recon.selected_but_not_applied)[:200] or "(none)",
-                ) + "\n"
-                + _kv(
-                    "Applied but not selected",
-                    ", ".join(_recon.applied_but_not_selected)[:200] or "(none)",
-                ) + "\n"
-                + _bar("-")
-            )
-            if not _recon.in_agreement:
-                logger.warning(
-                    "CAP-VS-APPLIED RECONCILIATION: selected_but_not_applied=%s "
-                    "applied_but_not_selected=%s",
-                    _recon.selected_but_not_applied,
-                    _recon.applied_but_not_selected,
-                )
-        except Exception:
-            logger.debug(
-                "Cap-vs-applied reconciliation failed (non-fatal)",
-                exc_info=True,
-            )
-
-        _apply_skip = _should_skip_eval_for_patch_bundle(
-            patches=patches,
-            apply_log=apply_log,
-            stage="post_apply",
-        )
-        if _apply_skip.skip:
-            if _apply_skip.reason_code == "no_applied_patches":
-                _dead_on_arrival_ag_ids.add(str(ag_id))
-                # Cycle 9 T4: never cache an empty signature ``()`` as
-                # "already tried" — it represents "every patch was
-                # dropped before the applier" (e.g. blast-radius gate),
-                # which short-circuits subsequent strategist attempts.
-                _record_dead_on_arrival_signature(
-                    seen=_dead_on_arrival_patch_signatures,
-                    signature=_selected_patch_signature,
-                    reason=_apply_skip.reason_code,
-                )
-                # Cycle 2 Task 3: also record the selected-proposal-ID
-                # signature (informative even when blast-radius drops
-                # every patch) so a future iteration can detect that
-                # the same AG is being retried with the same proposals
-                # and avoid wasting iteration budget.
-                _doa_selected_proposal_signature = (
-                    _compute_selected_proposal_signature(
-                        (ag.get("proposals") or [])
-                        if isinstance(ag, dict) else []
-                    )
-                )
-                _record_doa_selected_signature(
-                    seen=_doa_selected_proposal_signatures,
-                    ag_id=str(ag_id),
-                    signature=_doa_selected_proposal_signature,
-                )
-                # Cycle 9 T7: emit one PATCH_SKIPPED DecisionRecord per
-                # proposal_id in the dead-on-arrival signature. ACCEPTANCE_DECIDED
-                # already covers the AG-level signal; this gives
-                # finer-grained per-patch attribution (no-op patch vs
-                # applier-rejected patch).
+                # Regression-mining lane (audit-only, soft-fail). Mines
+                # ``column_confusion`` insights from failed candidate eval
+                # rows for newly-regressed questions. Acceptance, rollback,
+                # and state loaders are unchanged; the insights live in
+                # the decision-audit table and on the reflection JSON for
+                # later inspection. A feature flag controls whether the
+                # next strategist call sees them as compact hints.
+                _mined_insights: list = []
                 try:
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        dead_on_arrival_decision_records,
-                        is_strict_mode,
+                    from genie_space_optimizer.optimization.regression_mining import (
+                        mine_regression_insights,
+                        summarize_insights_for_reflection,
                     )
-                    _doa_root_cause = ""
-                    _doa_rca_id = ""
-                    for _cid in (ag.get("source_cluster_ids") or []):
-                        _doa_cluster = (
-                            _iter_source_clusters_by_id.get(str(_cid)) or {}
+                    _regressed_qids: set[str] = set()
+                    for _r in gate_result.get("regressions") or []:
+                        for _q in _r.get("blocking_qids") or []:
+                            if _q:
+                                _regressed_qids.add(str(_q))
+                    # Fallback: if no per-question regression fired (e.g.
+                    # the gate failed for raw acceptance reasons), mine the
+                    # set of qids that flipped from passing to failing.
+                    if not _regressed_qids and prev_failure_qids is not None:
+                        _flipped = {
+                            str(q) for q in (_rb_fail_qids or set())
+                            if q not in prev_failure_qids
+                        }
+                        _regressed_qids = _flipped
+                    _failed_rows = (
+                        gate_result.get("failed_eval_result", {}).get("rows") or []
+                    )
+                    _mined_insights = mine_regression_insights(
+                        failed_eval_rows=_failed_rows,
+                        regressed_qids=_regressed_qids,
+                        metadata_snapshot=metadata_snapshot,
+                    )
+                    if _mined_insights:
+                        reflection["regression_mining"] = (
+                            summarize_insights_for_reflection(_mined_insights)
                         )
-                        if not _doa_root_cause:
-                            _doa_root_cause = str(
-                                _doa_cluster.get("root_cause") or ""
-                            )
-                        if not _doa_rca_id:
-                            _doa_rca_id = str(
-                                _iter_rca_id_by_cluster.get(str(_cid)) or ""
-                            )
-                        if _doa_root_cause and _doa_rca_id:
-                            break
-                    _doa_target_qids = [
-                        str(q)
-                        for q in (ag.get("affected_questions") or [])
-                        if q
-                    ]
-                    _doa_records = dead_on_arrival_decision_records(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        ag_id=str(ag_id),
-                        rca_id=_doa_rca_id,
-                        root_cause=_doa_root_cause,
-                        target_qids=_doa_target_qids,
-                        signature=tuple(_selected_patch_signature or ()),
-                        reason=str(_apply_skip.reason_code or ""),
+                        logger.info(
+                            "Regression mining produced %d insight(s) for iter %d "
+                            "(qids: %s)",
+                            len(_mined_insights),
+                            iteration_counter,
+                            ", ".join(sorted({i.question_id for i in _mined_insights})[:5]),
+                        )
+                except Exception:
+                    logger.debug(
+                        "Regression mining failed for rollback iter %d",
+                        iteration_counter,
+                        exc_info=True,
                     )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).extend([r.to_dict() for r in _doa_records])
-                except Exception as _dead_on_arrival_exc:
+
+                try:
+                    update_iteration_reflection(
+                        spark, run_id, iteration_counter, reflection,
+                        catalog=catalog, schema=schema, eval_scope="full",
+                    )
+                except Exception:
+                    logger.debug("Failed to persist reflection for rollback iter %d", iteration_counter, exc_info=True)
+
+                # Persist the mined insights as typed decision-audit rows.
+                # ``gate_name="regression_mining"`` lets a single SQL query
+                # answer "what did we learn from rollbacks on this run?"
+                # without parsing reflection JSON. Soft-fail by design —
+                # the audit table is non-authoritative.
+                if _mined_insights:
                     try:
-                        from genie_space_optimizer.common.config import (
-                            phase_b_producer_typed_exceptions_enabled as _typed_on,
+                        from genie_space_optimizer.optimization.regression_mining import (
+                            build_decision_audit_rows,
                         )
-                        if _typed_on():
-                            from genie_space_optimizer.optimization.decision_emitters import (
-                                producer_exception_record as _producer_exception_record,
-                            )
-                            _pe_rec = _producer_exception_record(
-                                run_id=run_id,
-                                iteration=iteration_counter,
-                                producer="dead_on_arrival",
-                                ag_id=str((ag or {}).get("id") or ""),
-                                exception=_dead_on_arrival_exc,
-                            )
-                            _current_iter_inputs.setdefault(
-                                "decision_records", []
-                            ).append(_pe_rec.to_dict())
+                        from genie_space_optimizer.optimization.state import (
+                            write_lever_loop_decisions as _write_mining_decisions,
+                        )
+                        _mining_rows = build_decision_audit_rows(
+                            _mined_insights,
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            ag_id=ag_id,
+                        )
+                        _write_mining_decisions(
+                            spark, _mining_rows, catalog=catalog, schema=schema,
+                        )
                     except Exception:
                         logger.debug(
-                            "Phase B: producer_exception_record emission failed for dead_on_arrival",
+                            "Failed to persist regression-mining audit rows for iter %d",
+                            iteration_counter,
                             exc_info=True,
                         )
-                    _phase_b_producer_exceptions["dead_on_arrival"] = (
-                        _phase_b_producer_exceptions.get(
-                            "dead_on_arrival", 0
+                for p in patches:
+                    # B1.2 — converted patches use ``type`` / ``target``;
+                    # the legacy fields ``patch_type`` / ``target_object``
+                    # are absent on the conversion path so the previous
+                    # extractor returned ``("", "")`` and the guard
+                    # silently rejected every entry. Read both for
+                    # backward compatibility with any pre-conversion
+                    # fixtures.
+                    ft = str(p.get("type") or p.get("patch_type") or "").strip()
+                    tgt = str(p.get("target") or p.get("target_object") or "").strip()
+                    if ft and tgt:
+                        tried_patches.add((ft, tgt))
+                _lever_frozenset = frozenset(int(lk) for lk in lever_keys)
+                # Phase C3 + D3: only CONTENT_REGRESSION rollbacks contribute
+                # to the tried-cluster bookkeeping. Phase D3 also lowers the
+                # threshold so the (root_cause, blame, lever_set) 3-tuple is
+                # marked after the FIRST content rollback, while the legacy
+                # (root_cause, blame) 2-tuple (which suppresses across ALL
+                # levers) is only written when we've exhausted ``>= 2``
+                # distinct lever sets on the same cluster.
+                _content_rb_count = sum(
+                    1 for _rb_entry in reflection_buffer
+                    if not _rb_entry.get("accepted")
+                    and not _rb_entry.get("escalation_handled")
+                    and _rb_entry.get("rollback_class") == _RC.CONTENT_REGRESSION.value
+                )
+                _should_mark_tried_lever_aware = _content_rb_count >= 1
+                source_cids = set(ag.get("source_cluster_ids", []))
+                for c in clusters:
+                    cid = c.get("cluster_id", "")
+                    if source_cids and cid not in source_cids:
+                        continue
+                    rc_ft = c.get("asi_failure_type") or c.get("root_cause", "other")
+                    rc_blame = _normalise_blame(c.get("asi_blame_set"))
+                    if not rc_ft or not _should_mark_tried_lever_aware:
+                        continue
+                    # Always add the 3-tuple (lever-aware) immediately.
+                    tried_root_causes.add((rc_ft, rc_blame, _lever_frozenset))
+                    # Legacy 2-tuple: only when the same cluster has failed
+                    # across >= 2 distinct lever sets (truly-dead cluster).
+                    _distinct_lever_sets = {
+                        frozenset(e.get("lever_set") or [])
+                        for e in reflection_buffer
+                        if (
+                            not e.get("accepted")
+                            and not e.get("escalation_handled")
+                            and e.get("rollback_class") == _RC.CONTENT_REGRESSION.value
+                            and e.get("root_cause") == rc_ft
+                            and (e.get("blame_set") or "") == rc_blame
                         )
-                        + 1
+                    }
+                    # Include the current lever set we're about to add.
+                    _distinct_lever_sets.add(_lever_frozenset)
+                    if len(_distinct_lever_sets) >= 2:
+                        tried_root_causes.add((rc_ft, rc_blame))
+                if not _should_mark_tried_lever_aware:
+                    logger.info(
+                        "No CONTENT_REGRESSION rollbacks yet — keeping cluster "
+                        "available for retry (root causes NOT marked as tried)",
                     )
-                    logger.debug(
-                        "dead-on-arrival DecisionRecord emission failed "
-                        "(non-fatal)",
-                        exc_info=True,
-                    )
-                    if is_strict_mode():
-                        raise
-                logger.warning(
-                    "AG %s deterministic_no_applied_patches: selected patch "
-                    "signature=%s recovery_reason=all_selected_patches_dropped_by_applier",
-                    ag_id,
-                    _selected_patch_signature,
-                )
-                print(
-                    _section(f"[{ag_id}] DETERMINISTIC REJECTION: NO APPLIED PATCHES", "!") + "\n"
-                    + _kv("Reason", "all_selected_patches_dropped_by_applier") + "\n"
-                    + _kv("Selected patch signature", _selected_patch_signature) + "\n"
-                    + _kv("Action", "discard buffered AG and force strategist recovery") + "\n"
-                    + _bar("!")
-                )
-                # Cycle 9 T3: selective drain — keep buffered AGs whose
-                # affected_questions are disjoint from the failed AG's.
-                _survivors, _dropped_buffered = _drain_buffered_action_groups(
-                    failed_ag=ag,
-                    buffered=pending_action_groups,
-                    reason="all_selected_patches_dropped_by_applier",
-                )
-                pending_action_groups = _survivors
-                if not pending_action_groups:
-                    pending_strategy = None
-            logger.warning(
-                "[%s] Skipping acceptance eval: %s",
-                ag_id,
-                _apply_skip.reason_detail,
-            )
-            print(
-                _section(f"[{ag_id}] SKIP EVAL: NO APPLIED PATCHES", "!") + "\n"
-                + _kv("Reason", _apply_skip.reason_detail) + "\n"
-                + _bar("!")
-            )
-            try:
-                from genie_space_optimizer.optimization.applier_audit import (
-                    applier_decision_counts,
-                )
-
-                _applier_decisions = apply_log.get("applier_decisions") or []
-                _decision_counts = applier_decision_counts(_applier_decisions)
-                if _decision_counts:
-                    print(
-                        _section(f"[{ag_id}] APPLIER DECISIONS", "-") + "\n"
-                        + "\n".join(
-                            f"|  {key}: {value}"
-                            for key, value in sorted(_decision_counts.items())
-                        ) + "\n"
-                        + _bar("-")
-                    )
-                # Cycle 8 Bug 1 Phase 3a — persist applier-decision counts to
-                # MLflow so future cycle intakes have queryable diagnostic
-                # data. Without this, the only way to learn why an AG hit
-                # ``skipped_no_applied_patches`` is to dig the per-AG span
-                # out of MLflow's full trace tree, or hand-grep the cycle's
-                # stderr. Best-effort wrapped.
                 try:
-                    import mlflow as _mlflow_apl  # type: ignore[import-not-found]
-                    if _decision_counts and _mlflow_apl.active_run() is not None:
-                        _mlflow_apl.log_dict(
-                            {
-                                "iteration": iteration_counter,
-                                "ag_id": str(ag_id),
-                                "decision_counts": dict(_decision_counts),
-                                "reason_code": _apply_skip.reason_code,
-                                "reason_detail": _apply_skip.reason_detail,
-                            },
-                            artifact_file=(
-                                f"phase_a/applier_decisions/"
-                                f"iter_{iteration_counter}_{ag_id}.json"
-                            ),
-                        )
-                        _mlflow_apl.set_tags({
-                            (
-                                f"applier_decisions.iter_{iteration_counter}."
-                                f"{ag_id}.dropped_count"
-                            ): str(sum(_decision_counts.values())),
-                        })
-                except Exception:
-                    logger.debug(
-                        "Cycle 8 Bug 1 Phase 3a: MLflow applier-decisions "
-                        "persistence skipped (non-fatal)",
-                        exc_info=True,
+                    _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                        _compute_iteration_counters(_current_iter_inputs)
                     )
-            except Exception:
-                logger.debug("Failed to print applier decision counts", exc_info=True)
-            write_stage(
-                spark,
-                run_id,
-                f"AG_{ag_id}_NO_APPLIED_PATCHES",
-                "SKIPPED",
-                task_key="lever_loop",
-                iteration=iteration_counter,
-                detail={"reason_code": _apply_skip.reason_code},
-                catalog=catalog,
-                schema=schema,
-            )
-            reflection_buffer.append(_build_reflection_entry(
-                iteration=iteration_counter,
-                ag_id=ag_id,
-                accepted=False,
-                levers=[int(lk) for lk in lever_keys],
-                target_objects=[],
-                prev_scores=best_scores,
-                new_scores=best_scores,
-                rollback_reason=_apply_skip.reason_code,
-                patches=patches,
-                affected_question_ids=ag.get("affected_questions", []),
-                prev_failure_qids=prev_failure_qids,
-                new_failure_qids=prev_failure_qids,
-                **_ag_identity_kwargs,
-            ))
-            # Phase A — Replay-fixture capture: like the dead-on-arrival
-            # branch above, the AG short-circuits before the gate and
-            # neither the rollback nor the accept paths fire. Stamp the
-            # outcome so the fixture surfaces "AG was attempted but the
-            # applier produced no applied entries".
-            try:
-                _current_iter_inputs["ag_outcomes"][str(ag_id)] = (
-                    "skipped_no_applied_patches"
-                )
-            except Exception:
-                logger.debug(
-                    "Phase A: ag_outcome capture (no_applied_patches) failed (non-fatal)",
-                    exc_info=True,
-                )
-            _phase_b_emit_ag_outcome_record(ag, "skipped_no_applied_patches")
-            _render_current_journey()
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="skipped_no_applied_patches",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=skipped_no_applied_patches skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        _fallback_lever = int(lever_keys[0]) if lever_keys else 0
-        for idx, entry in enumerate(apply_log.get("applied", [])):
-            _patch_lever = int(entry.get("patch", {}).get("lever", _fallback_lever))
-            write_patch(
-                spark, run_id, iteration_counter, _patch_lever, idx,
-                _build_patch_record(entry, _patch_lever, apply_mode),
-                catalog, schema,
-            )
-            # Task 13 — emit ``applied`` per applied patch.
-            # Track 3/E (Phase A burn-down) — splits into
-            # ``applied_targeted`` (qid was in the patch's
-            # target_qids) and ``applied_broad_ag_scope`` (qid was
-            # in the AG's affected_questions but not specifically
-            # targeted by this patch). Phase B's
-            # ``causal_patch_survival_pct`` consumes this distinction.
-            try:
-                _ap = entry.get("patch", {}) or {}
-                _ap_pid = str(
-                    _ap.get("proposal_id")
-                    or _ap.get("expanded_patch_id")
-                    or _ap.get("id")
-                    or ""
-                )
-                # Plan N1 Task 4 — parent for lane-key collapse.
-                # Patches stamped by ``_stamp_expanded_patch_identity``
-                # carry an explicit ``parent_proposal_id``; if absent,
-                # fall back to ``source_proposal_id`` or the unqualified
-                # id parsed out of the expanded form (``L1:P001#1`` or
-                # ``P001#1``).
-                _ap_parent_pid = str(
-                    _ap.get("parent_proposal_id")
-                    or _ap.get("source_proposal_id")
-                    or (
-                        _ap_pid.split(":", 1)[-1].split("#", 1)[0]
-                        if _ap_pid else ""
-                    )
-                )
-                _ap_target_qids = list(_ap.get("_grounding_target_qids") or [])
-                if not _ap_target_qids:
-                    _ap_target_qids = list(_ap.get("target_qids") or [])
-                _ap_target_qid_set = {str(q) for q in _ap_target_qids if q}
-
-                _ap_ag_qids = {
-                    str(q)
-                    for q in (ag.get("affected_questions", []) or [])
-                    if str(q)
-                }
-                _ap_broad_qid_set = _ap_ag_qids - _ap_target_qid_set
-
-                _ap_patch_type = str(
-                    _ap.get("patch_type") or _ap.get("type") or ""
-                )
-
-                if _ap_target_qid_set:
-                    _journey_emit(
-                        "applied_targeted",
-                        question_ids=sorted(_ap_target_qid_set),
-                        proposal_id=_ap_pid,
-                        parent_proposal_id=_ap_parent_pid,
-                        patch_type=_ap_patch_type,
-                    )
-                if _ap_broad_qid_set:
-                    _journey_emit(
-                        "applied_broad_ag_scope",
-                        question_ids=sorted(_ap_broad_qid_set),
-                        proposal_id=_ap_pid,
-                        parent_proposal_id=_ap_parent_pid,
-                        patch_type=_ap_patch_type,
-                    )
-            except Exception:
-                logger.debug(
-                    "Track 3/E: applied journey emit failed (non-fatal)",
-                    exc_info=True,
-                )
-
-        # Phase F+H Commit A4: F7 application — post-stage observability
-        # with atomic dedup. apply_patch_set at harness.py:16187 STAYS
-        # inline; this stage call consumes the apply_log it produces and
-        # emits PATCH_APPLIED records via ctx.decision_emit per
-        # stages/application.py:159-171, replacing the inline
-        # _patch_applied_records producer (formerly at this site).
-        #
-        # Dedup is atomic with the stage insertion: the inline producer
-        # block (formerly Phase B delta Task 7 — emit PATCH_APPLIED
-        # records per applied entry) is removed; the stage call emits
-        # the same records via the same producer (decision_emitters.
-        # patch_applied_records) wrapped in StageContext.decision_emit
-        # which routes back to _current_iter_inputs["decision_records"].
-        # Without atomic dedup, both fire and break byte-stability.
-        #
-        # Verified against: stages/application.py:47-62 (Input dataclass),
-        # 137-176 (apply body — does NOT call apply_patch_set; emits
-        # PATCH_APPLIED via ctx.decision_emit at :170-171),
-        # 65-77 (AppliedPatchSet — fields applied + applied_signature).
-        try:
-            from genie_space_optimizer.optimization.stages import (
-                StageContext as _StageCtx,
-            )
-            from genie_space_optimizer.optimization.stages import (
-                application as _app_stage,
-            )
-
-            _cluster_root_cause_by_id = {
-                str(_c.get("cluster_id") or ""): str(_c.get("root_cause") or "")
-                for _c in (clusters or [])
-                if _c.get("cluster_id")
-            }
-            _stage_ctx_application = _StageCtx(
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                space_id=str(space_id),
-                domain=str(domain),
-                catalog=str(catalog),
-                schema=str(schema),
-                apply_mode=str(apply_mode),
-                journey_emit=_journey_emit,
-                decision_emit=(
-                    lambda record:
-                        _current_iter_inputs.setdefault(
-                            "decision_records", []
-                        ).append(record.to_dict())
-                ),
-                mlflow_anchor_run_id=_phase_h_anchor_run_id,
-                feature_flags={},
-            )
-            _app_inp = _app_stage.ApplicationInput(
-                applied_entries_by_ag={
-                    str(ag_id): tuple(apply_log.get("applied", []) or [])
-                },
-                ags=tuple([ag] if isinstance(ag, dict) else []),
-                rca_id_by_cluster=_iter_rca_id_by_cluster,
-                cluster_root_cause_by_id=_cluster_root_cause_by_id,
-            )
-            # Phase F+H Commit B14: wrap F7 with stage_io_capture decorator.
-            # Replay-byte-stable because wrap_with_io_capture returns out
-            # unchanged and the MLflow log_text calls are no-ops while
-            # _stage_ctx_application.mlflow_anchor_run_id is None (Phase C
-            # Commit 17 wires the anchor).
-            from genie_space_optimizer.optimization.stage_io_capture import (
-                wrap_with_io_capture as _wrap_with_io_capture_a4,
-            )
-            _app_wrapped = _wrap_with_io_capture_a4(
-                execute=_app_stage.execute,
-                stage_key="applied_patches",
-            )
-            _applied_set = _app_wrapped(_stage_ctx_application, _app_inp)
-            # _applied_set.applied is tuple[AppliedPatch, ...]; available
-            # for downstream stages (F8 acceptance, F9 learning) when
-            # those wire-ups land.
-        except Exception as _patch_applied_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
+                        iteration=int(iteration_counter),
+                        current_iter_inputs=_current_iter_inputs,
+                        journey_events=_journey_events if "_journey_events" in dir() else [],
+                        journey_report=_journey_report if "_journey_report" in dir() else None,
+                        accepted_count=_phase_h_a,
+                        rolled_back_count=_phase_h_r,
+                        skipped_count=_phase_h_s,
+                        gate_drop_count=_phase_h_g,
+                        iteration_accuracy_percent=None,
+                        exit_path="rolled_back",
                         run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="patch_applied",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_patch_applied_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for patch_applied",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["patch_applied"] += 1
-            _phase_b_producer_exceptions["patch_applied"] = (
-                _phase_b_producer_exceptions.get("patch_applied", 0) + 1
-            )
-            logger.debug(
-                "Phase F+H A4: patch_applied stage call failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        _queued = apply_log.get("queued_high", [])
-        if _queued:
-            from genie_space_optimizer.optimization.state import write_queued_patch
-            from genie_space_optimizer.optimization.labeling import flag_for_human_review
-            for qentry in _queued:
-                _qpatch = qentry.get("patch", {})
-                write_queued_patch(
-                    spark, run_id, iteration_counter,
-                    _qpatch.get("type", ""),
-                    _qpatch.get("target", ""),
-                    catalog, schema,
-                    confidence_tier="queued_high_risk",
-                )
-            _queued_flag_items = [
-                {
-                    "question_id": qentry.get("patch", {}).get("target", "unknown"),
-                    "question_text": "",
-                    "reason": (
-                        f"High-risk patch queued for review: "
-                        f"{qentry.get('patch', {}).get('type', '')} on "
-                        f"{qentry.get('patch', {}).get('target', '')}"
-                    ),
-                    "iterations_failed": 0,
-                    "patches_tried": qentry.get("patch", {}).get("type", ""),
-                }
-                for qentry in _queued
-            ]
-            flag_for_human_review(spark, run_id, catalog, schema, domain, _queued_flag_items)
-            _qh_lines = [_section(f"[{ag_id}] Queued {len(_queued)} High-Risk Patch(es) for Human Review", "!")]
-            for qi, qe in enumerate(_queued, 1):
-                _qp = qe.get("patch", {})
-                _qh_lines.append(
-                    _kv(f"  [{qi}]", f"{_qp.get('type', '?')} \u2192 {_qp.get('target', '?')}")
-                )
-            _qh_lines.append(_bar("!"))
-            print("\n".join(_qh_lines))
-
-        if not apply_log.get("patch_deployed", False) and apply_log.get("applied"):
-            _pe = apply_log.get("patch_error", "unknown")
-            from genie_space_optimizer.optimization.rollback_class import (
-                RollbackClass,
-                classify_rollback_reason,
-            )
-            _pe_class = classify_rollback_reason(f"patch_deploy_failed: {_pe}")
-            print(
-                _section(f"[{ag_id}] PATCH DEPLOY FAILED", "!") + "\n"
-                + _kv("Error", str(_pe)[:300]) + "\n"
-                + _kv("Rollback class", _pe_class.value) + "\n"
-                + _bar("!")
-            )
-            write_stage(
-                spark, run_id, f"AG_{ag_id}_PATCH_FAILED", "ERROR",
-                task_key="lever_loop", iteration=iteration_counter,
-                error_message=str(_pe)[:500],
-                detail={"rollback_class": _pe_class.value},
-                catalog=catalog, schema=schema,
-            )
-            reflection_buffer.append(_build_reflection_entry(
-                iteration=iteration_counter, ag_id=ag_id, accepted=False,
-                levers=[int(lk) for lk in lever_keys], target_objects=[],
-                prev_scores=best_scores, new_scores=best_scores,
-                rollback_reason=f"patch_deploy_failed: {str(_pe)[:100]}",
-                patches=patches,
-                affected_question_ids=ag.get("affected_questions", []),
-                prev_failure_qids=prev_failure_qids,
-                new_failure_qids=prev_failure_qids,
-                **_ag_identity_kwargs,
-            ))
-            if _pe_class == RollbackClass.SCHEMA_FAILURE:
-                print(
-                    _section("LEVER LOOP — SCHEMA-FATAL PATCH ERROR", "!") + "\n"
-                    + _kv("Error", str(_pe)[:300]) + "\n"
-                    + _kv("Rollback class", RollbackClass.SCHEMA_FAILURE.value) + "\n"
-                    + _kv("Reason", "Genie API rejected the PATCH payload structure; retrying would deterministically fail.") + "\n"
-                    + _bar("!")
-                )
-                write_stage(
-                    spark, run_id, "LEVER_LOOP_SCHEMA_FATAL", "ERROR",
-                    task_key="lever_loop", iteration=iteration_counter,
-                    error_message=str(_pe)[:500],
-                    detail={"rollback_class": RollbackClass.SCHEMA_FAILURE.value},
-                    catalog=catalog, schema=schema,
-                )
-                break
-            # Phase C3: INFRA_FAILURE retry budget. Unlike CONTENT_REGRESSION
-            # rollbacks, infra failures don't tell us anything about the
-            # strategy's quality. We don't want them to count against
-            # ``_diminishing_returns`` or the content rollback counter,
-            # but an unbounded loop of infra flakes would spin forever —
-            # hence the separate budget. Exit cleanly when the budget is
-            # exhausted with a dedicated terminal reason.
-            if _pe_class == RollbackClass.INFRA_FAILURE:
-                _consecutive_infra = 0
-                for _rb_entry in reversed(reflection_buffer):
-                    if _rb_entry.get("rollback_class") == RollbackClass.INFRA_FAILURE.value:
-                        _consecutive_infra += 1
-                    else:
-                        break
-                if _consecutive_infra >= INFRA_RETRY_BUDGET:
-                    print(
-                        _section("LEVER LOOP — INFRA RETRY BUDGET EXHAUSTED", "!") + "\n"
-                        + _kv("Consecutive infra rollbacks", _consecutive_infra) + "\n"
-                        + _kv("Budget", INFRA_RETRY_BUDGET) + "\n"
-                        + _kv("Last error", str(_pe)[:300]) + "\n"
-                        + _bar("!")
-                    )
-                    write_stage(
-                        spark, run_id, "LEVER_LOOP_INFRA_EXHAUSTED", "ERROR",
-                        task_key="lever_loop", iteration=iteration_counter,
-                        error_message=str(_pe)[:500],
-                        detail={
-                            "consecutive_infra": _consecutive_infra,
-                            "budget": INFRA_RETRY_BUDGET,
-                        },
-                        catalog=catalog, schema=schema,
-                    )
-                    break
-            _render_current_journey()
-            try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
-                )
-                _finalize_iteration_summary(
-                    iter_traces=_iter_traces,
-                    iter_summaries=_iter_summaries,
-                    iteration=int(iteration_counter),
-                    current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="applier_failed",
-                )
-            except Exception:
-                logger.debug(
-                    "Phase H finalise on exit_path=applier_failed skipped (non-fatal)",
-                    exc_info=True,
-                )
-            continue
-
-        # ── Applied Patches Detail ───────────────────────────────────
-        _applied = apply_log.get("applied", [])
-        if _applied:
-            _ap_lines = [_section(f"[{ag_id}] Applied {len(_applied)} Patch(es)", "=")]
-            for ai, aentry in enumerate(_applied, 1):
-                _ap = aentry.get("patch", {})
-                _aa = aentry.get("action", {})
-                _ap_lines.append(_fmt_patch(ai, _ap, _aa, aentry))
-            _ap_lines.append(_bar("="))
-            print("\n".join(_ap_lines))
-
-        _dropped = apply_log.get("dropped_patches", [])
-        if _dropped:
-            _dp_lines = [_section(f"[{ag_id}] Dropped {len(_dropped)} Join Spec Patch(es)", "!")]
-            for di, dp in enumerate(_dropped, 1):
-                _dp_lines.append(
-                    f"|  [{di}] {dp.get('type', '?')}: "
-                    f"{dp.get('left_table', '?')} <-> {dp.get('right_table', '?')}"
-                )
-            _dp_lines.append(
-                "|  Reason: join spec PATCH failed; remaining patches deployed successfully"
-            )
-            _dp_lines.append(_bar("!"))
-            print("\n".join(_dp_lines))
-
-        # ── 3B.6: Three-gate eval ───────────────────────────────────
-        # Snapshot the carried baseline at the start of *this* iteration
-        # so the next iteration's drift diagnostic has something to
-        # compare against.
-        _baseline_at_start_of_this_iter = float(best_accuracy)
-        gate_result = _run_gate_checks(
-            spark=spark,
-            w=w,
-            run_id=run_id,
-            space_id=space_id,
-            exp_name=exp_name,
-            domain=domain,
-            iteration_counter=iteration_counter,
-            ag_id=ag_id,
-            benchmarks=benchmarks,
-            proposals=all_proposals,
-            patches=patches,
-            apply_log=apply_log,
-            clusters=clusters,
-            metadata_snapshot=metadata_snapshot,
-            predict_fn=predict_fn,
-            scorers=scorers,
-            prev_model_id=prev_model_id,
-            best_scores=best_scores,
-            best_accuracy=best_accuracy,
-            catalog=catalog,
-            schema=schema,
-            reference_sqls=reference_sqls,
-            noise_floor=noise_floor,
-            affected_question_ids=set(ag.get("affected_questions", [])),
-            lever_keys=lever_keys,
-            max_benchmark_count=max_benchmark_count,
-            prev_failure_qids=prev_failure_qids,
-            prev_iter_pre_accept_baseline=_prev_iter_pre_accept_baseline,
-            accepted_baseline_rows_for_control_plane=(
-                _accepted_baseline_rows_for_control_plane
-            ),
-            phase_h_anchor_run_id=_phase_h_anchor_run_id,
-        )
-
-        # Phase A — Lossless contract: refresh the deterministic eval-result
-        # carrier IMMEDIATELY after the gate returns, BEFORE the accept/
-        # rollback branch below. The previous wiring only refreshed on the
-        # accept path (line ~15400 region), so a run where every iteration
-        # rolled back would leave the carrier empty for the entire run,
-        # producing empty `eval_rows` and `post_eval_passing_qids` in the
-        # replay fixture and starving the journey-contract validator of qids.
-        # The helper returns {} when neither full_result nor
-        # failed_eval_result is populated; in that case we deliberately keep
-        # the prior carrier value rather than clobbering with empty.
-        _gate_eval = _extract_eval_result_from_gate(gate_result)
-        if _gate_eval:
-            _latest_eval_result = _gate_eval
-            # Defensive backfill — populate the current iteration's snapshot
-            # from THIS iteration's gate result so iter 1 has real eval_rows
-            # even when the baseline seed at _run_lever_loop start silently
-            # failed. The iter-start snapshot block (around line ~11138)
-            # reads _latest_eval_result, which on iter 1 only has the
-            # baseline seed; if that seed is empty the iter-1 snapshot is
-            # empty too. This second write fixes that without depending on
-            # the seed.
-            try:
-                _backfill_rows = _build_fixture_eval_rows(_gate_eval)
-                if _backfill_rows and not _current_iter_inputs.get("eval_rows"):
-                    _current_iter_inputs["eval_rows"] = _backfill_rows
-            except Exception:
-                logger.debug(
-                    "Phase A: eval_rows backfill from gate_result failed "
-                    "(non-fatal)",
-                    exc_info=True,
-                )
-
-        # v2 Task 21 — Per-question regression rows with full attribution.
-        # The gate returns the verdict and suppressed-qid set; the lever
-        # loop owns persistence here because ``strategy`` (cluster
-        # provenance), ``all_proposals`` (proposal IDs by qid), and
-        # ``apply_log`` (which patches actually deployed) are all in
-        # scope at this level.
-        try:
-            _t4_verdict_for_persist = gate_result.get("_t4_verdict")
-            _t4_suppressed_for_persist = gate_result.get("_suppressed_qids") or set()
-            if _t4_verdict_for_persist is not None:
-                from genie_space_optimizer.optimization.per_question_regression import (
-                    build_question_regression_rows,
-                )
-                _cluster_ids_by_qid: dict[str, list[str]] = {}
-                for _c in (strategy.get("_source_clusters") or []) if strategy else []:
-                    _cid = str(_c.get("cluster_id") or "").strip()
-                    if not _cid:
-                        continue
-                    for _q in _c.get("question_ids") or []:
-                        _cluster_ids_by_qid.setdefault(str(_q), []).append(_cid)
-                _proposal_ids_by_qid: dict[str, list[str]] = {}
-                for _p in (all_proposals or []):
-                    _pid = str(_p.get("proposal_id") or _p.get("id") or "").strip()
-                    if not _pid:
-                        continue
-                    for _q in _p.get("target_qids") or []:
-                        _proposal_ids_by_qid.setdefault(str(_q), []).append(_pid)
-                _applied_patch_entries = apply_log.get("applied", []) or []
-                _applied_patch_ids: list[str] = []
-                for _entry in _applied_patch_entries:
-                    _ap = _entry.get("patch", {}) or {}
-                    _ap_pid = str(
-                        _ap.get("proposal_id")
-                        or _ap.get("expanded_patch_id")
-                        or _ap.get("id")
-                        or ""
-                    )
-                    if _ap_pid:
-                        _applied_patch_ids.append(_ap_pid)
-                _t4_rows = build_question_regression_rows(
-                    run_id=run_id,
-                    iteration=iteration_counter,
-                    ag_id=ag_id,
-                    verdict=_t4_verdict_for_persist,
-                    suppressed_qids=_t4_suppressed_for_persist,
-                    cluster_ids_by_qid=_cluster_ids_by_qid,
-                    proposal_ids_by_qid=_proposal_ids_by_qid,
-                    applied_patch_ids=_applied_patch_ids,
-                )
-                if _t4_rows:
-                    from genie_space_optimizer.optimization.state import (
-                        write_question_regressions,
-                    )
-                    write_question_regressions(
-                        spark, _t4_rows, catalog=catalog, schema=schema,
-                    )
-        except Exception:
-            logger.debug(
-                "Failed to persist per-question regression rows", exc_info=True,
-            )
-
-        # After the gate finishes, this iteration's pre-acceptance
-        # baseline becomes the reference for the next iteration's
-        # drift diagnostic.
-        _prev_iter_pre_accept_baseline = _baseline_at_start_of_this_iter
-
-        # Phase F+H A5 (v2.1): F8 acceptance — post-stage observability
-        # with SELECTIVE atomic dedup at the 2 post-gate callsites + the
-        # post-eval block. The closure _phase_b_emit_ag_outcome_record
-        # STAYS inline because its 3 pre-gate callsites
-        # ("skipped_dead_on_arrival", "skipped_pre_ag_snapshot_failed",
-        # "skipped_no_applied_patches") are pre-gate filtering paths that
-        # bypass decide_control_plane_acceptance entirely — F8.decide()
-        # cannot reproduce them.
-        #
-        # decide_control_plane_acceptance is called once per AG INSIDE
-        # _run_gate_checks (verified PURE — zero mlflow./spark./global
-        # hits in control_plane.py). F8.decide() re-calls the same gate
-        # per AG with the same inputs, derives the same reason_code, and
-        # emits ACCEPTANCE_DECIDED + QID_RESOLUTION via stages/
-        # acceptance.py:decide.
-        #
-        # Why this anchor (best_accuracy drift trap):
-        # - At this point best_accuracy is still the pre-acceptance
-        #   baseline that _run_gate_checks consumed; best_accuracy is
-        #   only mutated later inside the accept branch.
-        # - AGs that hit the 3 pre-gate filters have already `continue`'d.
-        #   The in-scope `ag` is the SURVIVOR.
-        # - inp.ags=(ag,) captures the single-AG slate exactly (one AG
-        #   per outer iteration per the strategist invariant).
-        #
-        # Replaces:
-        # - 2 post-gate callsites further below: rolled_back (inside
-        #   the gate-failed branch) and accepted (after the accept
-        #   branch's _outcome_for_journey computation).
-        # - _post_eval_resolution_records block at iteration-end.
-        # Does NOT replace:
-        # - closure _phase_b_emit_ag_outcome_record (definition + 3
-        #   pre-gate callsites STAY inline).
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                is_strict_mode as _phase_b_strict_mode,
-            )
-            from genie_space_optimizer.optimization.stages import (
-                StageContext as _StageCtx,
-            )
-            from genie_space_optimizer.optimization.stages import (
-                acceptance as _accept_stage,
-            )
-
-            _stage_ctx_a5 = _StageCtx(
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                space_id=str(space_id),
-                domain=str(domain),
-                catalog=str(catalog),
-                schema=str(schema),
-                apply_mode=str(apply_mode),
-                journey_emit=_journey_emit,
-                decision_emit=_decision_emit,
-                mlflow_anchor_run_id=_phase_h_anchor_run_id,  # C17 v2 — activates Phase B capture
-                feature_flags={},
-            )
-
-            # Group apply_log entries by AG. Always source from apply_log
-            # (no _applied_set check) — apply_log is the iteration-local
-            # bound earlier in this iteration; _applied_set may not be
-            # bound if A4 errored upstream.
-            _accept_applied_by_ag: dict[str, list[dict]] = {}
-            for _entry in (apply_log.get("applied") or []):
-                _patch = _entry.get("patch") or {}
-                _entry_ag = str(_patch.get("ag_id") or "")
-                if _entry_ag:
-                    _accept_applied_by_ag.setdefault(_entry_ag, []).append(
-                        _entry
-                    )
-            _accept_applied_by_ag_t: dict[str, tuple] = {
-                k: tuple(v) for k, v in _accept_applied_by_ag.items()
-            }
-
-            # Source candidate_accuracy + candidate_pre_arbiter_accuracy
-            # from gate_result (the values _run_gate_checks consumed
-            # internally). Recomputing from full_result_1 is forbidden —
-            # it would diverge.
-            _accept_candidate_accuracy = float(
-                gate_result.get("full_accuracy") or 0.0
-            )
-            _accept_candidate_pre_arbiter = _candidate_pre_arbiter_from_gate(
-                gate_result
-            )
-            # post_rows: read from gate_result.full_result.rows (what the
-            # gate actually consumed). The previous fallback referenced
-            # ``full_result_1`` which is only assigned in the eval helper's
-            # scope and would NameError here whenever
-            # ``gate_result.full_result.rows`` is empty. We drop the
-            # impossible fallback (mirrors the safe ``or []`` pattern at
-            # the accepted-baseline write site below).
-            _accept_gate_full_result = (
-                gate_result.get("full_result") or {}
-            )
-            _accept_post_rows = (
-                _accept_gate_full_result.get("rows")
-                or []
-            )
-
-            try:
-                _accept_inp = _accept_stage.AcceptanceInput(
-                    applied_entries_by_ag=_accept_applied_by_ag_t,
-                    ags=(ag,),  # single-AG slate
-                    baseline_accuracy=float(best_accuracy),
-                    candidate_accuracy=_accept_candidate_accuracy,
-                    baseline_pre_arbiter_accuracy=float(_iter_best_pre_arbiter),
-                    candidate_pre_arbiter_accuracy=_accept_candidate_pre_arbiter,
-                    pre_rows=tuple(_baseline_rows_for_control_plane or []),
-                    post_rows=tuple(_accept_post_rows),
-                    protected_qids=(),
-                    min_gain_pp=float(MIN_POST_ARBITER_GAIN_PP),
-                    min_pre_arbiter_gain_pp=2.0,
-                    rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
-                    cluster_by_qid={},
-                )
-            except Exception as _accept_inp_exc:
-                from genie_space_optimizer.optimization.stage_io_capture import (
-                    record_capture_failure as _record_capture_failure,
-                    stage_artifact_paths as _stage_artifact_paths,
-                )
-                try:
-                    _paths = _stage_artifact_paths(
-                        int(iteration_counter), "acceptance_decision",
-                    )
-                    _record_capture_failure(
-                        stage_key="acceptance_decision",
-                        artifact_path=_paths["input"],
-                        error_class=type(_accept_inp_exc).__name__,
+                        iter_producer_exceptions=_iter_producer_exceptions,
                     )
                 except Exception:
                     logger.debug(
-                        "Phase F+H A5: record_capture_failure for "
-                        "AcceptanceInput build failed",
+                        "Phase H finalise on exit_path=rolled_back skipped (non-fatal)",
                         exc_info=True,
                     )
-                raise
-            # Phase F+H Commit B15: wrap F8 with stage_io_capture
-            # decorator. Replay-byte-stable — wrap_with_io_capture
-            # returns the stage output unchanged; MLflow log_text
-            # calls are no-ops while mlflow_anchor_run_id is None
-            # (C17 wires the anchor on real runs).
-            from genie_space_optimizer.optimization.stage_io_capture import (
-                wrap_with_io_capture as _wrap_with_io_capture_a5,
-            )
-            _accept_wrapped = _wrap_with_io_capture_a5(
-                execute=_accept_stage.execute,
-                stage_key="acceptance_decision",
-            )
-            _ag_outcome = _accept_wrapped(_stage_ctx_a5, _accept_inp)
-        except Exception as _accept_stage_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="ag_outcome",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_accept_stage_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase F+H A5: producer_exception_record emission failed",
-                    exc_info=True,
-                )
-            _iter_producer_exceptions["ag_outcome"] = (
-                _iter_producer_exceptions.get("ag_outcome", 0) + 1
-            )
-            _phase_b_producer_exceptions["ag_outcome"] = (
-                _phase_b_producer_exceptions.get("ag_outcome", 0) + 1
-            )
-            logger.debug(
-                "Phase F+H A5 v2.1: acceptance stage failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
+                continue
 
-        # ── 3B.7: Accept or rollback ────────────────────────────────
-        _target_objects = [
-            p.get("target_object", "") for p in patches if p.get("target_object")
-        ]
+            # ── Accept action group ──────────────────────────────────────
+            ags_accepted.append(ag_id)
+            for lk in lever_keys:
+                levers_accepted.append(int(lk))
 
-        if not gate_result.get("passed"):
-            reason = gate_result.get("rollback_reason", "unknown")
-            # Phase A — Lossless contract: stamp rolled_back for every
-            # qid the AG targeted. Required transition from APPLIED.
+            # Phase A — Lossless contract: stamp accepted (or accepted_with_
+            # regression_debt) for every qid the AG targeted. Required
+            # transition from APPLIED.
             try:
+                _outcome_for_journey = (
+                    "accepted_with_regression_debt"
+                    if (
+                        gate_result.get("acceptance_decision", {}) or {}
+                    ).get("reason_code") == "accepted_with_regression_debt"
+                    else "accepted"
+                )
                 _emit_ag_outcome_journey(
                     emit=_journey_emit,
                     ag_id=str(ag_id),
-                    outcome="rolled_back",
+                    outcome=_outcome_for_journey,
                     affected_qids=list(ag.get("affected_questions") or []),
                 )
-                _current_iter_inputs["ag_outcomes"][str(ag_id)] = "rolled_back"
             except Exception:
                 logger.debug(
-                    "Phase A: AG-outcome (rolled_back) emit/capture failed (non-fatal)",
+                    "Phase A: AG-outcome journey emit (accepted) failed (non-fatal)",
                     exc_info=True,
                 )
-            # A5 v2.1: F8 emits ACCEPTANCE_DECIDED above.
-            _render_current_journey()
-            rollback(apply_log, w, space_id, metadata_snapshot)
-            # Task 7 — verify the Genie Space actually returned to its
-            # pre-AG state. If not, halt subsequent AGs because clustering
-            # against a still-modified space pollutes downstream RCA.
             try:
-                from genie_space_optimizer.optimization.applier import (
-                    verify_rollback_restored,
+                _current_iter_inputs["ag_outcomes"][str(ag_id)] = _outcome_for_journey
+            except Exception:
+                logger.debug(
+                    "Phase A: ag_outcome capture (accepted) failed (non-fatal)",
+                    exc_info=True,
+                )
+            # Phase F+H A5 v2.1: F8.decide() (above, pre-3B.7) emits the
+            # ACCEPTANCE_DECIDED record for accepted /
+            # accepted_with_regression_debt. The closure callsite formerly
+            # here is deleted to prevent double-emission.
+
+            # Phase C Task 3 — ObservedEffect per applied patch in this AG.
+            # Best-effort with defensive defaults: empty pre/post passing
+            # qid sets and zero deltas if the surrounding scope hasn't yet
+            # named the relevant signals. The structured surface is what
+            # matters; downstream consumers (next-action mapper) tolerate
+            # unset fields, and Phase D / Cycle-8 Bug 1 Phase 3b will plumb
+            # richer signals into this site.
+            try:
+                from genie_space_optimizer.optimization.rca_execution import (
+                    build_observed_effects,
                 )
 
-                _restore_decision = verify_rollback_restored(
-                    w=w,
-                    space_id=space_id,
-                    expected_snapshot=metadata_snapshot,
-                )
-                if not _restore_decision.get("verified", True):
-                    logger.error(
-                        "AG %s: verify_rollback_restored returned not verified "
-                        "(reason=%s, first_diff=%s). Genie Space state may not "
-                        "match pre-iteration baseline. Failing run terminally.",
-                        ag_id,
-                        _restore_decision.get("reason", "unknown"),
-                        _restore_decision.get("first_diff_path", "(none)"),
-                    )
-                    print(
-                        _section("ROLLBACK VERIFICATION FAILED", "-") + "\n"
-                        + _kv("AG", ag_id) + "\n"
-                        + _kv("Reason", _restore_decision.get("reason", "unknown")) + "\n"
-                        + _kv("Expected digest", _restore_decision.get("expected_digest", "(none)")) + "\n"
-                        + _kv("Live digest", _restore_decision.get("live_digest", "(none)")) + "\n"
-                        + _kv("First diff", _restore_decision.get("first_diff_path", "(none)")) + "\n"
-                        + "|  Genie Space state did not match pre-iteration snapshot.\n"
-                        + "|  Failing the run terminally; subsequent AGs cannot trust live state.\n"
-                        + _bar("-")
-                    )
-                    _rollback_state_trusted_for_quarantine = False
-                    update_run_status(
-                        spark,
-                        run_id,
-                        catalog,
-                        schema,
-                        status="FAILED",
-                        convergence_reason="failed_rollback_verification",
-                    )
-                    raise FailedRollbackVerification(
-                        json.dumps(_restore_decision, default=str)[:1000]
-                    )
-            except FailedRollbackVerification:
-                raise
-            except Exception:
-                logger.warning(
-                    "verify_rollback_restored raised — treating as non-fatal "
-                    "but flagging for operator review",
-                    exc_info=True,
-                )
-            mark_patches_rolled_back(
-                spark, run_id, iteration_counter, reason, catalog, schema,
-            )
-            ags_rolled_back.append(ag_id)
-            # Cycle 9 W4 — capture every applied patch from this AG into
-            # the per-run DOA fingerprint buffer when the post-eval
-            # acceptance decision still reports unresolved target qids.
-            # The buffer is later read by the strategist preprocessing
-            # step (commit 3) to prune any candidate whose retry
-            # signature is already known dead-on-arrival in this run.
-            try:
-                from types import SimpleNamespace as _DoaDecisionAdapter
-                _accept_dict = gate_result.get("acceptance_decision") or {}
-                _doa_decision = _DoaDecisionAdapter(
-                    accepted=bool(_accept_dict.get("accepted", False)),
-                    target_still_hard_qids=tuple(
-                        _accept_dict.get("target_still_hard_qids") or ()
-                    ),
-                )
-                _capture_doa_fingerprints_on_rollback(
-                    buffer=_doa_fingerprint_buffer,
-                    decision=_doa_decision,
+                _observed = build_observed_effects(
+                    iteration=iteration_counter,
                     ag_id=str(ag_id),
-                    applied_patches=[
-                        (e.get("patch") or {})
-                        for e in (apply_log.get("applied") or [])
-                    ],
+                    apply_log=apply_log,
+                    pre_passing_qids=(),
+                    post_passing_qids=tuple(
+                        _current_iter_inputs.get("post_eval_passing_qids") or ()
+                    ),
+                    pre_iq=0.0,
+                    post_iq=0.0,
+                    arbiter_verdict_change="",
+                    pre_judge_failures=0,
+                    post_judge_failures=0,
                 )
-            except Exception:
+                _current_iter_inputs.setdefault("observed_effects", []).extend(
+                    [
+                        {
+                            "iteration": e.iteration,
+                            "ag_id": e.ag_id,
+                            "proposal_id": e.proposal_id,
+                            "pre_passing_qids": list(e.pre_passing_qids),
+                            "post_passing_qids": list(e.post_passing_qids),
+                            "iq_delta": e.iq_delta,
+                            "arbiter_verdict_change": e.arbiter_verdict_change,
+                            "judge_failure_delta": e.judge_failure_delta,
+                        }
+                        for e in _observed
+                    ]
+                )
+            except Exception as _observed_effect_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="observed_effect",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_observed_effect_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for observed_effect",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["observed_effect"] = (
+                    _phase_b_producer_exceptions.get("observed_effect", 0) + 1
+                )
                 logger.debug(
-                    "Cycle 9 W4: DOA fingerprint capture wiring failed "
-                    "(non-fatal)",
+                    "Phase C: build_observed_effects failed (non-fatal)",
                     exc_info=True,
                 )
-            # Phase 1.3: drop the AG buffer when an AG rolls back.  The
-            # buffered AGs were produced from the same strategist call
-            # and tend to share the same flawed root-cause hypothesis;
-            # forcing a fresh strategist call gives the next iteration
-            # a clean slate informed by the rollback in reflection_buffer.
-            if pending_action_groups:
-                logger.info(
-                    "Dropping %d buffered AG(s) after rollback of %s",
-                    len(pending_action_groups), ag_id,
-                )
-                pending_action_groups = []
-                pending_strategy = None
-            for lk in lever_keys:
-                levers_rolled_back.append(int(lk))
-            # Phase E2: include rollback_class in stage detail so the
-            # run summary can break rollbacks down by class.
-            from genie_space_optimizer.optimization.rollback_class import (
-                classify_rollback_reason as _classify_rb,
-            )
-            _rb_class = _classify_rb(reason).value
-            write_stage(
-                spark, run_id, f"AG_{ag_id}_STARTED", "ROLLED_BACK",
-                task_key="lever_loop", iteration=iteration_counter,
-                detail={
-                    "reason": reason,
-                    "levers": lever_keys,
-                    "rollback_class": _rb_class,
-                },
-                catalog=catalog, schema=schema,
-            )
-            _failed_eval = gate_result.get("failed_eval_result", {})
-            _fail_tmap = _failed_eval.get("trace_map", {})
-            _fail_qids = set(_failed_eval.get("failure_question_ids", []))
-            all_failure_question_ids.extend(_fail_qids)
-            for qid, tid in _fail_tmap.items():
+                if _phase_b_strict_mode():
+                    raise
+
+            full_scores = gate_result["full_scores"]
+            full_accuracy = gate_result["full_accuracy"]
+            new_model_id = gate_result["new_model_id"]
+            full_result = gate_result["full_result"]
+            # Phase A — carrier is now refreshed at the gate-checks site above
+            # (right after `_run_gate_checks` returns), so this re-assignment is
+            # redundant on the accept path but harmless. Kept as a no-op anchor
+            # so downstream reads of the local `full_result` variable stay
+            # consistent with the carrier.
+            _latest_eval_result = full_result or _latest_eval_result
+            _last_full_mlflow_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
+
+            _full_trace_map = full_result.get("trace_map", {})
+            _full_failures = set(full_result.get("failure_question_ids", []))
+            all_failure_question_ids.extend(_full_failures)
+            for qid, tid in _full_trace_map.items():
                 question_trace_map.setdefault(qid, []).append(tid)
-                if qid in _fail_qids:
+                if qid in _full_failures:
                     all_failure_trace_ids.append(tid)
-                elif "regressions" in gate_result:
-                    all_regression_trace_ids.append(tid)
-            _fail_run_id = _failed_eval.get("mlflow_run_id") or _failed_eval.get("run_id", "")
-            if _fail_run_id:
-                all_eval_mlflow_run_ids.append(_fail_run_id)
+            _full_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
+            if _full_run_id:
+                all_eval_mlflow_run_ids.append(_full_run_id)
 
-            _failed_scores = gate_result.get("full_scores", best_scores)
-            _rb_fail_qids = set(
-                gate_result.get("failed_eval_result", {}).get("failure_question_ids", [])
-            )
-            _affected_set = set(ag.get("affected_questions", []))
-            _any_target_improved = bool(
-                _affected_set and prev_failure_qids
-                and (_affected_set & prev_failure_qids) - (_rb_fail_qids or prev_failure_qids)
-            )
-            _rb_refinement = "in_plan" if _any_target_improved else "out_of_plan"
-            _rb_acc_delta = (
-                sum(_failed_scores.values()) / max(len(_failed_scores), 1)
-                - sum(best_scores.values()) / max(len(best_scores), 1)
-            )
-            _regressions = gate_result.get("regressions", [])
-            _rb_patch_types = sorted({p.get("patch_type", "?") for p in patches})
-            _control_plane_reason_for_reflection = ""
-            for _r in _regressions:
-                if _r.get("judge") == "control_plane_acceptance":
-                    _control_plane_reason_for_reflection = str(
-                        _r.get("reason") or ""
-                    )
-                    break
-            _rb_reflection = _format_rollback_reflection(
-                rollback_reason=reason,
-                control_plane_reason=_control_plane_reason_for_reflection,
-                any_target_improved=_any_target_improved,
-                regressions=_regressions,
-                patch_types=_rb_patch_types,
-                root_cause_summary=str(ag.get("root_cause_summary", "")),
-                accuracy_delta_pp=float(_rb_acc_delta),
-            )
-
-            # Task 19 — record SQL-shape deltas on the rolled-back AG
-            # so the strategist can see what the candidate accomplished
-            # vs. ground truth, and where shape work still remains.
-            from genie_space_optimizer.optimization.sql_shape_delta import (
-                compute_sql_shape_delta,
-            )
-
-            def _row_qid(row: dict) -> str:
-                return str(
-                    row.get("inputs.question_id")
-                    or row.get("inputs/question_id")
-                    or row.get("question_id")
-                    or (row.get("inputs") or {}).get("question_id", "")
-                )
-
-            def _row_sql(row: dict) -> str:
-                return str(
-                    row.get("outputs.predictions.sql")
-                    or row.get("outputs/predictions/sql")
-                    or row.get("generated_sql")
-                    or row.get("genie_sql")
-                    or (row.get("outputs") or {}).get("genie_sql", "")
-                    or ""
-                )
-
-            def _row_count(row: dict) -> int | None:
-                for k in ("genie_row_count", "outputs.genie_row_count", "outputs/genie_row_count"):
-                    v = row.get(k)
-                    if isinstance(v, (int, float)):
-                        return int(v)
-                v = (row.get("outputs") or {}).get("genie_row_count")
-                return int(v) if isinstance(v, (int, float)) else None
-
-            _accepted_by_qid = {
-                _row_qid(r): r
-                for r in (_accepted_baseline_rows_for_control_plane or [])
-                if _row_qid(r)
-            }
-            _candidate_by_qid_for_delta = {
-                _row_qid(r): r
-                for r in (_failed_eval.get("rows") or [])
-                if _row_qid(r)
-            }
             try:
-                _gt_by_qid = dict(reference_sqls or {})
+                from genie_space_optimizer.optimization.evaluation import log_expectations_on_traces
+                log_expectations_on_traces(full_result)
             except Exception:
-                _gt_by_qid = {}
-            _sql_deltas: list[dict] = []
-            for _qid, _cand_row in _candidate_by_qid_for_delta.items():
-                _gt_sql = str(_gt_by_qid.get(_qid, ""))
-                if not _gt_sql:
-                    continue
-                _acc_row = _accepted_by_qid.get(_qid, {})
-                try:
-                    _delta = compute_sql_shape_delta(
-                        target_qid=_qid,
-                        accepted_sql=_row_sql(_acc_row),
-                        candidate_sql=_row_sql(_cand_row),
-                        ground_truth_sql=_gt_sql,
-                        accepted_row_count=_row_count(_acc_row),
-                        candidate_row_count=_row_count(_cand_row),
-                    )
-                except Exception:
-                    continue
-                if _delta.get("improved") or _delta.get("remaining"):
-                    _sql_deltas.append(_delta)
+                logger.debug("Failed to log expectations on iter %d traces", iteration_counter, exc_info=True)
 
+            try:
+                log_judge_verdicts_on_traces(full_result)
+            except Exception:
+                logger.debug("Failed to log judge verdicts on iter %d traces", iteration_counter, exc_info=True)
+
+            try:
+                _persist_text, _persist_data = _build_question_persistence_summary(
+                    _verdict_history, reflection_buffer,
+                )
+                if _persist_data:
+                    log_persistence_context_on_traces(full_result, _persist_data)
+            except Exception:
+                logger.debug("Failed to log persistence context on iter %d traces", iteration_counter, exc_info=True)
+
+            lever_changes.append({
+                "lever": ag_id,
+                "lever_name": f"AG {ag_id}: {ag.get('root_cause_summary', '')[:60]}",
+                "patches": [
+                    {"change": p.get("change_description", ""), "patch_type": p.get("patch_type", "")}
+                    for p in all_proposals
+                ],
+                "accuracy_delta": full_accuracy - best_accuracy,
+            })
+
+            _accepted_fail_qids = set(full_result.get("failure_question_ids", []))
+            _acc_delta = full_accuracy - best_accuracy
+            _acc_patch_types = sorted({p.get("patch_type", "?") for p in patches})
+            _acc_reflection = (
+                f"Accepted: {ag.get('root_cause_summary', 'improvement')} resolved via "
+                f"{', '.join(_acc_patch_types)}. "
+                f"Accuracy improved by {_acc_delta:+.1f}% "
+                f"affecting {len(ag.get('affected_questions', []))} question(s)."
+            )
             reflection = _build_reflection_entry(
-                iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                iteration=iteration_counter, ag_id=ag_id, accepted=True,
                 levers=[int(lk) for lk in lever_keys],
                 target_objects=_target_objects,
-                prev_scores=best_scores, new_scores=_failed_scores,
-                rollback_reason=reason, patches=patches,
+                prev_scores=best_scores, new_scores=full_scores,
+                rollback_reason=None, patches=patches,
                 affected_question_ids=ag.get("affected_questions", []),
                 prev_failure_qids=prev_failure_qids,
-                new_failure_qids=_rb_fail_qids or prev_failure_qids,
-                reflection_text=_rb_reflection,
-                refinement_mode=_rb_refinement,
+                new_failure_qids=_accepted_fail_qids,
+                reflection_text=_acc_reflection,
+                acceptance_delta_pp=float(
+                    gate_result.get("acceptance_delta_pp", _acc_delta)
+                ),
                 **_ag_identity_kwargs,
             )
-            reflection["sql_shape_deltas"] = _sql_deltas
             _attach_rca_theme_attribution(
                 spark=spark,
                 run_id=run_id,
@@ -20936,1311 +21481,924 @@ def _run_lever_loop(
                 metadata_snapshot=metadata_snapshot,
                 reflection=reflection,
                 prev_failure_qids=prev_failure_qids,
-                new_failure_qids=_rb_fail_qids or set(),
+                new_failure_qids=_accepted_fail_qids,
                 catalog=catalog,
                 schema=schema,
             )
             reflection_buffer.append(reflection)
-
-            # Regression-mining lane (audit-only, soft-fail). Mines
-            # ``column_confusion`` insights from failed candidate eval
-            # rows for newly-regressed questions. Acceptance, rollback,
-            # and state loaders are unchanged; the insights live in
-            # the decision-audit table and on the reflection JSON for
-            # later inspection. A feature flag controls whether the
-            # next strategist call sees them as compact hints.
-            _mined_insights: list = []
-            try:
-                from genie_space_optimizer.optimization.regression_mining import (
-                    mine_regression_insights,
-                    summarize_insights_for_reflection,
-                )
-                _regressed_qids: set[str] = set()
-                for _r in gate_result.get("regressions") or []:
-                    for _q in _r.get("blocking_qids") or []:
-                        if _q:
-                            _regressed_qids.add(str(_q))
-                # Fallback: if no per-question regression fired (e.g.
-                # the gate failed for raw acceptance reasons), mine the
-                # set of qids that flipped from passing to failing.
-                if not _regressed_qids and prev_failure_qids is not None:
-                    _flipped = {
-                        str(q) for q in (_rb_fail_qids or set())
-                        if q not in prev_failure_qids
-                    }
-                    _regressed_qids = _flipped
-                _failed_rows = (
-                    gate_result.get("failed_eval_result", {}).get("rows") or []
-                )
-                _mined_insights = mine_regression_insights(
-                    failed_eval_rows=_failed_rows,
-                    regressed_qids=_regressed_qids,
-                    metadata_snapshot=metadata_snapshot,
-                )
-                if _mined_insights:
-                    reflection["regression_mining"] = (
-                        summarize_insights_for_reflection(_mined_insights)
-                    )
-                    logger.info(
-                        "Regression mining produced %d insight(s) for iter %d "
-                        "(qids: %s)",
-                        len(_mined_insights),
-                        iteration_counter,
-                        ", ".join(sorted({i.question_id for i in _mined_insights})[:5]),
-                    )
-            except Exception:
-                logger.debug(
-                    "Regression mining failed for rollback iter %d",
-                    iteration_counter,
-                    exc_info=True,
-                )
-
             try:
                 update_iteration_reflection(
                     spark, run_id, iteration_counter, reflection,
                     catalog=catalog, schema=schema, eval_scope="full",
                 )
             except Exception:
-                logger.debug("Failed to persist reflection for rollback iter %d", iteration_counter, exc_info=True)
+                logger.debug("Failed to persist reflection for accepted iter %d", iteration_counter, exc_info=True)
+            prev_failure_qids = _accepted_fail_qids
 
-            # Persist the mined insights as typed decision-audit rows.
-            # ``gate_name="regression_mining"`` lets a single SQL query
-            # answer "what did we learn from rollbacks on this run?"
-            # without parsing reflection JSON. Soft-fail by design —
-            # the audit table is non-authoritative.
-            if _mined_insights:
+            if _acc_delta >= 1.0:
+                skill_exemplars.append({
+                    "root_cause": ag.get("root_cause_summary", ""),
+                    "lever_pattern": sorted(ag.get("lever_directives", {}).keys()),
+                    "patch_types": [p.get("patch_type") for p in patches[:5] if p.get("patch_type") is not None],
+                    "accuracy_gain": round(_acc_delta, 1),
+                })
+
+            best_scores = full_scores
+            best_accuracy = full_accuracy
+            best_model_id = new_model_id
+            best_iteration = iteration_counter
+            # Roll the in-scope pre-arbiter baseline forward to whatever the
+            # gate just consumed for this accepted candidate. Mirrors the
+            # post-arbiter ``best_accuracy`` update one line up.
+            _iter_best_pre_arbiter = _candidate_pre_arbiter_from_gate(gate_result)
+            prev_scores = full_scores
+            prev_model_id = new_model_id
+            # Task 5 — only update accepted-baseline rows on accept; rollback
+            # paths must NOT touch this list. Pull from the gate's
+            # ``full_result.rows`` so the snapshot is the same row set the
+            # gate just used to decide acceptance, not a stale ``_after_rows``
+            # local that may have been narrowed for diagnostics.
+            _accepted_full_rows = (
+                gate_result.get("full_result", {}).get("rows")
+                or []
+            )
+            _accepted_baseline_rows_for_control_plane = [
+                dict(row) for row in _accepted_full_rows
+            ]
+            # Task 6 — restore quarantine trust now that an AG accepted and the
+            # live Genie config matches the gate's accepted-baseline rows.
+            _rollback_state_trusted_for_quarantine = True
+            # Task 8 — carry accepted regression debt into the next strategist
+            # input so the loop targets it before any new soft cluster.
+            _acceptance_detail = gate_result.get("acceptance_decision") or {}
+            _regression_debt_qids_for_next_iteration = tuple(
+                str(q)
+                for q in (_acceptance_detail.get("regression_debt_qids") or [])
+                if str(q)
+            )
+            if _regression_debt_qids_for_next_iteration:
+                print(
+                    _section("REGRESSION DEBT CARRIED FORWARD", "-") + "\n"
+                    + _kv("QIDs", list(_regression_debt_qids_for_next_iteration)) + "\n"
+                    + _bar("-")
+                )
+
+            new_refs = extract_reference_sqls(full_result)
+            if new_refs:
+                reference_sqls.update(new_refs)
+            new_hashes = extract_reference_result_hashes(full_result)
+            if new_hashes:
+                reference_result_hashes.update(new_hashes)
+
+            update_run_status(
+                spark, run_id, catalog, schema,
+                best_iteration=best_iteration,
+                best_accuracy=best_accuracy,
+                best_model_id=best_model_id,
+            )
+
+            post_instructions = _get_general_instructions(
+                apply_log.get("post_snapshot", metadata_snapshot)
+            )
+            if post_instructions:
+                register_instruction_version(
+                    uc_schema=f"{catalog}.{schema}",
+                    space_id=space_id,
+                    instruction_text=post_instructions,
+                    run_id=run_id,
+                    lever=0,
+                    iteration=iteration_counter,
+                    accuracy=best_accuracy,
+                    domain=domain,
+                )
+
+            write_stage(
+                spark, run_id, f"AG_{ag_id}_STARTED", "COMPLETE",
+                task_key="lever_loop", iteration=iteration_counter,
+                detail={
+                    "accuracy": full_accuracy,
+                    "accepted": True,
+                    "patches_applied": len(apply_log.get("applied", [])),
+                    "levers": lever_keys,
+                },
+                catalog=catalog, schema=schema,
+            )
+
+            metadata_snapshot = apply_log.get("post_snapshot", metadata_snapshot)
+            if _original_instruction_sections:
+                metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
+
+            # Phase 7: end-of-iteration diagnostics. Single block summarizing
+            # ASI source quality, cluster processing, patch capping, and
+            # pre-arbiter accuracy so operators can spot degenerate values
+            # at a glance. Any field at a danger threshold (ASI=none > 50%,
+            # arbiter rescue > 30%) emits an inline SEVERITY:HIGH banner.
+            try:
+                _diag_lines = [_section("LEVER_LOOP_DIAGNOSTICS", "=")]
+                _diag_lines.append(_kv("Iteration", iteration_counter))
+                _diag_lines.append(_kv("AG id", ag_id))
+
+                # ASI source histogram from the latest eval rows. The
+                # ``_eval_rows`` variable is populated below in the join-
+                # mining block but doesn't exist yet at this point in the
+                # iteration; pull rows directly from ``full_result``.
+                _asi_source_counts: dict[str, int] = {}
+                _asi_total = 0
+                _diag_rows = full_result.get("rows", []) if isinstance(full_result, dict) else []
+                if not _diag_rows and isinstance(full_result, dict):
+                    _rows_json = full_result.get("rows_json")
+                    if isinstance(_rows_json, list):
+                        _diag_rows = _rows_json
+                    elif isinstance(_rows_json, str):
+                        try:
+                            import json as _json_diag
+                            _diag_rows = _json_diag.loads(_rows_json)
+                        except (ValueError, TypeError):
+                            _diag_rows = []
+                for _r in _diag_rows:
+                    if not isinstance(_r, dict):
+                        continue
+                    for _log in (_r.get("_asi_extraction_log") or []):
+                        if not isinstance(_log, dict):
+                            continue
+                        _src = str(_log.get("source") or "none")
+                        _asi_source_counts[_src] = _asi_source_counts.get(_src, 0) + 1
+                        _asi_total += 1
+                if _asi_total:
+                    _none_pct = (
+                        100 * _asi_source_counts.get("none", 0) / _asi_total
+                    )
+                    _hist = ", ".join(
+                        f"{k}={v}"
+                        for k, v in sorted(
+                            _asi_source_counts.items(), key=lambda kv: -kv[1],
+                        )
+                    )
+                    _diag_lines.append(_kv("ASI source histogram", _hist))
+                    if _none_pct > 50.0:
+                        _diag_lines.append(
+                            f"|   [SEVERITY:HIGH] ASI source none={_none_pct:.0f}% > 50% "
+                            f"— strategist is reasoning blind on heuristic root_causes"
+                        )
+                else:
+                    _diag_lines.append(_kv("ASI source histogram", "(no rows)"))
+
+                # Cluster processing.
+                _diag_lines.append(_kv(
+                    "Hard clusters formed", len(clusters or []),
+                ))
+                _diag_lines.append(_kv(
+                    "Soft clusters formed", len(soft_signal_clusters or []),
+                ))
+                _diag_lines.append(_kv("AGs attempted (cumulative)", len(ags_attempted)))
+                _diag_lines.append(_kv("AGs accepted (cumulative)", len(ags_accepted)))
+                _diag_lines.append(_kv("AGs rolled back (cumulative)", len(ags_rolled_back)))
+                _diag_lines.append(_kv("Pending AGs in buffer", len(pending_action_groups)))
+
+                # Patch cap.
+                _diag_lines.append(_kv("Patches applied this AG", len(apply_log.get("applied", []))))
+
+                # Pre-arbiter accuracy + arbiter rescue rate.
+                _full_scores = (
+                    full_result.get("scores", {})
+                    if isinstance(full_result, dict) else {}
+                )
+                _pre_arb = _full_scores.get(
+                    "_pre_arbiter/overall_accuracy",
+                    _full_scores.get("_pre_arbiter/result_correctness"),
+                )
+                _adj = (
+                    full_result.get("overall_accuracy")
+                    if isinstance(full_result, dict) else None
+                )
+                if _pre_arb is not None:
+                    _diag_lines.append(
+                        _kv("Pre-arbiter accuracy", f"{_pre_arb:.1f}%"),
+                    )
+                if _adj is not None:
+                    _diag_lines.append(
+                        _kv("Arbiter-adjusted accuracy", f"{_adj:.1f}%"),
+                    )
+                _bcr = (
+                    full_result.get("both_correct_rate")
+                    if isinstance(full_result, dict) else None
+                )
+                if isinstance(_bcr, (int, float)) and _bcr is not None:
+                    _alljudge = float(
+                        _full_scores.get("_pre_arbiter/result_correctness", 0.0)
+                    ) / 100.0
+                    # Task 2 — ``both_correct_rate`` may arrive as 0-100 or 0-1
+                    # depending on producer. Normalise to a fraction before
+                    # subtracting ``_alljudge`` and clamp to the valid
+                    # probability range so the printed value cannot exceed 100%.
+                    _bcr_frac = float(_bcr) / 100.0 if float(_bcr) > 1.0 else float(_bcr)
+                    _rescue = max(0.0, min(1.0, _bcr_frac - _alljudge))
+                    _diag_lines.append(
+                        _kv("Arbiter rescue rate", f"{_rescue*100:.1f}%"),
+                    )
+                    if _rescue > 0.30:
+                        _diag_lines.append(
+                            f"|   [SEVERITY:HIGH] Arbiter rescue rate "
+                            f"{_rescue*100:.1f}% > 30% — pre-arbiter is the "
+                            f"truthful signal"
+                        )
+
+                _diag_lines.append(_bar("="))
+                print("\n".join(_diag_lines))
+            except Exception:
+                logger.debug(
+                    "Phase 7: LEVER_LOOP_DIAGNOSTICS block failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # ── Mine execution-proven joins from latest eval rows ────────
+            try:
+                _eval_rows = full_result.get("rows", [])
+                if not _eval_rows:
+                    _eval_rows_json = full_result.get("rows_json")
+                    if isinstance(_eval_rows_json, str):
+                        import json as _json_mod
+                        try:
+                            _eval_rows = _json_mod.loads(_eval_rows_json)
+                        except (ValueError, TypeError):
+                            _eval_rows = []
+                    elif isinstance(_eval_rows_json, list):
+                        _eval_rows = _eval_rows_json
+                if _eval_rows:
+                    _mine_result = _mine_and_apply_proven_joins(
+                        w, spark, run_id, space_id, metadata_snapshot, _eval_rows,
+                        catalog, schema, iteration=iteration_counter,
+                    )
+                    if _mine_result.get("total_applied", 0) > 0:
+                        from genie_space_optimizer.common.genie_client import fetch_space_config as _fetch_cfg
+                        config = _fetch_cfg(w, space_id)
+                        metadata_snapshot = config.get("_parsed_space", config)
+            except Exception:
+                logger.debug(
+                    "Iterative join mining failed at iter %d (non-fatal)",
+                    iteration_counter, exc_info=True,
+                )
+
+            # Phase A — Lossless contract: stamp post_eval for every qid
+            # that entered eval, with was/is/transition derived from the
+            # pre-iteration and post-iteration passing sets. The contract
+            # requires every evaluated qid to terminate in POST_EVAL.
+            try:
+                _post_eval_full_result = _latest_eval_result or {}
+                _post_eval_eval_qids = list(
+                    _post_eval_full_result.get("question_ids") or []
+                )
+                _post_eval_failure_set = set(
+                    _post_eval_full_result.get("failure_question_ids") or []
+                )
+                _post_eval_is_passing = [
+                    str(q)
+                    for q in _post_eval_eval_qids
+                    if str(q) and str(q) not in _post_eval_failure_set
+                ]
+                _emit_post_eval_journey(
+                    emit=_journey_emit,
+                    eval_qids=_post_eval_eval_qids,
+                    was_passing_qids=list(_prev_passing_qids),
+                    is_passing_qids=_post_eval_is_passing,
+                )
+                # Capture the post-iteration passing set as next iteration's
+                # was-passing baseline.
+                _prev_passing_qids = set(_post_eval_is_passing)
+                # Phase A — capture the post-eval passing set in the replay
+                # fixture iteration snapshot.
                 try:
-                    from genie_space_optimizer.optimization.regression_mining import (
-                        build_decision_audit_rows,
-                    )
-                    from genie_space_optimizer.optimization.state import (
-                        write_lever_loop_decisions as _write_mining_decisions,
-                    )
-                    _mining_rows = build_decision_audit_rows(
-                        _mined_insights,
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        ag_id=ag_id,
-                    )
-                    _write_mining_decisions(
-                        spark, _mining_rows, catalog=catalog, schema=schema,
+                    _current_iter_inputs["post_eval_passing_qids"] = sorted(
+                        _post_eval_is_passing
                     )
                 except Exception:
                     logger.debug(
-                        "Failed to persist regression-mining audit rows for iter %d",
-                        iteration_counter,
+                        "Phase A: post_eval_passing_qids capture failed (non-fatal)",
                         exc_info=True,
                     )
-            for p in patches:
-                # B1.2 — converted patches use ``type`` / ``target``;
-                # the legacy fields ``patch_type`` / ``target_object``
-                # are absent on the conversion path so the previous
-                # extractor returned ``("", "")`` and the guard
-                # silently rejected every entry. Read both for
-                # backward compatibility with any pre-conversion
-                # fixtures.
-                ft = str(p.get("type") or p.get("patch_type") or "").strip()
-                tgt = str(p.get("target") or p.get("target_object") or "").strip()
-                if ft and tgt:
-                    tried_patches.add((ft, tgt))
-            _lever_frozenset = frozenset(int(lk) for lk in lever_keys)
-            # Phase C3 + D3: only CONTENT_REGRESSION rollbacks contribute
-            # to the tried-cluster bookkeeping. Phase D3 also lowers the
-            # threshold so the (root_cause, blame, lever_set) 3-tuple is
-            # marked after the FIRST content rollback, while the legacy
-            # (root_cause, blame) 2-tuple (which suppresses across ALL
-            # levers) is only written when we've exhausted ``>= 2``
-            # distinct lever sets on the same cluster.
-            _content_rb_count = sum(
-                1 for _rb_entry in reflection_buffer
-                if not _rb_entry.get("accepted")
-                and not _rb_entry.get("escalation_handled")
-                and _rb_entry.get("rollback_class") == _RC.CONTENT_REGRESSION.value
-            )
-            _should_mark_tried_lever_aware = _content_rb_count >= 1
-            source_cids = set(ag.get("source_cluster_ids", []))
-            for c in clusters:
-                cid = c.get("cluster_id", "")
-                if source_cids and cid not in source_cids:
-                    continue
-                rc_ft = c.get("asi_failure_type") or c.get("root_cause", "other")
-                rc_blame = _normalise_blame(c.get("asi_blame_set"))
-                if not rc_ft or not _should_mark_tried_lever_aware:
-                    continue
-                # Always add the 3-tuple (lever-aware) immediately.
-                tried_root_causes.add((rc_ft, rc_blame, _lever_frozenset))
-                # Legacy 2-tuple: only when the same cluster has failed
-                # across >= 2 distinct lever sets (truly-dead cluster).
-                _distinct_lever_sets = {
-                    frozenset(e.get("lever_set") or [])
-                    for e in reflection_buffer
-                    if (
-                        not e.get("accepted")
-                        and not e.get("escalation_handled")
-                        and e.get("rollback_class") == _RC.CONTENT_REGRESSION.value
-                        and e.get("root_cause") == rc_ft
-                        and (e.get("blame_set") or "") == rc_blame
-                    )
-                }
-                # Include the current lever set we're about to add.
-                _distinct_lever_sets.add(_lever_frozenset)
-                if len(_distinct_lever_sets) >= 2:
-                    tried_root_causes.add((rc_ft, rc_blame))
-            if not _should_mark_tried_lever_aware:
-                logger.info(
-                    "No CONTENT_REGRESSION rollbacks yet — keeping cluster "
-                    "available for retry (root causes NOT marked as tried)",
+            except Exception:
+                logger.debug(
+                    "Phase A: post_eval journey emit failed (non-fatal)",
+                    exc_info=True,
                 )
+
+            # Phase F+H A5 v2.1: F8.decide() (above, pre-3B.7) emits the
+            # QID_RESOLUTION records via stages/acceptance.py:decide →
+            # post_eval_resolution_records (acceptance.py:230-240). The
+            # harness inline post_eval_resolution_records emit block
+            # formerly here is deleted to prevent double-emission.
+
+            # Phase A — note: the iteration snapshot was appended at
+            # iteration begin via ``begin_iteration_capture``. No late append
+            # is needed; mutations to ``_current_iter_inputs`` above already
+            # reach ``_replay_fixture_iterations`` because they share a ref.
+
+            # Lossless contract Task 7 — warn-only journey-contract validator.
+            # The hard gate flips this to raise in Phase 4. Defensive wrap so a
+            # validator bug never breaks the loop while we burn down warnings.
+            # L4a: capture the report and stash it on _current_iter_inputs so the
+            # fixture exporter and MLflow per-iteration write (next try-block)
+            # both see it.
+            _journey_report = None
             try:
-                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
-                    _compute_iteration_counters(_current_iter_inputs)
+                _eval_qids_for_validator = list(
+                    (_latest_eval_result or {}).get("question_ids") or []
                 )
+                _journey_report = _validate_journeys_at_iteration_end(
+                    events=_journey_events,
+                    eval_qids=_eval_qids_for_validator,
+                    iteration=iteration_counter,
+                    raise_on_violation=False,
+                )
+                if _journey_report is not None:
+                    _current_iter_inputs["journey_validation"] = (
+                        _journey_report.to_dict()
+                    )
+            except Exception:
+                logger.debug(
+                    "iteration-end journey validator failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Phase E.0 Task 5 — anchor phase_a/journey_validation/ to the
+            # lever_loop sibling instead of mlflow.active_run() (which is
+            # whichever stage end_run/start_run last started). Surfaces
+            # success/failure via GSO_PHASE_A_ARTIFACT_V1 stdout marker.
+            if _journey_report is not None:
+                _phase_a_artifact_path = (
+                    f"phase_a/journey_validation/iter_{iteration_counter}.json"
+                )
+                _phase_a_result = _persist_phase_a_artifact_to_anchor(
+                    opt_run_id=run_id,
+                    iteration=iteration_counter,
+                    report_dict=_journey_report.to_dict(),
+                )
+                if not _phase_a_result.success:
+                    logger.warning(
+                        "Phase A: anchored persistence failed: %s",
+                        _phase_a_result.exception_class,
+                    )
+                from genie_space_optimizer.common.mlflow_markers import (
+                    phase_a_artifact_marker,
+                )
+                print(phase_a_artifact_marker(
+                    optimization_run_id=run_id,
+                    iteration=iteration_counter,
+                    anchor_run_id=_phase_a_result.anchor_run_id,
+                    artifact_path=_phase_a_artifact_path,
+                    success=_phase_a_result.success,
+                    exception_class=_phase_a_result.exception_class,
+                ))
+
+            # Phase B Trace Plan Task 7 — render the operator transcript and
+            # persist the per-iteration decision trace + transcript to MLflow.
+            # All best-effort wrapped: missing mlflow / no active run / no
+            # decisions captured this iteration is silently skipped.
+            try:
+                from genie_space_optimizer.optimization.rca_decision_trace import (
+                    DecisionRecord,
+                    OptimizationTrace,
+                    canonical_decision_json,
+                    render_operator_transcript,
+                    validate_decisions_against_journey,
+                )
+
+                _decision_records = [
+                    DecisionRecord.from_dict(r)
+                    for r in (_current_iter_inputs.get("decision_records") or [])
+                ]
+                if _decision_records:
+                    _decision_validation = validate_decisions_against_journey(
+                        records=_decision_records,
+                        events=_journey_events,
+                    )
+                    _trace = OptimizationTrace(
+                        journey_events=tuple(_journey_events),
+                        decision_records=tuple(_decision_records),
+                    )
+                    # Spine stage 10 — Learning / Next Action. Classify
+                    # each unresolved qid in this iteration's trace into a
+                    # FailureBucket and refresh ``_prior_buckets_by_qid``
+                    # so the next iteration's spine stage 4 (Action Group
+                    # Selection) consumes it via ``ActionGroupsInput.
+                    # prior_buckets_by_qid``. The classifier is pure (no
+                    # side effects); the call is wrapped in try/except so
+                    # any failure preserves the prior map rather than
+                    # corrupting carry-over state.
+                    try:
+                        from genie_space_optimizer.optimization.failure_bucketing import (
+                            classify_unresolved_qid as _classify_unresolved_qid,
+                        )
+                        from genie_space_optimizer.optimization.rca_decision_trace import (
+                            DecisionOutcome as _DecisionOutcome,
+                        )
+                        _next_buckets: dict[str, Any] = {}
+                        _qids_seen: set[str] = set()
+                        for _r in _decision_records:
+                            _qid = str(getattr(_r, "question_id", "") or "")
+                            if not _qid or _qid in _qids_seen:
+                                continue
+                            if getattr(_r, "outcome", None) != _DecisionOutcome.UNRESOLVED:
+                                continue
+                            _qids_seen.add(_qid)
+                            _classification = _classify_unresolved_qid(
+                                _trace, _qid, iteration=iteration_counter,
+                            )
+                            if _classification.bucket is not None:
+                                _next_buckets[_qid] = _classification.bucket
+                        _prior_buckets_by_qid = _next_buckets
+                    except Exception:
+                        logger.debug(
+                            "Spine stage 10: bucket classification failed "
+                            "(non-fatal); prior_buckets_by_qid carried over "
+                            "unchanged",
+                            exc_info=True,
+                        )
+                    # Cycle 5 T2 — refresh the cross-iteration carry-over
+                    # for dropped causal patches. The next iteration's
+                    # ActionGroupsInput threads this list into the
+                    # strategist's prompt context (gated by the flag).
+                    try:
+                        _prior_iteration_dropped_causal_patches = list(
+                            _iter_dropped_causal
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Cycle 5 T2: dropped-causal carry-over refresh "
+                            "failed (non-fatal); prior list unchanged",
+                            exc_info=True,
+                        )
+                    _transcript = render_operator_transcript(
+                        trace=_trace,
+                        iteration=iteration_counter,
+                    )
+                    print(_transcript)
+                    _phase_b_decision_artifact = (
+                        f"phase_b/decision_trace/iter_{iteration_counter}.json"
+                    )
+                    _phase_b_transcript_artifact = (
+                        f"phase_b/operator_transcript/iter_{iteration_counter}.txt"
+                    )
+                    print(phase_b_marker(
+                        optimization_run_id=run_id,
+                        iteration=iteration_counter,
+                        decision_record_count=len(_decision_records),
+                        decision_validation_count=len(_decision_validation),
+                        transcript_chars=len(_transcript),
+                        decision_trace_artifact=_phase_b_decision_artifact,
+                        operator_transcript_artifact=_phase_b_transcript_artifact,
+                        persist_ok=True,
+                    ))
+                    # Phase E.0 Task 5 — anchor phase_b/ to the lever_loop
+                    # sibling. Replaces mlflow.active_run() persistence so
+                    # decision_trace + operator_transcript land alongside
+                    # phase_a/ on the same operator-discoverable run.
+                    _phase_b_result = _persist_phase_b_artifacts_to_anchor(
+                        opt_run_id=run_id,
+                        iteration=iteration_counter,
+                        decision_json=canonical_decision_json(_decision_records),
+                        transcript=_transcript,
+                        record_count=len(_decision_records),
+                        violation_count=len(_decision_validation),
+                    )
+                    if not _phase_b_result.success:
+                        logger.warning(
+                            "Phase B: anchored persistence failed: %s",
+                            _phase_b_result.exception_class,
+                        )
+                    from genie_space_optimizer.common.mlflow_markers import (
+                        phase_b_artifact_marker,
+                    )
+                    print(phase_b_artifact_marker(
+                        optimization_run_id=run_id,
+                        iteration=iteration_counter,
+                        anchor_run_id=_phase_b_result.anchor_run_id,
+                        decision_trace_path=_phase_b_decision_artifact,
+                        operator_transcript_path=_phase_b_transcript_artifact,
+                        success=_phase_b_result.success,
+                        exception_class=_phase_b_result.exception_class,
+                    ))
+            except Exception:
+                logger.debug(
+                    "Phase B: decision trace persistence skipped (non-fatal)",
+                    exc_info=True,
+                )
+                try:
+                    import mlflow as _mlflow_phase_b_partial  # type: ignore[import-not-found]
+                    if _mlflow_phase_b_partial.active_run() is not None:
+                        _mlflow_phase_b_partial.set_tag(
+                            "genie.phase_b.partial", "true"
+                        )
+                except Exception:
+                    logger.debug("Phase B partial tag skipped", exc_info=True)
+
+            # Phase B observability follow-up — per-iteration accounting
+            # for the manifest + no-records diagnostic. ALWAYS runs, even
+            # when the persistence block above short-circuited (no records,
+            # missing mlflow, etc.). This is what makes the postmortem
+            # analyzer able to distinguish "Phase B ran but had nothing to
+            # record" from "Phase B never ran" or "deploy is stale".
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    NoRecordsReason as _NoRecordsReason,
+                    classify_no_records_reason as _classify_no_records_reason,
+                )
+                from genie_space_optimizer.optimization.rca_decision_trace import (
+                    DecisionRecord as _DecisionRecord_pb,
+                    validate_decisions_against_journey as _validate_pb,
+                )
+                from genie_space_optimizer.optimization.run_analysis_contract import (
+                    phase_b_no_records_marker as _phase_b_no_records_marker,
+                )
+
+                _iter_records_dicts = list(
+                    _current_iter_inputs.get("decision_records") or []
+                )
+                _iter_record_count = len(_iter_records_dicts)
+                _phase_b_iter_record_counts.append(_iter_record_count)
+
+                if _iter_record_count == 0:
+                    # No-records diagnostic — emit a stable stdout marker +
+                    # MLflow tag with a reason from the closed
+                    # NoRecordsReason vocabulary.
+                    _no_rec_reason = _classify_no_records_reason(
+                        iteration_inputs=_current_iter_inputs,
+                        producer_exceptions=_iter_producer_exceptions,
+                    )
+                    _phase_b_no_records_iterations.append(int(iteration_counter))
+                    _phase_b_iter_violation_counts.append(0)
+                    print(_phase_b_no_records_marker(
+                        optimization_run_id=run_id,
+                        iteration=iteration_counter,
+                        reason=_no_rec_reason.value,
+                        producer_exceptions=dict(_iter_producer_exceptions),
+                        contract_version=_PHASE_B_CONTRACT_VERSION,
+                    ))
+                    try:
+                        import mlflow as _mlflow_no_rec  # type: ignore[import-not-found]
+                        if _mlflow_no_rec.active_run() is not None:
+                            _mlflow_no_rec.set_tags({
+                                (
+                                    f"decision_trace.iter_{iteration_counter}."
+                                    "no_records_reason"
+                                ): _no_rec_reason.value,
+                                (
+                                    f"decision_trace.iter_{iteration_counter}.records"
+                                ): "0",
+                            })
+                    except Exception:
+                        logger.debug(
+                            "Phase B no-records MLflow tag skipped (non-fatal)",
+                            exc_info=True,
+                        )
+                else:
+                    # Records were captured — track artifact path + count
+                    # violations.
+                    _phase_b_artifact_paths.append(
+                        f"phase_b/decision_trace/iter_{iteration_counter}.json"
+                    )
+                    try:
+                        _typed_records = [
+                            _DecisionRecord_pb.from_dict(r) for r in _iter_records_dicts
+                        ]
+                        _violations = _validate_pb(
+                            records=_typed_records,
+                            events=_journey_events,
+                        )
+                        _phase_b_iter_violation_counts.append(len(_violations))
+                        _phase_b_total_violations += len(_violations)
+                    except Exception:
+                        _phase_b_iter_violation_counts.append(0)
+            except Exception:
+                logger.debug(
+                    "Phase B: per-iter accounting skipped (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Phase C Task 6 — emit STRATEGIST_AG_EMITTED+UNRESOLVED+
+            # RCA_UNGROUNDED for findings whose qids are not covered by
+            # any emitted AG. Fires once per iteration after all AGs have
+            # been processed so action_groups is fully populated.
+            try:
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    orphan_rca_records as _orphan_rca_records,
+                )
+                from genie_space_optimizer.optimization.rca import (
+                    rca_findings_from_clusters as _rca_findings_from_clusters_c6,
+                )
+
+                _phase_c_findings_orphan = _rca_findings_from_clusters_c6(
+                    clusters or []
+                )
+                _strategy_for_orphan = (
+                    _current_iter_inputs.get("strategist_response") or {}
+                )
+                _orphan_records = _orphan_rca_records(
+                    run_id=run_id,
+                    iteration=iteration_counter,
+                    findings=_phase_c_findings_orphan,
+                    action_groups=(_strategy_for_orphan.get("action_groups") or []),
+                )
+                _current_iter_inputs.setdefault("decision_records", []).extend(
+                    [r.to_dict() for r in _orphan_records]
+                )
+            except Exception as _orphan_rca_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="orphan_rca",
+                            ag_id="",
+                            exception=_orphan_rca_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed for orphan_rca",
+                        exc_info=True,
+                    )
+                _phase_b_producer_exceptions["orphan_rca"] = (
+                    _phase_b_producer_exceptions.get("orphan_rca", 0) + 1
+                )
+                logger.debug(
+                    "Phase C: orphan_rca_records failed (non-fatal)",
+                    exc_info=True,
+                )
+                if _phase_b_strict_mode():
+                    raise
+
+            # Cycle 10 W1 — RCA-ungrounded records for clusters that reached
+            # AG-emit without a fit RCA. Companion to orphan_rca_records:
+            # orphan = AG emitted but qids not covered by any AG; ungrounded =
+            # AG covers the cluster but no RCA grounded the fix surface.
+            try:
+                _w1_action_groups = list(
+                    (_strategy_for_orphan or {}).get("action_groups") or []
+                )
+                _w1_ag_emitted = {
+                    str(cid): True
+                    for ag in _w1_action_groups
+                    for cid in (ag.get("source_cluster_ids") or ())
+                    if str(cid)
+                }
+                _w1_rca_id_by_cluster = {
+                    str(c.get("cluster_id") or ""): str(c.get("rca_id") or "")
+                    for c in (clusters or [])
+                }
+                _w1_count = _emit_rca_ungrounded_records_for_unfit_clusters(
+                    run_id=str(run_id),
+                    iteration=int(iteration_counter),
+                    clusters=list(clusters or ()),
+                    rca_id_by_cluster=_w1_rca_id_by_cluster,
+                    ag_emitted_for_cluster=_w1_ag_emitted,
+                    iter_inputs=_current_iter_inputs,
+                )
+                if _w1_count:
+                    logger.info(
+                        "Cycle 10 W1: emitted %d rca_ungrounded records",
+                        _w1_count,
+                    )
+            except Exception:
+                logger.debug(
+                    "Cycle 10 W1: rca_ungrounded wiring failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # Cycle 5 T1 — productive-iteration budget accounting end-of-iter
+            # decision. Gated by ``GSO_PRODUCTIVE_ITERATION_BUDGET`` (Option
+            # A: zero behaviour change with flag off → no record emitted, no
+            # marker, no counter decrement). With flag on, an iteration that
+            # applied zero patches AND produced a typed P4 reason
+            # (``proposal_generation_empty``,
+            # ``structural_gate_dropped_instruction_only``,
+            # ``no_structural_candidate``) is classified as a deterministic
+            # no-op and does not consume the iteration counter; the
+            # iteration_budget_decision_record + GSO_ITERATION_BUDGET_V1
+            # marker make the accounting auditable.
+            try:
+                from genie_space_optimizer.common.config import (
+                    productive_iteration_budget_enabled,
+                )
+                if productive_iteration_budget_enabled():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        iteration_budget_decision_record,
+                    )
+                    from genie_space_optimizer.common.mlflow_markers import (
+                        iteration_budget_marker,
+                    )
+                    if _iter_applied_count == 0:
+                        _iter_no_op_cause = _classify_iteration_no_op_cause(
+                            _current_iter_inputs.get("decision_records") or []
+                        )
+                        # Only treat as deterministic no-op when one of the
+                        # typed P4 reasons fired this iteration. Untyped /
+                        # unexplained no-ops still consume budget so the
+                        # loop terminates on plateau rather than spinning.
+                        if _iter_no_op_cause:
+                            _iter_consumed = False
+                    _iter_budget_rec = iteration_budget_decision_record(
+                        run_id=str(run_id),
+                        iteration=int(iteration_counter),
+                        consumed=_iter_consumed,
+                        no_op_cause=(_iter_no_op_cause or None),
+                        applied_patches=int(_iter_applied_count),
+                    )
+                    # Cycle 6 F-1 — gate duplicate emits within the iteration.
+                    # The counter decrement and marker print live inside the
+                    # gate too, since both are non-idempotent side effects.
+                    _iter_budget_key = _emit_idempotency_key(
+                        _iter_budget_rec.to_dict()
+                    )
+                    if _iter_budget_key not in _iter_emitted_keys:
+                        _iter_emitted_keys.add(_iter_budget_key)
+                        _decision_emit(_iter_budget_rec)
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_iter_budget_rec.to_dict())
+                        _counter_after = (
+                            iteration_counter
+                            if _iter_consumed
+                            else iteration_counter - 1
+                        )
+                        print(iteration_budget_marker(
+                            optimization_run_id=str(run_id),
+                            iteration=int(iteration_counter),
+                            consumed=_iter_consumed,
+                            no_op_cause=str(_iter_no_op_cause or ""),
+                            applied_patches=int(_iter_applied_count),
+                            iteration_counter_after=int(_counter_after),
+                        ))
+                        if not _iter_consumed:
+                            iteration_counter -= 1
+            except Exception:
+                logger.debug(
+                    "Cycle 5 T1: iteration_budget emit failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # GSO run analysis: emit machine-readable per-iteration summary
+            # so the analyzer skill can build a postmortem without scraping
+            # freeform logs.
+            try:
+                _iter_ag_outcomes = (_current_iter_inputs.get("ag_outcomes") or {})
+                _accepted_count = sum(
+                    1 for v in _iter_ag_outcomes.values()
+                    if str(v).startswith("accepted")
+                )
+                _rolled_back_count = sum(
+                    1 for v in _iter_ag_outcomes.values()
+                    if str(v) == "rolled_back"
+                )
+                _skipped_count = sum(
+                    1 for v in _iter_ag_outcomes.values()
+                    if str(v).startswith("skipped")
+                )
+                _gate_drop_count = sum(
+                    1
+                    for r in (_current_iter_inputs.get("decision_records") or [])
+                    if str(r.get("outcome") or "") == "dropped"
+                )
+                try:
+                    _scoreboard_loop_snapshot = {
+                        "iteration": int(iteration_counter),
+                        "passing_qids": list(
+                            _current_iter_inputs.get("post_eval_passing_qids") or []
+                        ),
+                        "hard_failure_qids": [
+                            qid
+                            for c in (_current_iter_inputs.get("clusters") or [])
+                            for qid in (c.get("question_ids") or [])
+                        ],
+                        "applied_patch_count": _accepted_count,
+                        "rolled_back_patch_count": _rolled_back_count,
+                        "trace_id_fallback_count": 0,
+                        "trace_id_total": 0,
+                    }
+                    print(_format_scoreboard_banner(
+                        loop_snapshot=_scoreboard_loop_snapshot,
+                    ))
+                except Exception:
+                    logger.debug(
+                        "scoreboard banner failed (non-fatal)", exc_info=True,
+                    )
+                print(iteration_summary_marker(
+                    optimization_run_id=run_id,
+                    iteration=iteration_counter,
+                    accepted_count=_accepted_count,
+                    rolled_back_count=_rolled_back_count,
+                    skipped_count=_skipped_count,
+                    gate_drop_count=_gate_drop_count,
+                    decision_record_count=len(
+                        _current_iter_inputs.get("decision_records") or []
+                    ),
+                    journey_violation_count=(
+                        0 if _journey_report is None else len(_journey_report.violations)
+                    ),
+                ))
+            except Exception:
+                logger.debug("GSO iteration summary marker skipped", exc_info=True)
+
+            # Phase H iteration content completeness — finalise the iteration
+            # with rich data and ``exit_path=completed``. Every iteration-body
+            # ``continue`` / ``break`` must call ``_finalize_iteration_summary``
+            # with the appropriate ``exit_path`` label BEFORE the exit, so this
+            # path only fires when the iteration finishes cleanly.
+            try:
+                _iter_acc_pct: float | None
+                try:
+                    _iter_acc_pct = (
+                        float(best_accuracy)
+                        if iteration_counter == best_iteration
+                        else None
+                    )
+                except Exception:
+                    _iter_acc_pct = None
                 _finalize_iteration_summary(
                     iter_traces=_iter_traces,
                     iter_summaries=_iter_summaries,
                     iteration=int(iteration_counter),
                     current_iter_inputs=_current_iter_inputs,
-                    journey_events=_journey_events if "_journey_events" in dir() else [],
-                    journey_report=_journey_report if "_journey_report" in dir() else None,
-                    accepted_count=_phase_h_a,
-                    rolled_back_count=_phase_h_r,
-                    skipped_count=_phase_h_s,
-                    gate_drop_count=_phase_h_g,
-                    iteration_accuracy_percent=None,
-                    exit_path="rolled_back",
+                    journey_events=_journey_events,
+                    journey_report=_journey_report,
+                    accepted_count=int(_accepted_count or 0),
+                    rolled_back_count=int(_rolled_back_count or 0),
+                    skipped_count=int(_skipped_count or 0),
+                    gate_drop_count=int(_gate_drop_count or 0),
+                    iteration_accuracy_percent=_iter_acc_pct,
+                    exit_path="completed",
+                    run_id=run_id,
+                    iter_producer_exceptions=_iter_producer_exceptions,
                 )
             except Exception:
                 logger.debug(
-                    "Phase H finalise on exit_path=rolled_back skipped (non-fatal)",
+                    "Phase H iteration finalise skipped (non-fatal)",
                     exc_info=True,
                 )
-            continue
 
-        # ── Accept action group ──────────────────────────────────────
-        ags_accepted.append(ag_id)
-        for lk in lever_keys:
-            levers_accepted.append(int(lk))
+            # Task 13 — render the per-question journey ledger at normal
+            # iteration end. Early-exit paths call the same idempotent helper
+            # before continuing.
+            _render_current_journey()
+            # Cycle 11 Task 12 — invariant runner moved into
+            # ``_finalize_iteration_summary`` (Bug B fix). Every iteration-
+            # exit path now runs invariants because ``_finalize_iteration_summary``
+            # is the central choke point that every ``continue`` / ``break``
+            # / normal-end / exception-fallback path traverses.
 
-        # Phase A — Lossless contract: stamp accepted (or accepted_with_
-        # regression_debt) for every qid the AG targeted. Required
-        # transition from APPLIED.
-        try:
-            _outcome_for_journey = (
-                "accepted_with_regression_debt"
-                if (
-                    gate_result.get("acceptance_decision", {}) or {}
-                ).get("reason_code") == "accepted_with_regression_debt"
-                else "accepted"
-            )
-            _emit_ag_outcome_journey(
-                emit=_journey_emit,
-                ag_id=str(ag_id),
-                outcome=_outcome_for_journey,
-                affected_qids=list(ag.get("affected_questions") or []),
-            )
-        except Exception:
-            logger.debug(
-                "Phase A: AG-outcome journey emit (accepted) failed (non-fatal)",
-                exc_info=True,
-            )
-        try:
-            _current_iter_inputs["ag_outcomes"][str(ag_id)] = _outcome_for_journey
-        except Exception:
-            logger.debug(
-                "Phase A: ag_outcome capture (accepted) failed (non-fatal)",
-                exc_info=True,
-            )
-        # Phase F+H A5 v2.1: F8.decide() (above, pre-3B.7) emits the
-        # ACCEPTANCE_DECIDED record for accepted /
-        # accepted_with_regression_debt. The closure callsite formerly
-        # here is deleted to prevent double-emission.
-
-        # Phase C Task 3 — ObservedEffect per applied patch in this AG.
-        # Best-effort with defensive defaults: empty pre/post passing
-        # qid sets and zero deltas if the surrounding scope hasn't yet
-        # named the relevant signals. The structured surface is what
-        # matters; downstream consumers (next-action mapper) tolerate
-        # unset fields, and Phase D / Cycle-8 Bug 1 Phase 3b will plumb
-        # richer signals into this site.
-        try:
-            from genie_space_optimizer.optimization.rca_execution import (
-                build_observed_effects,
-            )
-
-            _observed = build_observed_effects(
-                iteration=iteration_counter,
-                ag_id=str(ag_id),
-                apply_log=apply_log,
-                pre_passing_qids=(),
-                post_passing_qids=tuple(
-                    _current_iter_inputs.get("post_eval_passing_qids") or ()
-                ),
-                pre_iq=0.0,
-                post_iq=0.0,
-                arbiter_verdict_change="",
-                pre_judge_failures=0,
-                post_judge_failures=0,
-            )
-            _current_iter_inputs.setdefault("observed_effects", []).extend(
-                [
-                    {
-                        "iteration": e.iteration,
-                        "ag_id": e.ag_id,
-                        "proposal_id": e.proposal_id,
-                        "pre_passing_qids": list(e.pre_passing_qids),
-                        "post_passing_qids": list(e.post_passing_qids),
-                        "iq_delta": e.iq_delta,
-                        "arbiter_verdict_change": e.arbiter_verdict_change,
-                        "judge_failure_delta": e.judge_failure_delta,
-                    }
-                    for e in _observed
-                ]
-            )
-        except Exception as _observed_effect_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="observed_effect",
-                        ag_id=str((ag or {}).get("id") or ""),
-                        exception=_observed_effect_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for observed_effect",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["observed_effect"] = (
-                _phase_b_producer_exceptions.get("observed_effect", 0) + 1
-            )
-            logger.debug(
-                "Phase C: build_observed_effects failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        full_scores = gate_result["full_scores"]
-        full_accuracy = gate_result["full_accuracy"]
-        new_model_id = gate_result["new_model_id"]
-        full_result = gate_result["full_result"]
-        # Phase A — carrier is now refreshed at the gate-checks site above
-        # (right after `_run_gate_checks` returns), so this re-assignment is
-        # redundant on the accept path but harmless. Kept as a no-op anchor
-        # so downstream reads of the local `full_result` variable stay
-        # consistent with the carrier.
-        _latest_eval_result = full_result or _latest_eval_result
-        _last_full_mlflow_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
-
-        _full_trace_map = full_result.get("trace_map", {})
-        _full_failures = set(full_result.get("failure_question_ids", []))
-        all_failure_question_ids.extend(_full_failures)
-        for qid, tid in _full_trace_map.items():
-            question_trace_map.setdefault(qid, []).append(tid)
-            if qid in _full_failures:
-                all_failure_trace_ids.append(tid)
-        _full_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
-        if _full_run_id:
-            all_eval_mlflow_run_ids.append(_full_run_id)
-
-        try:
-            from genie_space_optimizer.optimization.evaluation import log_expectations_on_traces
-            log_expectations_on_traces(full_result)
-        except Exception:
-            logger.debug("Failed to log expectations on iter %d traces", iteration_counter, exc_info=True)
-
-        try:
-            log_judge_verdicts_on_traces(full_result)
-        except Exception:
-            logger.debug("Failed to log judge verdicts on iter %d traces", iteration_counter, exc_info=True)
-
-        try:
-            _persist_text, _persist_data = _build_question_persistence_summary(
-                _verdict_history, reflection_buffer,
-            )
-            if _persist_data:
-                log_persistence_context_on_traces(full_result, _persist_data)
-        except Exception:
-            logger.debug("Failed to log persistence context on iter %d traces", iteration_counter, exc_info=True)
-
-        lever_changes.append({
-            "lever": ag_id,
-            "lever_name": f"AG {ag_id}: {ag.get('root_cause_summary', '')[:60]}",
-            "patches": [
-                {"change": p.get("change_description", ""), "patch_type": p.get("patch_type", "")}
-                for p in all_proposals
-            ],
-            "accuracy_delta": full_accuracy - best_accuracy,
-        })
-
-        _accepted_fail_qids = set(full_result.get("failure_question_ids", []))
-        _acc_delta = full_accuracy - best_accuracy
-        _acc_patch_types = sorted({p.get("patch_type", "?") for p in patches})
-        _acc_reflection = (
-            f"Accepted: {ag.get('root_cause_summary', 'improvement')} resolved via "
-            f"{', '.join(_acc_patch_types)}. "
-            f"Accuracy improved by {_acc_delta:+.1f}% "
-            f"affecting {len(ag.get('affected_questions', []))} question(s)."
-        )
-        reflection = _build_reflection_entry(
-            iteration=iteration_counter, ag_id=ag_id, accepted=True,
-            levers=[int(lk) for lk in lever_keys],
-            target_objects=_target_objects,
-            prev_scores=best_scores, new_scores=full_scores,
-            rollback_reason=None, patches=patches,
-            affected_question_ids=ag.get("affected_questions", []),
-            prev_failure_qids=prev_failure_qids,
-            new_failure_qids=_accepted_fail_qids,
-            reflection_text=_acc_reflection,
-            acceptance_delta_pp=float(
-                gate_result.get("acceptance_delta_pp", _acc_delta)
-            ),
-            **_ag_identity_kwargs,
-        )
-        _attach_rca_theme_attribution(
-            spark=spark,
-            run_id=run_id,
-            iteration_counter=iteration_counter,
-            ag_id=ag_id,
-            metadata_snapshot=metadata_snapshot,
-            reflection=reflection,
-            prev_failure_qids=prev_failure_qids,
-            new_failure_qids=_accepted_fail_qids,
-            catalog=catalog,
-            schema=schema,
-        )
-        reflection_buffer.append(reflection)
-        try:
-            update_iteration_reflection(
-                spark, run_id, iteration_counter, reflection,
-                catalog=catalog, schema=schema, eval_scope="full",
-            )
-        except Exception:
-            logger.debug("Failed to persist reflection for accepted iter %d", iteration_counter, exc_info=True)
-        prev_failure_qids = _accepted_fail_qids
-
-        if _acc_delta >= 1.0:
-            skill_exemplars.append({
-                "root_cause": ag.get("root_cause_summary", ""),
-                "lever_pattern": sorted(ag.get("lever_directives", {}).keys()),
-                "patch_types": [p.get("patch_type") for p in patches[:5] if p.get("patch_type") is not None],
-                "accuracy_gain": round(_acc_delta, 1),
-            })
-
-        best_scores = full_scores
-        best_accuracy = full_accuracy
-        best_model_id = new_model_id
-        best_iteration = iteration_counter
-        # Roll the in-scope pre-arbiter baseline forward to whatever the
-        # gate just consumed for this accepted candidate. Mirrors the
-        # post-arbiter ``best_accuracy`` update one line up.
-        _iter_best_pre_arbiter = _candidate_pre_arbiter_from_gate(gate_result)
-        prev_scores = full_scores
-        prev_model_id = new_model_id
-        # Task 5 — only update accepted-baseline rows on accept; rollback
-        # paths must NOT touch this list. Pull from the gate's
-        # ``full_result.rows`` so the snapshot is the same row set the
-        # gate just used to decide acceptance, not a stale ``_after_rows``
-        # local that may have been narrowed for diagnostics.
-        _accepted_full_rows = (
-            gate_result.get("full_result", {}).get("rows")
-            or []
-        )
-        _accepted_baseline_rows_for_control_plane = [
-            dict(row) for row in _accepted_full_rows
-        ]
-        # Task 6 — restore quarantine trust now that an AG accepted and the
-        # live Genie config matches the gate's accepted-baseline rows.
-        _rollback_state_trusted_for_quarantine = True
-        # Task 8 — carry accepted regression debt into the next strategist
-        # input so the loop targets it before any new soft cluster.
-        _acceptance_detail = gate_result.get("acceptance_decision") or {}
-        _regression_debt_qids_for_next_iteration = tuple(
-            str(q)
-            for q in (_acceptance_detail.get("regression_debt_qids") or [])
-            if str(q)
-        )
-        if _regression_debt_qids_for_next_iteration:
-            print(
-                _section("REGRESSION DEBT CARRIED FORWARD", "-") + "\n"
-                + _kv("QIDs", list(_regression_debt_qids_for_next_iteration)) + "\n"
-                + _bar("-")
-            )
-
-        new_refs = extract_reference_sqls(full_result)
-        if new_refs:
-            reference_sqls.update(new_refs)
-        new_hashes = extract_reference_result_hashes(full_result)
-        if new_hashes:
-            reference_result_hashes.update(new_hashes)
-
-        update_run_status(
-            spark, run_id, catalog, schema,
-            best_iteration=best_iteration,
-            best_accuracy=best_accuracy,
-            best_model_id=best_model_id,
-        )
-
-        post_instructions = _get_general_instructions(
-            apply_log.get("post_snapshot", metadata_snapshot)
-        )
-        if post_instructions:
-            register_instruction_version(
-                uc_schema=f"{catalog}.{schema}",
-                space_id=space_id,
-                instruction_text=post_instructions,
-                run_id=run_id,
-                lever=0,
-                iteration=iteration_counter,
-                accuracy=best_accuracy,
-                domain=domain,
-            )
-
-        write_stage(
-            spark, run_id, f"AG_{ag_id}_STARTED", "COMPLETE",
-            task_key="lever_loop", iteration=iteration_counter,
-            detail={
-                "accuracy": full_accuracy,
-                "accepted": True,
-                "patches_applied": len(apply_log.get("applied", [])),
-                "levers": lever_keys,
-            },
-            catalog=catalog, schema=schema,
-        )
-
-        metadata_snapshot = apply_log.get("post_snapshot", metadata_snapshot)
-        if _original_instruction_sections:
-            metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
-
-        # Phase 7: end-of-iteration diagnostics. Single block summarizing
-        # ASI source quality, cluster processing, patch capping, and
-        # pre-arbiter accuracy so operators can spot degenerate values
-        # at a glance. Any field at a danger threshold (ASI=none > 50%,
-        # arbiter rescue > 30%) emits an inline SEVERITY:HIGH banner.
-        try:
-            _diag_lines = [_section("LEVER_LOOP_DIAGNOSTICS", "=")]
-            _diag_lines.append(_kv("Iteration", iteration_counter))
-            _diag_lines.append(_kv("AG id", ag_id))
-
-            # ASI source histogram from the latest eval rows. The
-            # ``_eval_rows`` variable is populated below in the join-
-            # mining block but doesn't exist yet at this point in the
-            # iteration; pull rows directly from ``full_result``.
-            _asi_source_counts: dict[str, int] = {}
-            _asi_total = 0
-            _diag_rows = full_result.get("rows", []) if isinstance(full_result, dict) else []
-            if not _diag_rows and isinstance(full_result, dict):
-                _rows_json = full_result.get("rows_json")
-                if isinstance(_rows_json, list):
-                    _diag_rows = _rows_json
-                elif isinstance(_rows_json, str):
-                    try:
-                        import json as _json_diag
-                        _diag_rows = _json_diag.loads(_rows_json)
-                    except (ValueError, TypeError):
-                        _diag_rows = []
-            for _r in _diag_rows:
-                if not isinstance(_r, dict):
-                    continue
-                for _log in (_r.get("_asi_extraction_log") or []):
-                    if not isinstance(_log, dict):
-                        continue
-                    _src = str(_log.get("source") or "none")
-                    _asi_source_counts[_src] = _asi_source_counts.get(_src, 0) + 1
-                    _asi_total += 1
-            if _asi_total:
-                _none_pct = (
-                    100 * _asi_source_counts.get("none", 0) / _asi_total
-                )
-                _hist = ", ".join(
-                    f"{k}={v}"
-                    for k, v in sorted(
-                        _asi_source_counts.items(), key=lambda kv: -kv[1],
-                    )
-                )
-                _diag_lines.append(_kv("ASI source histogram", _hist))
-                if _none_pct > 50.0:
-                    _diag_lines.append(
-                        f"|   [SEVERITY:HIGH] ASI source none={_none_pct:.0f}% > 50% "
-                        f"— strategist is reasoning blind on heuristic root_causes"
-                    )
-            else:
-                _diag_lines.append(_kv("ASI source histogram", "(no rows)"))
-
-            # Cluster processing.
-            _diag_lines.append(_kv(
-                "Hard clusters formed", len(clusters or []),
-            ))
-            _diag_lines.append(_kv(
-                "Soft clusters formed", len(soft_signal_clusters or []),
-            ))
-            _diag_lines.append(_kv("AGs attempted (cumulative)", len(ags_attempted)))
-            _diag_lines.append(_kv("AGs accepted (cumulative)", len(ags_accepted)))
-            _diag_lines.append(_kv("AGs rolled back (cumulative)", len(ags_rolled_back)))
-            _diag_lines.append(_kv("Pending AGs in buffer", len(pending_action_groups)))
-
-            # Patch cap.
-            _diag_lines.append(_kv("Patches applied this AG", len(apply_log.get("applied", []))))
-
-            # Pre-arbiter accuracy + arbiter rescue rate.
-            _full_scores = (
-                full_result.get("scores", {})
-                if isinstance(full_result, dict) else {}
-            )
-            _pre_arb = _full_scores.get(
-                "_pre_arbiter/overall_accuracy",
-                _full_scores.get("_pre_arbiter/result_correctness"),
-            )
-            _adj = (
-                full_result.get("overall_accuracy")
-                if isinstance(full_result, dict) else None
-            )
-            if _pre_arb is not None:
-                _diag_lines.append(
-                    _kv("Pre-arbiter accuracy", f"{_pre_arb:.1f}%"),
-                )
-            if _adj is not None:
-                _diag_lines.append(
-                    _kv("Arbiter-adjusted accuracy", f"{_adj:.1f}%"),
-                )
-            _bcr = (
-                full_result.get("both_correct_rate")
-                if isinstance(full_result, dict) else None
-            )
-            if isinstance(_bcr, (int, float)) and _bcr is not None:
-                _alljudge = float(
-                    _full_scores.get("_pre_arbiter/result_correctness", 0.0)
-                ) / 100.0
-                # Task 2 — ``both_correct_rate`` may arrive as 0-100 or 0-1
-                # depending on producer. Normalise to a fraction before
-                # subtracting ``_alljudge`` and clamp to the valid
-                # probability range so the printed value cannot exceed 100%.
-                _bcr_frac = float(_bcr) / 100.0 if float(_bcr) > 1.0 else float(_bcr)
-                _rescue = max(0.0, min(1.0, _bcr_frac - _alljudge))
-                _diag_lines.append(
-                    _kv("Arbiter rescue rate", f"{_rescue*100:.1f}%"),
-                )
-                if _rescue > 0.30:
-                    _diag_lines.append(
-                        f"|   [SEVERITY:HIGH] Arbiter rescue rate "
-                        f"{_rescue*100:.1f}% > 30% — pre-arbiter is the "
-                        f"truthful signal"
-                    )
-
-            _diag_lines.append(_bar("="))
-            print("\n".join(_diag_lines))
-        except Exception:
-            logger.debug(
-                "Phase 7: LEVER_LOOP_DIAGNOSTICS block failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # ── Mine execution-proven joins from latest eval rows ────────
-        try:
-            _eval_rows = full_result.get("rows", [])
-            if not _eval_rows:
-                _eval_rows_json = full_result.get("rows_json")
-                if isinstance(_eval_rows_json, str):
-                    import json as _json_mod
-                    try:
-                        _eval_rows = _json_mod.loads(_eval_rows_json)
-                    except (ValueError, TypeError):
-                        _eval_rows = []
-                elif isinstance(_eval_rows_json, list):
-                    _eval_rows = _eval_rows_json
-            if _eval_rows:
-                _mine_result = _mine_and_apply_proven_joins(
-                    w, spark, run_id, space_id, metadata_snapshot, _eval_rows,
-                    catalog, schema, iteration=iteration_counter,
-                )
-                if _mine_result.get("total_applied", 0) > 0:
-                    from genie_space_optimizer.common.genie_client import fetch_space_config as _fetch_cfg
-                    config = _fetch_cfg(w, space_id)
-                    metadata_snapshot = config.get("_parsed_space", config)
-        except Exception:
-            logger.debug(
-                "Iterative join mining failed at iter %d (non-fatal)",
-                iteration_counter, exc_info=True,
-            )
-
-        # Phase A — Lossless contract: stamp post_eval for every qid
-        # that entered eval, with was/is/transition derived from the
-        # pre-iteration and post-iteration passing sets. The contract
-        # requires every evaluated qid to terminate in POST_EVAL.
-        try:
-            _post_eval_full_result = _latest_eval_result or {}
-            _post_eval_eval_qids = list(
-                _post_eval_full_result.get("question_ids") or []
-            )
-            _post_eval_failure_set = set(
-                _post_eval_full_result.get("failure_question_ids") or []
-            )
-            _post_eval_is_passing = [
-                str(q)
-                for q in _post_eval_eval_qids
-                if str(q) and str(q) not in _post_eval_failure_set
-            ]
-            _emit_post_eval_journey(
-                emit=_journey_emit,
-                eval_qids=_post_eval_eval_qids,
-                was_passing_qids=list(_prev_passing_qids),
-                is_passing_qids=_post_eval_is_passing,
-            )
-            # Capture the post-iteration passing set as next iteration's
-            # was-passing baseline.
-            _prev_passing_qids = set(_post_eval_is_passing)
-            # Phase A — capture the post-eval passing set in the replay
-            # fixture iteration snapshot.
-            try:
-                _current_iter_inputs["post_eval_passing_qids"] = sorted(
-                    _post_eval_is_passing
-                )
-            except Exception:
-                logger.debug(
-                    "Phase A: post_eval_passing_qids capture failed (non-fatal)",
-                    exc_info=True,
-                )
-        except Exception:
-            logger.debug(
-                "Phase A: post_eval journey emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase F+H A5 v2.1: F8.decide() (above, pre-3B.7) emits the
-        # QID_RESOLUTION records via stages/acceptance.py:decide →
-        # post_eval_resolution_records (acceptance.py:230-240). The
-        # harness inline post_eval_resolution_records emit block
-        # formerly here is deleted to prevent double-emission.
-
-        # Phase A — note: the iteration snapshot was appended at
-        # iteration begin via ``begin_iteration_capture``. No late append
-        # is needed; mutations to ``_current_iter_inputs`` above already
-        # reach ``_replay_fixture_iterations`` because they share a ref.
-
-        # Lossless contract Task 7 — warn-only journey-contract validator.
-        # The hard gate flips this to raise in Phase 4. Defensive wrap so a
-        # validator bug never breaks the loop while we burn down warnings.
-        # L4a: capture the report and stash it on _current_iter_inputs so the
-        # fixture exporter and MLflow per-iteration write (next try-block)
-        # both see it.
-        _journey_report = None
-        try:
-            _eval_qids_for_validator = list(
-                (_latest_eval_result or {}).get("question_ids") or []
-            )
-            _journey_report = _validate_journeys_at_iteration_end(
-                events=_journey_events,
-                eval_qids=_eval_qids_for_validator,
-                iteration=iteration_counter,
-                raise_on_violation=False,
-            )
-            if _journey_report is not None:
-                _current_iter_inputs["journey_validation"] = (
-                    _journey_report.to_dict()
-                )
-        except Exception:
-            logger.debug(
-                "iteration-end journey validator failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase E.0 Task 5 — anchor phase_a/journey_validation/ to the
-        # lever_loop sibling instead of mlflow.active_run() (which is
-        # whichever stage end_run/start_run last started). Surfaces
-        # success/failure via GSO_PHASE_A_ARTIFACT_V1 stdout marker.
-        if _journey_report is not None:
-            _phase_a_artifact_path = (
-                f"phase_a/journey_validation/iter_{iteration_counter}.json"
-            )
-            _phase_a_result = _persist_phase_a_artifact_to_anchor(
-                opt_run_id=run_id,
-                iteration=iteration_counter,
-                report_dict=_journey_report.to_dict(),
-            )
-            if not _phase_a_result.success:
-                logger.warning(
-                    "Phase A: anchored persistence failed: %s",
-                    _phase_a_result.exception_class,
-                )
-            from genie_space_optimizer.common.mlflow_markers import (
-                phase_a_artifact_marker,
-            )
-            print(phase_a_artifact_marker(
-                optimization_run_id=run_id,
-                iteration=iteration_counter,
-                anchor_run_id=_phase_a_result.anchor_run_id,
-                artifact_path=_phase_a_artifact_path,
-                success=_phase_a_result.success,
-                exception_class=_phase_a_result.exception_class,
-            ))
-
-        # Phase B Trace Plan Task 7 — render the operator transcript and
-        # persist the per-iteration decision trace + transcript to MLflow.
-        # All best-effort wrapped: missing mlflow / no active run / no
-        # decisions captured this iteration is silently skipped.
-        try:
-            from genie_space_optimizer.optimization.rca_decision_trace import (
-                DecisionRecord,
-                OptimizationTrace,
-                canonical_decision_json,
-                render_operator_transcript,
-                validate_decisions_against_journey,
-            )
-
-            _decision_records = [
-                DecisionRecord.from_dict(r)
-                for r in (_current_iter_inputs.get("decision_records") or [])
-            ]
-            if _decision_records:
-                _decision_validation = validate_decisions_against_journey(
-                    records=_decision_records,
-                    events=_journey_events,
-                )
-                _trace = OptimizationTrace(
-                    journey_events=tuple(_journey_events),
-                    decision_records=tuple(_decision_records),
-                )
-                # Spine stage 10 — Learning / Next Action. Classify
-                # each unresolved qid in this iteration's trace into a
-                # FailureBucket and refresh ``_prior_buckets_by_qid``
-                # so the next iteration's spine stage 4 (Action Group
-                # Selection) consumes it via ``ActionGroupsInput.
-                # prior_buckets_by_qid``. The classifier is pure (no
-                # side effects); the call is wrapped in try/except so
-                # any failure preserves the prior map rather than
-                # corrupting carry-over state.
+        finally:
+            # Cycle 11 Task 12 / Bug B fix — exception-cascade
+            # safety net. If the iteration body raised before any
+            # explicit ``_finalize_iteration_summary`` call set
+            # ``_finalized_this_iter`` on ``_current_iter_inputs``,
+            # finalize now with ``exit_path="exception"`` so the
+            # invariant runner (moved into
+            # ``_finalize_iteration_summary``) still emits its
+            # ``INVARIANT_VIOLATION`` records and the rendered
+            # transcript reflects the crash. Use ``locals().get``
+            # so a crash before ``_begin_iteration_capture`` does
+            # not raise ``UnboundLocalError`` inside the finally.
+            _f_cur = locals().get("_current_iter_inputs")
+            if isinstance(_f_cur, dict) and not _f_cur.get(
+                "_finalized_this_iter"
+            ):
                 try:
-                    from genie_space_optimizer.optimization.failure_bucketing import (
-                        classify_unresolved_qid as _classify_unresolved_qid,
-                    )
-                    from genie_space_optimizer.optimization.rca_decision_trace import (
-                        DecisionOutcome as _DecisionOutcome,
-                    )
-                    _next_buckets: dict[str, Any] = {}
-                    _qids_seen: set[str] = set()
-                    for _r in _decision_records:
-                        _qid = str(getattr(_r, "question_id", "") or "")
-                        if not _qid or _qid in _qids_seen:
-                            continue
-                        if getattr(_r, "outcome", None) != _DecisionOutcome.UNRESOLVED:
-                            continue
-                        _qids_seen.add(_qid)
-                        _classification = _classify_unresolved_qid(
-                            _trace, _qid, iteration=iteration_counter,
-                        )
-                        if _classification.bucket is not None:
-                            _next_buckets[_qid] = _classification.bucket
-                    _prior_buckets_by_qid = _next_buckets
-                except Exception:
-                    logger.debug(
-                        "Spine stage 10: bucket classification failed "
-                        "(non-fatal); prior_buckets_by_qid carried over "
-                        "unchanged",
-                        exc_info=True,
-                    )
-                # Cycle 5 T2 — refresh the cross-iteration carry-over
-                # for dropped causal patches. The next iteration's
-                # ActionGroupsInput threads this list into the
-                # strategist's prompt context (gated by the flag).
-                try:
-                    _prior_iteration_dropped_causal_patches = list(
-                        _iter_dropped_causal
-                    )
-                except Exception:
-                    logger.debug(
-                        "Cycle 5 T2: dropped-causal carry-over refresh "
-                        "failed (non-fatal); prior list unchanged",
-                        exc_info=True,
-                    )
-                _transcript = render_operator_transcript(
-                    trace=_trace,
-                    iteration=iteration_counter,
-                )
-                print(_transcript)
-                _phase_b_decision_artifact = (
-                    f"phase_b/decision_trace/iter_{iteration_counter}.json"
-                )
-                _phase_b_transcript_artifact = (
-                    f"phase_b/operator_transcript/iter_{iteration_counter}.txt"
-                )
-                print(phase_b_marker(
-                    optimization_run_id=run_id,
-                    iteration=iteration_counter,
-                    decision_record_count=len(_decision_records),
-                    decision_validation_count=len(_decision_validation),
-                    transcript_chars=len(_transcript),
-                    decision_trace_artifact=_phase_b_decision_artifact,
-                    operator_transcript_artifact=_phase_b_transcript_artifact,
-                    persist_ok=True,
-                ))
-                # Phase E.0 Task 5 — anchor phase_b/ to the lever_loop
-                # sibling. Replaces mlflow.active_run() persistence so
-                # decision_trace + operator_transcript land alongside
-                # phase_a/ on the same operator-discoverable run.
-                _phase_b_result = _persist_phase_b_artifacts_to_anchor(
-                    opt_run_id=run_id,
-                    iteration=iteration_counter,
-                    decision_json=canonical_decision_json(_decision_records),
-                    transcript=_transcript,
-                    record_count=len(_decision_records),
-                    violation_count=len(_decision_validation),
-                )
-                if not _phase_b_result.success:
-                    logger.warning(
-                        "Phase B: anchored persistence failed: %s",
-                        _phase_b_result.exception_class,
-                    )
-                from genie_space_optimizer.common.mlflow_markers import (
-                    phase_b_artifact_marker,
-                )
-                print(phase_b_artifact_marker(
-                    optimization_run_id=run_id,
-                    iteration=iteration_counter,
-                    anchor_run_id=_phase_b_result.anchor_run_id,
-                    decision_trace_path=_phase_b_decision_artifact,
-                    operator_transcript_path=_phase_b_transcript_artifact,
-                    success=_phase_b_result.success,
-                    exception_class=_phase_b_result.exception_class,
-                ))
-        except Exception:
-            logger.debug(
-                "Phase B: decision trace persistence skipped (non-fatal)",
-                exc_info=True,
-            )
-            try:
-                import mlflow as _mlflow_phase_b_partial  # type: ignore[import-not-found]
-                if _mlflow_phase_b_partial.active_run() is not None:
-                    _mlflow_phase_b_partial.set_tag(
-                        "genie.phase_b.partial", "true"
-                    )
-            except Exception:
-                logger.debug("Phase B partial tag skipped", exc_info=True)
-
-        # Phase B observability follow-up — per-iteration accounting
-        # for the manifest + no-records diagnostic. ALWAYS runs, even
-        # when the persistence block above short-circuited (no records,
-        # missing mlflow, etc.). This is what makes the postmortem
-        # analyzer able to distinguish "Phase B ran but had nothing to
-        # record" from "Phase B never ran" or "deploy is stale".
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                NoRecordsReason as _NoRecordsReason,
-                classify_no_records_reason as _classify_no_records_reason,
-            )
-            from genie_space_optimizer.optimization.rca_decision_trace import (
-                DecisionRecord as _DecisionRecord_pb,
-                validate_decisions_against_journey as _validate_pb,
-            )
-            from genie_space_optimizer.optimization.run_analysis_contract import (
-                phase_b_no_records_marker as _phase_b_no_records_marker,
-            )
-
-            _iter_records_dicts = list(
-                _current_iter_inputs.get("decision_records") or []
-            )
-            _iter_record_count = len(_iter_records_dicts)
-            _phase_b_iter_record_counts.append(_iter_record_count)
-
-            if _iter_record_count == 0:
-                # No-records diagnostic — emit a stable stdout marker +
-                # MLflow tag with a reason from the closed
-                # NoRecordsReason vocabulary.
-                _no_rec_reason = _classify_no_records_reason(
-                    iteration_inputs=_current_iter_inputs,
-                    producer_exceptions=_iter_producer_exceptions,
-                )
-                _phase_b_no_records_iterations.append(int(iteration_counter))
-                _phase_b_iter_violation_counts.append(0)
-                print(_phase_b_no_records_marker(
-                    optimization_run_id=run_id,
-                    iteration=iteration_counter,
-                    reason=_no_rec_reason.value,
-                    producer_exceptions=dict(_iter_producer_exceptions),
-                    contract_version=_PHASE_B_CONTRACT_VERSION,
-                ))
-                try:
-                    import mlflow as _mlflow_no_rec  # type: ignore[import-not-found]
-                    if _mlflow_no_rec.active_run() is not None:
-                        _mlflow_no_rec.set_tags({
-                            (
-                                f"decision_trace.iter_{iteration_counter}."
-                                "no_records_reason"
-                            ): _no_rec_reason.value,
-                            (
-                                f"decision_trace.iter_{iteration_counter}.records"
-                            ): "0",
-                        })
-                except Exception:
-                    logger.debug(
-                        "Phase B no-records MLflow tag skipped (non-fatal)",
-                        exc_info=True,
-                    )
-            else:
-                # Records were captured — track artifact path + count
-                # violations.
-                _phase_b_artifact_paths.append(
-                    f"phase_b/decision_trace/iter_{iteration_counter}.json"
-                )
-                try:
-                    _typed_records = [
-                        _DecisionRecord_pb.from_dict(r) for r in _iter_records_dicts
-                    ]
-                    _violations = _validate_pb(
-                        records=_typed_records,
-                        events=_journey_events,
-                    )
-                    _phase_b_iter_violation_counts.append(len(_violations))
-                    _phase_b_total_violations += len(_violations)
-                except Exception:
-                    _phase_b_iter_violation_counts.append(0)
-        except Exception:
-            logger.debug(
-                "Phase B: per-iter accounting skipped (non-fatal)",
-                exc_info=True,
-            )
-
-        # Phase C Task 6 — emit STRATEGIST_AG_EMITTED+UNRESOLVED+
-        # RCA_UNGROUNDED for findings whose qids are not covered by
-        # any emitted AG. Fires once per iteration after all AGs have
-        # been processed so action_groups is fully populated.
-        try:
-            from genie_space_optimizer.optimization.decision_emitters import (
-                orphan_rca_records as _orphan_rca_records,
-            )
-            from genie_space_optimizer.optimization.rca import (
-                rca_findings_from_clusters as _rca_findings_from_clusters_c6,
-            )
-
-            _phase_c_findings_orphan = _rca_findings_from_clusters_c6(
-                clusters or []
-            )
-            _strategy_for_orphan = (
-                _current_iter_inputs.get("strategist_response") or {}
-            )
-            _orphan_records = _orphan_rca_records(
-                run_id=run_id,
-                iteration=iteration_counter,
-                findings=_phase_c_findings_orphan,
-                action_groups=(_strategy_for_orphan.get("action_groups") or []),
-            )
-            _current_iter_inputs.setdefault("decision_records", []).extend(
-                [r.to_dict() for r in _orphan_records]
-            )
-        except Exception as _orphan_rca_exc:
-            try:
-                from genie_space_optimizer.common.config import (
-                    phase_b_producer_typed_exceptions_enabled as _typed_on,
-                )
-                if _typed_on():
-                    from genie_space_optimizer.optimization.decision_emitters import (
-                        producer_exception_record as _producer_exception_record,
-                    )
-                    _pe_rec = _producer_exception_record(
-                        run_id=run_id,
-                        iteration=iteration_counter,
-                        producer="orphan_rca",
-                        ag_id="",
-                        exception=_orphan_rca_exc,
-                    )
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_pe_rec.to_dict())
-            except Exception:
-                logger.debug(
-                    "Phase B: producer_exception_record emission failed for orphan_rca",
-                    exc_info=True,
-                )
-            _phase_b_producer_exceptions["orphan_rca"] = (
-                _phase_b_producer_exceptions.get("orphan_rca", 0) + 1
-            )
-            logger.debug(
-                "Phase C: orphan_rca_records failed (non-fatal)",
-                exc_info=True,
-            )
-            if _phase_b_strict_mode():
-                raise
-
-        # Cycle 10 W1 — RCA-ungrounded records for clusters that reached
-        # AG-emit without a fit RCA. Companion to orphan_rca_records:
-        # orphan = AG emitted but qids not covered by any AG; ungrounded =
-        # AG covers the cluster but no RCA grounded the fix surface.
-        try:
-            _w1_action_groups = list(
-                (_strategy_for_orphan or {}).get("action_groups") or []
-            )
-            _w1_ag_emitted = {
-                str(cid): True
-                for ag in _w1_action_groups
-                for cid in (ag.get("source_cluster_ids") or ())
-                if str(cid)
-            }
-            _w1_rca_id_by_cluster = {
-                str(c.get("cluster_id") or ""): str(c.get("rca_id") or "")
-                for c in (clusters or [])
-            }
-            _w1_count = _emit_rca_ungrounded_records_for_unfit_clusters(
-                run_id=str(run_id),
-                iteration=int(iteration_counter),
-                clusters=list(clusters or ()),
-                rca_id_by_cluster=_w1_rca_id_by_cluster,
-                ag_emitted_for_cluster=_w1_ag_emitted,
-                iter_inputs=_current_iter_inputs,
-            )
-            if _w1_count:
-                logger.info(
-                    "Cycle 10 W1: emitted %d rca_ungrounded records",
-                    _w1_count,
-                )
-        except Exception:
-            logger.debug(
-                "Cycle 10 W1: rca_ungrounded wiring failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # Cycle 5 T1 — productive-iteration budget accounting end-of-iter
-        # decision. Gated by ``GSO_PRODUCTIVE_ITERATION_BUDGET`` (Option
-        # A: zero behaviour change with flag off → no record emitted, no
-        # marker, no counter decrement). With flag on, an iteration that
-        # applied zero patches AND produced a typed P4 reason
-        # (``proposal_generation_empty``,
-        # ``structural_gate_dropped_instruction_only``,
-        # ``no_structural_candidate``) is classified as a deterministic
-        # no-op and does not consume the iteration counter; the
-        # iteration_budget_decision_record + GSO_ITERATION_BUDGET_V1
-        # marker make the accounting auditable.
-        try:
-            from genie_space_optimizer.common.config import (
-                productive_iteration_budget_enabled,
-            )
-            if productive_iteration_budget_enabled():
-                from genie_space_optimizer.optimization.decision_emitters import (
-                    iteration_budget_decision_record,
-                )
-                from genie_space_optimizer.common.mlflow_markers import (
-                    iteration_budget_marker,
-                )
-                if _iter_applied_count == 0:
-                    _iter_no_op_cause = _classify_iteration_no_op_cause(
-                        _current_iter_inputs.get("decision_records") or []
-                    )
-                    # Only treat as deterministic no-op when one of the
-                    # typed P4 reasons fired this iteration. Untyped /
-                    # unexplained no-ops still consume budget so the
-                    # loop terminates on plateau rather than spinning.
-                    if _iter_no_op_cause:
-                        _iter_consumed = False
-                _iter_budget_rec = iteration_budget_decision_record(
-                    run_id=str(run_id),
-                    iteration=int(iteration_counter),
-                    consumed=_iter_consumed,
-                    no_op_cause=(_iter_no_op_cause or None),
-                    applied_patches=int(_iter_applied_count),
-                )
-                # Cycle 6 F-1 — gate duplicate emits within the iteration.
-                # The counter decrement and marker print live inside the
-                # gate too, since both are non-idempotent side effects.
-                _iter_budget_key = _emit_idempotency_key(
-                    _iter_budget_rec.to_dict()
-                )
-                if _iter_budget_key not in _iter_emitted_keys:
-                    _iter_emitted_keys.add(_iter_budget_key)
-                    _decision_emit(_iter_budget_rec)
-                    _current_iter_inputs.setdefault(
-                        "decision_records", []
-                    ).append(_iter_budget_rec.to_dict())
-                    _counter_after = (
-                        iteration_counter
-                        if _iter_consumed
-                        else iteration_counter - 1
-                    )
-                    print(iteration_budget_marker(
-                        optimization_run_id=str(run_id),
+                    _finalize_iteration_summary(
+                        iter_traces=_iter_traces,
+                        iter_summaries=_iter_summaries,
                         iteration=int(iteration_counter),
-                        consumed=_iter_consumed,
-                        no_op_cause=str(_iter_no_op_cause or ""),
-                        applied_patches=int(_iter_applied_count),
-                        iteration_counter_after=int(_counter_after),
-                    ))
-                    if not _iter_consumed:
-                        iteration_counter -= 1
-        except Exception:
-            logger.debug(
-                "Cycle 5 T1: iteration_budget emit failed (non-fatal)",
-                exc_info=True,
-            )
-
-        # GSO run analysis: emit machine-readable per-iteration summary
-        # so the analyzer skill can build a postmortem without scraping
-        # freeform logs.
-        try:
-            _iter_ag_outcomes = (_current_iter_inputs.get("ag_outcomes") or {})
-            _accepted_count = sum(
-                1 for v in _iter_ag_outcomes.values()
-                if str(v).startswith("accepted")
-            )
-            _rolled_back_count = sum(
-                1 for v in _iter_ag_outcomes.values()
-                if str(v) == "rolled_back"
-            )
-            _skipped_count = sum(
-                1 for v in _iter_ag_outcomes.values()
-                if str(v).startswith("skipped")
-            )
-            _gate_drop_count = sum(
-                1
-                for r in (_current_iter_inputs.get("decision_records") or [])
-                if str(r.get("outcome") or "") == "dropped"
-            )
-            try:
-                _scoreboard_loop_snapshot = {
-                    "iteration": int(iteration_counter),
-                    "passing_qids": list(
-                        _current_iter_inputs.get("post_eval_passing_qids") or []
-                    ),
-                    "hard_failure_qids": [
-                        qid
-                        for c in (_current_iter_inputs.get("clusters") or [])
-                        for qid in (c.get("question_ids") or [])
-                    ],
-                    "applied_patch_count": _accepted_count,
-                    "rolled_back_patch_count": _rolled_back_count,
-                    "trace_id_fallback_count": 0,
-                    "trace_id_total": 0,
-                }
-                print(_format_scoreboard_banner(
-                    loop_snapshot=_scoreboard_loop_snapshot,
-                ))
-            except Exception:
-                logger.debug(
-                    "scoreboard banner failed (non-fatal)", exc_info=True,
-                )
-            print(iteration_summary_marker(
-                optimization_run_id=run_id,
-                iteration=iteration_counter,
-                accepted_count=_accepted_count,
-                rolled_back_count=_rolled_back_count,
-                skipped_count=_skipped_count,
-                gate_drop_count=_gate_drop_count,
-                decision_record_count=len(
-                    _current_iter_inputs.get("decision_records") or []
-                ),
-                journey_violation_count=(
-                    0 if _journey_report is None else len(_journey_report.violations)
-                ),
-            ))
-        except Exception:
-            logger.debug("GSO iteration summary marker skipped", exc_info=True)
-
-        # Phase H iteration content completeness — finalise the iteration
-        # with rich data and ``exit_path=completed``. Every iteration-body
-        # ``continue`` / ``break`` must call ``_finalize_iteration_summary``
-        # with the appropriate ``exit_path`` label BEFORE the exit, so this
-        # path only fires when the iteration finishes cleanly.
-        try:
-            _iter_acc_pct: float | None
-            try:
-                _iter_acc_pct = (
-                    float(best_accuracy)
-                    if iteration_counter == best_iteration
-                    else None
-                )
-            except Exception:
-                _iter_acc_pct = None
-            _finalize_iteration_summary(
-                iter_traces=_iter_traces,
-                iter_summaries=_iter_summaries,
-                iteration=int(iteration_counter),
-                current_iter_inputs=_current_iter_inputs,
-                journey_events=_journey_events,
-                journey_report=_journey_report,
-                accepted_count=int(_accepted_count or 0),
-                rolled_back_count=int(_rolled_back_count or 0),
-                skipped_count=int(_skipped_count or 0),
-                gate_drop_count=int(_gate_drop_count or 0),
-                iteration_accuracy_percent=_iter_acc_pct,
-                exit_path="completed",
-            )
-        except Exception:
-            logger.debug(
-                "Phase H iteration finalise skipped (non-fatal)",
-                exc_info=True,
-            )
-
-        # Task 13 — render the per-question journey ledger at normal
-        # iteration end. Early-exit paths call the same idempotent helper
-        # before continuing.
-        _render_current_journey()
-
-        # Cycle 11 Task 12 — run the invariant suite at end-of-iteration.
-        # Violations land as typed INVARIANT_VIOLATION records (warn-
-        # and-degrade in production); strict mode raises AssertionError
-        # for CI/replay. The per-iteration evidence dict is intentionally
-        # minimal in this commit — fixture-based pilot evaluation is
-        # the load-bearing path; richer live evidence is a Cycle 12
-        # follow-up.
-        try:
-            from genie_space_optimizer.common.config import (
-                loop_invariants_enabled as _inv_enabled,
-                loop_invariants_strict as _inv_strict,
-            )
-            if _inv_enabled():
-                from genie_space_optimizer.optimization.invariants import (
-                    run_invariants as _run_invariants,
-                )
-                from genie_space_optimizer.optimization.decision_emitters import (
-                    invariant_violation_record as _invariant_violation_record,
-                )
-
-                _iter_evidence = {
-                    "phase_b": {
-                        "total_records": len(
-                            _current_iter_inputs.get("decision_records") or []
+                        current_iter_inputs=_f_cur,
+                        journey_events=locals().get(
+                            "_journey_events"
+                        ) or [],
+                        journey_report=locals().get(
+                            "_journey_report"
                         ),
-                        "producer_exceptions": dict(_iter_producer_exceptions or {}),
-                    },
-                    "replay_fixture_records": 0,
-                    "iterations": [],
-                    "manifest": {"declared_paths": [], "materialized_paths": []},
-                    "convergence": {},
-                }
-                _violations = _run_invariants(_iter_evidence)
-                if _violations and _inv_strict():
-                    raise AssertionError(
-                        f"INVARIANT_VIOLATION (strict): {_violations}"
+                        accepted_count=0,
+                        rolled_back_count=0,
+                        skipped_count=0,
+                        gate_drop_count=0,
+                        iteration_accuracy_percent=None,
+                        exit_path="exception",
+                        run_id=run_id,
+                        iter_producer_exceptions=locals().get(
+                            "_iter_producer_exceptions"
+                        ),
                     )
-                for _v in _violations:
-                    try:
-                        _rec = _invariant_violation_record(
-                            run_id=run_id,
-                            iteration=iteration_counter,
-                            violation=_v,
-                        )
-                        _current_iter_inputs.setdefault(
-                            "decision_records", []
-                        ).append(_rec.to_dict())
-                    except Exception:
-                        logger.debug(
-                            "Cycle 11 Task 12: invariant_violation_record emission failed",
-                            exc_info=True,
-                        )
-        except AssertionError:
-            raise
-        except Exception:
-            logger.debug(
-                "Cycle 11 Task 12: invariant suite execution failed (non-fatal)",
-                exc_info=True,
-            )
-
+                except Exception:
+                    logger.debug(
+                        "Phase H exception-fallback finalise "
+                        "skipped (non-fatal)",
+                        exc_info=True,
+                    )
     write_stage(
         spark, run_id, "LEVER_LOOP_STARTED", "COMPLETE",
         task_key="lever_loop",

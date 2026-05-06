@@ -33,6 +33,23 @@ FIXTURES = {
         / "fixtures"
         / "run_80532762433063_7now_pre_nameerror_fix.json"
     ),
+    # Run 40405156883710 — captured *after* Bug A landed and Cycle 11
+    # observability shipped to production. The same instrumentation
+    # that named Bug A then named Bug B: a cross-scope
+    # ``UnboundLocalError`` on ``full_accuracy`` at the F9 plateau-
+    # termination call site (``harness.py:_run_lever_loop`` line
+    # 13779 post-Bug-A-fix). Committed as a pre-Bug-B-fix regression
+    # marker. The accompanying assertion
+    # (``test_no_full_accuracy_unbound_local_error_in_committed_fixtures``)
+    # skips this exact fixture so the bug-on-disk does not block
+    # merge of the fix; it asserts against every other fixture so
+    # any fresh run that re-introduces the same UnboundLocalError
+    # fails CI.
+    "40405156883710_airline_pre_bugb_fix": (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "run_40405156883710_airline_pre_bugb_fix.json"
+    ),
 }
 
 # Fixtures that pre-date the harness.py:_run_lever_loop cross-scope
@@ -40,6 +57,19 @@ FIXTURES = {
 # regression provenance and are exempt from the post-fix assertion.
 _PRE_NAMEERROR_FIX_FIXTURES = frozenset({
     "80532762433063_7now_pre_nameerror_fix",
+    # 40405156883710 was captured with Cycle 11 instrumentation
+    # active but BEFORE the Bug A NameError fix landed in production.
+    # The same run also surfaced Bug B (``UnboundLocalError`` on
+    # ``full_accuracy``); it appears in ``_PRE_BUGB_FIX_FIXTURES`` too.
+    "40405156883710_airline_pre_bugb_fix",
+})
+
+# Fixtures that pre-date the harness.py:_run_lever_loop Bug B
+# (``UnboundLocalError`` on ``full_accuracy`` at the F9 plateau-
+# termination call site). Kept on disk for regression provenance and
+# exempted from the post-Bug-B-fix assertion.
+_PRE_BUGB_FIX_FIXTURES = frozenset({
+    "40405156883710_airline_pre_bugb_fix",
 })
 
 
@@ -307,3 +337,53 @@ def test_no_full_pre_arbiter_accuracy_nameerror_in_committed_fixtures(
                     f"{fixture_id} — the harness.py:_run_lever_loop "
                     f"acceptance-stage fix has regressed. Record: {rec}"
                 )
+
+
+def test_no_full_accuracy_unbound_local_error_in_committed_fixtures(
+    fixture, request
+):
+    """Regression — once the harness.py:13779 fix lands, no fixture
+    should carry a ``producer_exception`` decision record naming
+    ``full_accuracy`` as the missing local with an
+    ``UnboundLocalError``.
+
+    Closes Bug B surfaced by Cycle 11's typed
+    ``PRODUCER_EXCEPTION`` record in run 40405156883710 (parent run
+    1099b152-8655-4f1e-ab43-1240a9400280, airline). The bug fired
+    because ``full_accuracy`` was assigned only inside the
+    acceptance branch of ``_run_lever_loop``; on rollback-only
+    plateau paths the local stayed unbound and the F9 plateau-
+    termination's ``LearningInput`` constructor at ``:13779`` raised
+    on read.
+
+    Fixtures captured *before* the fix are kept on disk for
+    provenance (see ``_PRE_BUGB_FIX_FIXTURES``) and skipped by this
+    assertion. Every other fixture — including any future post-fix
+    capture — must be free of the ``full_accuracy``
+    ``UnboundLocalError``.
+    """
+    fixture_id = request.node.callspec.id
+    if fixture_id in _PRE_BUGB_FIX_FIXTURES:
+        pytest.skip(
+            f"fixture {fixture_id} pre-dates the harness.py "
+            "_run_lever_loop full_accuracy UnboundLocalError fix "
+            "(Bug B) — kept on disk for regression provenance"
+        )
+
+    for it in fixture.get("iterations") or []:
+        for rec in it.get("decision_records") or []:
+            if str(rec.get("decision_type") or "") != "producer_exception":
+                continue
+            metrics = rec.get("metrics") or {}
+            exception_class = str(metrics.get("exception_class") or "")
+            repr_text = str(metrics.get("exception_repr") or "")
+            traceback_head = str(metrics.get("traceback_head") or "")
+            blob = f"{repr_text}\n{traceback_head}"
+            if exception_class != "UnboundLocalError":
+                continue
+            assert "full_accuracy" not in blob, (
+                f"iter {it.get('iteration')}: full_accuracy "
+                f"UnboundLocalError reproduced in fixture "
+                f"{fixture_id} — the harness.py:_run_lever_loop F9 "
+                f"plateau-termination fix has regressed. Record: {rec}"
+            )
