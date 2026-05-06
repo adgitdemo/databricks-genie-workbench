@@ -5603,6 +5603,19 @@ def l6_narrow_replacement_patch_aware_enabled() -> bool:
     return _flag_default_on("GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE")
 
 
+def l6_narrow_replacement_for_expression_enabled() -> bool:
+    """P0: extend narrow L6 replacement to add_sql_snippet_expression
+    and add_sql_snippet_measure patch types via question-scoped CASE
+    wrapping.
+
+    Default off so existing canonical replay fixtures stay byte-stable;
+    flipped on after the P0 re-pilot confirms the synthesized narrow
+    expressions clear the blast-radius gate AND improve target QID
+    accuracy on the run-809960554692716 fixture.
+    """
+    return _flag_enabled("GSO_L6_NARROW_REPLACEMENT_FOR_EXPRESSION")
+
+
 def doa_fingerprint_patch_body_match_enabled() -> bool:
     """Cycle 10 W5 — DOA fingerprint buffer also indexes
     ``patch_body_fingerprint`` so reproposals that switch

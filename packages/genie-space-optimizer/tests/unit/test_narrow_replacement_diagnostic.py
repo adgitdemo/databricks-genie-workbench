@@ -23,7 +23,12 @@ def _h002_expression_patch() -> dict:
     }
 
 
-def test_diagnose_expression_patch_currently_returns_lacks_where_predicate() -> None:
+def test_diagnose_expression_patch_lacks_where_predicate_when_flag_off(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "GSO_L6_NARROW_REPLACEMENT_FOR_EXPRESSION", raising=False
+    )
     from genie_space_optimizer.optimization.cluster_driven_synthesis import (
         narrow_replacement_diagnosis,
     )
@@ -38,7 +43,12 @@ def test_diagnose_expression_patch_currently_returns_lacks_where_predicate() -> 
     assert str(diag["original_patch_type"]) == "add_sql_snippet_expression"
 
 
-def test_build_currently_returns_none_for_expression_patch() -> None:
+def test_build_returns_none_for_expression_patch_when_flag_off(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "GSO_L6_NARROW_REPLACEMENT_FOR_EXPRESSION", raising=False
+    )
     from genie_space_optimizer.optimization.cluster_driven_synthesis import (
         build_narrow_l6_replacement,
     )
