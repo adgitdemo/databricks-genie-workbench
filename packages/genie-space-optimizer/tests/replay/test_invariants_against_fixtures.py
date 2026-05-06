@@ -18,7 +18,29 @@ FIXTURES = {
     "3b050ec5_7now": (
         pathlib.Path(__file__).parent / "fixtures" / "run_3b050ec5_7now.json"
     ),
+    # Run 80532762433063 — the run whose typed PRODUCER_EXCEPTION
+    # decision record (Cycle 11 instrumentation) named the actual
+    # root cause of the optimizer's silent acceptance failures: a
+    # cross-scope ``NameError`` on ``full_pre_arbiter_accuracy`` at
+    # ``harness.py:_run_lever_loop``. Committed as a pre-fix
+    # regression marker. The accompanying assertion
+    # (``test_no_full_pre_arbiter_accuracy_nameerror_in_committed_fixtures``)
+    # skips this exact fixture so the bug-on-disk does not block
+    # merge of the fix; it asserts against every other fixture so
+    # any fresh run that re-introduces the same NameError fails CI.
+    "80532762433063_7now_pre_nameerror_fix": (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "run_80532762433063_7now_pre_nameerror_fix.json"
+    ),
 }
+
+# Fixtures that pre-date the harness.py:_run_lever_loop cross-scope
+# NameError fix — they intentionally carry the bug-on-disk for
+# regression provenance and are exempt from the post-fix assertion.
+_PRE_NAMEERROR_FIX_FIXTURES = frozenset({
+    "80532762433063_7now_pre_nameerror_fix",
+})
 
 
 @pytest.fixture(params=sorted(FIXTURES.keys()))
@@ -237,3 +259,51 @@ def test_invariants_run_over_fixture_emits_violation_diagnostic(fixture, request
             f"{str(v.get('detail', ''))[:200]}"
         )
     assert isinstance(violations, list)
+
+
+def test_no_full_pre_arbiter_accuracy_nameerror_in_committed_fixtures(
+    fixture, request
+):
+    """Regression — once the cross-scope ``NameError`` fix in
+    ``harness.py:_run_lever_loop`` lands, no fresh fixture should
+    carry a ``producer_exception`` decision record naming
+    ``full_pre_arbiter_accuracy`` (or its sibling latent names
+    ``_best_pre_arbiter`` / ``full_result_1``) as the missing name.
+
+    Closes the actual root cause Cycle 11's typed
+    ``PRODUCER_EXCEPTION`` record surfaced in run 80532762433063.
+
+    Fixtures captured *before* the fix are kept on disk for
+    provenance (see ``_PRE_NAMEERROR_FIX_FIXTURES``) and skipped
+    by this assertion. Every other fixture — including any future
+    post-fix capture — must be free of the cross-scope NameError
+    family.
+    """
+    fixture_id = request.node.callspec.id
+    if fixture_id in _PRE_NAMEERROR_FIX_FIXTURES:
+        pytest.skip(
+            f"fixture {fixture_id} pre-dates the harness.py "
+            "_run_lever_loop cross-scope NameError fix — kept on "
+            "disk for regression provenance"
+        )
+
+    cross_scope_names = (
+        "full_pre_arbiter_accuracy",
+        "_best_pre_arbiter",
+        "full_result_1",
+    )
+    for it in fixture.get("iterations") or []:
+        for rec in it.get("decision_records") or []:
+            if str(rec.get("decision_type") or "") != "producer_exception":
+                continue
+            metrics = rec.get("metrics") or {}
+            repr_text = str(metrics.get("exception_repr") or "")
+            traceback_head = str(metrics.get("traceback_head") or "")
+            blob = f"{repr_text}\n{traceback_head}"
+            for name in cross_scope_names:
+                assert name not in blob, (
+                    f"iter {it.get('iteration')}: cross-scope "
+                    f"NameError on {name!r} reproduced in fixture "
+                    f"{fixture_id} — the harness.py:_run_lever_loop "
+                    f"acceptance-stage fix has regressed. Record: {rec}"
+                )

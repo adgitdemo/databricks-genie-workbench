@@ -2034,6 +2034,21 @@ def _emit_diagnostic_ag_trunk_events(
             )
 
 
+def _candidate_pre_arbiter_from_gate(gate_result) -> float:
+    """Source candidate pre-arbiter accuracy from ``gate_result``.
+
+    Mirrors the post-arbiter pattern at the acceptance call site
+    (``float(gate_result.get("full_accuracy") or 0.0)``). Pure: no I/O,
+    no scope leakage. Closes the cross-scope ``NameError`` at
+    ``harness.py:_run_lever_loop`` that Cycle 11's typed
+    ``PRODUCER_EXCEPTION`` record surfaced in run ``80532762433063``,
+    where the previous fallback referenced ``full_pre_arbiter_accuracy``
+    which is only assigned in a sibling eval helper's scope.
+    """
+    val = (gate_result or {}).get("full_pre_arbiter_accuracy")
+    return float(val if val is not None else 0.0)
+
+
 def compute_current_hard_qids(
     *,
     currently_failing,
@@ -12662,6 +12677,19 @@ def _run_lever_loop(
     best_accuracy = prev_accuracy
     best_model_id = prev_model_id
     best_iteration = iteration_counter
+    # Track the best pre-arbiter accuracy in this loop's scope so the
+    # acceptance stage's ``baseline_pre_arbiter_accuracy`` reads from a
+    # name that exists in ``_run_lever_loop``. Sourced from the canonical
+    # ``_pre_arbiter/overall_accuracy`` score (B0.1/B0.2 stamp), with a
+    # safe fallback to ``best_accuracy`` so older/resumed runs that
+    # pre-date the stamp still produce a real number. Closes the
+    # latent cross-scope ``_best_pre_arbiter`` NameError that lived
+    # one block away from the ``full_pre_arbiter_accuracy`` bug
+    # surfaced by Cycle 11's typed PRODUCER_EXCEPTION record.
+    _iter_best_pre_arbiter = float(
+        best_scores.get("_pre_arbiter/overall_accuracy", best_accuracy)
+        or 0.0
+    )
     # Task 5 — Accepted/live baseline rows for the control-plane gate.
     # This is updated only after an AG is accepted, never after a
     # rejected candidate full eval. Falling back to Delta latest-full
@@ -20525,20 +20553,21 @@ def _run_lever_loop(
             _accept_candidate_accuracy = float(
                 gate_result.get("full_accuracy") or 0.0
             )
-            _accept_candidate_pre_arbiter = (
-                float(gate_result.get("full_pre_arbiter_accuracy"))
-                if gate_result.get("full_pre_arbiter_accuracy") is not None
-                else float(full_pre_arbiter_accuracy or 0.0)
+            _accept_candidate_pre_arbiter = _candidate_pre_arbiter_from_gate(
+                gate_result
             )
-            # post_rows: prefer gate_result.full_result.rows (what the
-            # gate actually consumed); fall back to full_result_1 only
-            # when the gate did not surface it.
+            # post_rows: read from gate_result.full_result.rows (what the
+            # gate actually consumed). The previous fallback referenced
+            # ``full_result_1`` which is only assigned in the eval helper's
+            # scope and would NameError here whenever
+            # ``gate_result.full_result.rows`` is empty. We drop the
+            # impossible fallback (mirrors the safe ``or []`` pattern at
+            # the accepted-baseline write site below).
             _accept_gate_full_result = (
                 gate_result.get("full_result") or {}
             )
             _accept_post_rows = (
                 _accept_gate_full_result.get("rows")
-                or (full_result_1 or {}).get("rows")
                 or []
             )
 
@@ -20548,7 +20577,7 @@ def _run_lever_loop(
                     ags=(ag,),  # single-AG slate
                     baseline_accuracy=float(best_accuracy),
                     candidate_accuracy=_accept_candidate_accuracy,
-                    baseline_pre_arbiter_accuracy=float(_best_pre_arbiter),
+                    baseline_pre_arbiter_accuracy=float(_iter_best_pre_arbiter),
                     candidate_pre_arbiter_accuracy=_accept_candidate_pre_arbiter,
                     pre_rows=tuple(_baseline_rows_for_control_plane or []),
                     post_rows=tuple(_accept_post_rows),
@@ -21312,6 +21341,10 @@ def _run_lever_loop(
         best_accuracy = full_accuracy
         best_model_id = new_model_id
         best_iteration = iteration_counter
+        # Roll the in-scope pre-arbiter baseline forward to whatever the
+        # gate just consumed for this accepted candidate. Mirrors the
+        # post-arbiter ``best_accuracy`` update one line up.
+        _iter_best_pre_arbiter = _candidate_pre_arbiter_from_gate(gate_result)
         prev_scores = full_scores
         prev_model_id = new_model_id
         # Task 5 — only update accepted-baseline rows on accept; rollback
