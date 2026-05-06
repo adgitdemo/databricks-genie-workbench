@@ -241,3 +241,26 @@ def test_i5_green_when_replay_is_valid() -> None:
         },
     }
     assert check_i5_replay_validity(evidence) == []
+
+
+def test_i6_red_when_declared_paths_not_materialized() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i6_manifest_paths
+
+    evidence = {"manifest": {
+        "declared_paths": ["a", "b", "c"],
+        "materialized_paths": ["a"],
+    }}
+    violations = check_i6_manifest_paths(evidence)
+    assert any(v["invariant_id"] == "I6" for v in violations)
+    v = violations[0]
+    assert sorted(v["missing_paths"]) == ["b", "c"]
+
+
+def test_i6_green_when_paths_equal() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i6_manifest_paths
+
+    evidence = {"manifest": {
+        "declared_paths": ["a", "b"],
+        "materialized_paths": ["a", "b"],
+    }}
+    assert check_i6_manifest_paths(evidence) == []

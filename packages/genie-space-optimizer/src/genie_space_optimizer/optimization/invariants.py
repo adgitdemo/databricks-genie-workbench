@@ -288,7 +288,29 @@ def check_i5_replay_validity(evidence: Mapping[str, Any]) -> list[dict]:
     )]
 
 
-# Stubs for I6..I8 — populated in subsequent tasks. The aggregator
+def check_i6_manifest_paths(evidence: Mapping[str, Any]) -> list[dict]:
+    """I6 — manifest declared paths == materialized paths. Closes
+    7NOW 130/163 missing while ``missing_pieces=[]``."""
+    manifest = dict(evidence.get("manifest") or {})
+    declared = {str(p) for p in (manifest.get("declared_paths") or [])}
+    materialized = {str(p) for p in (manifest.get("materialized_paths") or [])}
+    missing = declared - materialized
+    if not missing:
+        return []
+    return [_violation(
+        invariant_id="I6",
+        title="manifest_declared_paths_not_materialized",
+        detail=(
+            f"{len(missing)} of {len(declared)} declared Phase H paths "
+            f"are absent from MLflow"
+        ),
+        declared_count=len(declared),
+        materialized_count=len(materialized),
+        missing_paths=sorted(missing),
+    )]
+
+
+# Stubs for I7..I8 — populated in subsequent tasks. The aggregator
 # tolerates missing checks so each can land in its own commit.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
@@ -301,6 +323,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
         check_i3_acceptance_buckets,
         check_i4_no_silent_retry,
         check_i5_replay_validity,
+        check_i6_manifest_paths,
     ):
         try:
             violations.extend(check(evidence))
