@@ -168,6 +168,35 @@ def narrow_not_applicable_marker(
     return "GSO_NARROW_NOT_APPLICABLE_V1 " + json.dumps(payload, sort_keys=True)
 
 
+def narrow_replacement_synthesized_marker(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    original_patch_type: str,
+    narrowing_strategy: str,
+    narrow_proposal_id: str,
+) -> str:
+    """P0: typed marker emitted at the narrow-replacement survivor site
+    in _run_narrow_l6_replacement_loop. Mirror of
+    narrow_not_applicable_marker so the marker stream carries both the
+    "tried and produced a survivor" and "tried and declined" outcomes.
+    """
+    payload = {
+        "run_id": str(run_id),
+        "iteration": int(iteration),
+        "ag_id": str(ag_id),
+        "cluster_id": str(cluster_id),
+        "root_cause": str(root_cause),
+        "original_patch_type": str(original_patch_type),
+        "narrowing_strategy": str(narrowing_strategy),
+        "narrow_proposal_id": str(narrow_proposal_id),
+    }
+    return "GSO_NARROW_REPLACEMENT_SYNTHESIZED_V1 " + json.dumps(payload, sort_keys=True)
+
+
 def ag_levers_unioned_marker(
     *,
     run_id: str,

@@ -2211,6 +2211,69 @@ def _run_narrow_l6_replacement_loop(
             continue
         if retest.get("safe") is True:
             survivors.append(narrow)
+            if iter_inputs is not None:
+                try:
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        narrow_replacement_synthesized_record,
+                    )
+                    from genie_space_optimizer.common.mlflow_markers import (
+                        narrow_replacement_synthesized_marker,
+                    )
+                    _rec = narrow_replacement_synthesized_record(
+                        run_id=str(run_id),
+                        iteration=int(iteration),
+                        ag_id=str(ag_id),
+                        cluster_id=str(cluster_id),
+                        root_cause=str(ag_root_cause or ""),
+                        original_patch_type=str(
+                            (drop or {}).get("patch_type") or ""
+                        ),
+                        original_proposal_id=str(
+                            (drop or {}).get("proposal_id") or ""
+                        ),
+                        narrow_proposal_id=str(
+                            narrow.get("proposal_id") or ""
+                        ),
+                        narrowing_strategy=str(
+                            narrow.get("narrowing_strategy") or ""
+                        ),
+                        target_qids=tuple(blast_target_qids or ()),
+                    )
+                    iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_rec.to_dict())
+                    try:
+                        _marker = narrow_replacement_synthesized_marker(
+                            run_id=str(run_id),
+                            iteration=int(iteration),
+                            ag_id=str(ag_id),
+                            cluster_id=str(cluster_id),
+                            root_cause=str(ag_root_cause or ""),
+                            original_patch_type=str(
+                                (drop or {}).get("patch_type") or ""
+                            ),
+                            narrowing_strategy=str(
+                                narrow.get("narrowing_strategy") or ""
+                            ),
+                            narrow_proposal_id=str(
+                                narrow.get("proposal_id") or ""
+                            ),
+                        )
+                        iter_inputs.setdefault(
+                            "markers", []
+                        ).append(_marker)
+                    except Exception:
+                        logger.debug(
+                            "P0: narrow_replacement_synthesized "
+                            "marker emit failed (non-fatal)",
+                            exc_info=True,
+                        )
+                except Exception:
+                    logger.debug(
+                        "P0: narrow_replacement_synthesized record "
+                        "emit failed (non-fatal)",
+                        exc_info=True,
+                    )
     return survivors
 
 

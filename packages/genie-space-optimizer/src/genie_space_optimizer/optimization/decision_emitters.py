@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import traceback
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
@@ -2314,6 +2315,70 @@ def narrow_not_applicable_record(
             "original_patch_type": str(original_patch_type),
             "reason": str(reason),
         },
+    )
+
+
+@dataclass(frozen=True)
+class NarrowReplacementSynthesizedRecord:
+    decision_type: str
+    run_id: str
+    iteration: int
+    ag_id: str
+    cluster_id: str
+    root_cause: str
+    original_patch_type: str
+    original_proposal_id: str
+    narrow_proposal_id: str
+    narrowing_strategy: str
+    target_qids: tuple
+
+    def to_dict(self) -> dict:
+        return {
+            "decision_type": self.decision_type,
+            "run_id": self.run_id,
+            "iteration": int(self.iteration),
+            "ag_id": self.ag_id,
+            "cluster_id": self.cluster_id,
+            "root_cause": self.root_cause,
+            "original_patch_type": self.original_patch_type,
+            "original_proposal_id": self.original_proposal_id,
+            "narrow_proposal_id": self.narrow_proposal_id,
+            "narrowing_strategy": self.narrowing_strategy,
+            "target_qids": list(self.target_qids),
+        }
+
+
+def narrow_replacement_synthesized_record(
+    *,
+    run_id: str,
+    iteration: int,
+    ag_id: str,
+    cluster_id: str,
+    root_cause: str,
+    original_patch_type: str,
+    original_proposal_id: str,
+    narrow_proposal_id: str,
+    narrowing_strategy: str,
+    target_qids,
+) -> "NarrowReplacementSynthesizedRecord":
+    """P0 Task 5A: typed record emitted at the narrow-replacement
+    survivor site in `_run_narrow_l6_replacement_loop`. Mirror of
+    `narrow_not_applicable_record` for the SUCCESS path so dashboards
+    can distinguish "narrow-replacement saved an iteration" from "no
+    narrow-replacement was attempted" or "synthesizer declined".
+    """
+    return NarrowReplacementSynthesizedRecord(
+        decision_type="narrow_replacement_synthesized",
+        run_id=str(run_id),
+        iteration=int(iteration),
+        ag_id=str(ag_id),
+        cluster_id=str(cluster_id),
+        root_cause=str(root_cause),
+        original_patch_type=str(original_patch_type),
+        original_proposal_id=str(original_proposal_id),
+        narrow_proposal_id=str(narrow_proposal_id),
+        narrowing_strategy=str(narrowing_strategy),
+        target_qids=tuple(str(q) for q in (target_qids or ()) if str(q)),
     )
 
 
