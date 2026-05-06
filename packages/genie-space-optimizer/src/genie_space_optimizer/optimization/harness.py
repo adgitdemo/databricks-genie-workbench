@@ -21326,32 +21326,12 @@ def _run_lever_loop(
         except Exception:
             logger.debug("GSO iteration summary marker skipped", exc_info=True)
 
-        # Phase H content population — every iteration that reaches end-of-body
-        # MUST appear in the operator transcript, even when no decision records
-        # were produced (those iterations still rendered the per-stage "no
-        # decisions emitted" placeholder via PROCESS_STAGE_ORDER). Without this
-        # block the transcript only renders the run-overview header.
+        # Phase H iteration content completeness — finalise the iteration
+        # with rich data and ``exit_path=completed``. Every iteration-body
+        # ``continue`` / ``break`` must call ``_finalize_iteration_summary``
+        # with the appropriate ``exit_path`` label BEFORE the exit, so this
+        # path only fires when the iteration finishes cleanly.
         try:
-            from genie_space_optimizer.optimization.rca_decision_trace import (
-                DecisionRecord as _PhaseH_DecisionRecord,
-                OptimizationTrace as _PhaseH_OptimizationTrace,
-            )
-
-            _phase_h_records_raw = list(
-                _current_iter_inputs.get("decision_records") or []
-            )
-            _phase_h_records: list[Any] = []
-            for _r in _phase_h_records_raw:
-                try:
-                    _phase_h_records.append(
-                        _PhaseH_DecisionRecord.from_dict(_r)
-                    )
-                except Exception:
-                    continue
-            _iter_traces[iteration_counter] = _PhaseH_OptimizationTrace(
-                journey_events=tuple(_journey_events or ()),
-                decision_records=tuple(_phase_h_records),
-            )
             _iter_acc_pct: float | None
             try:
                 _iter_acc_pct = (
@@ -21361,22 +21341,23 @@ def _run_lever_loop(
                 )
             except Exception:
                 _iter_acc_pct = None
-            _iter_summaries[iteration_counter] = _build_iteration_summary_dict(
+            _finalize_iteration_summary(
+                iter_traces=_iter_traces,
+                iter_summaries=_iter_summaries,
                 iteration=int(iteration_counter),
+                current_iter_inputs=_current_iter_inputs,
+                journey_events=_journey_events,
+                journey_report=_journey_report,
                 accepted_count=int(_accepted_count or 0),
                 rolled_back_count=int(_rolled_back_count or 0),
                 skipped_count=int(_skipped_count or 0),
                 gate_drop_count=int(_gate_drop_count or 0),
-                decision_record_count=len(_phase_h_records),
-                journey_violation_count=(
-                    0 if _journey_report is None
-                    else len(_journey_report.violations)
-                ),
                 iteration_accuracy_percent=_iter_acc_pct,
+                exit_path="completed",
             )
         except Exception:
             logger.debug(
-                "Phase H content population skipped (non-fatal)",
+                "Phase H iteration finalise skipped (non-fatal)",
                 exc_info=True,
             )
 
