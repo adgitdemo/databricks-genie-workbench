@@ -339,6 +339,31 @@ def _stamp_iteration_stub(
     )
 
 
+def _compute_iteration_counters(
+    current_iter_inputs: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    """Compute (accepted, rolled_back, skipped, gate_drop) counts from
+    the iteration's accumulated ``ag_outcomes`` map.
+
+    Used by ``_finalize_iteration_summary`` callers at every iteration-body
+    exit so the counters reflect the actual outcomes recorded so far —
+    even at early exits, where the end-of-body counter computation has
+    not yet run.
+    """
+    outcomes = (current_iter_inputs.get("ag_outcomes") or {}) if isinstance(
+        current_iter_inputs, dict
+    ) else {}
+    accepted = sum(1 for v in outcomes.values() if str(v).startswith("accepted"))
+    rolled_back = sum(1 for v in outcomes.values() if str(v) == "rolled_back")
+    skipped = sum(
+        1 for v in outcomes.values() if str(v).startswith("skipped")
+    )
+    gate_drop = sum(
+        1 for v in outcomes.values() if str(v).startswith("gate_drop")
+    )
+    return (accepted, rolled_back, skipped, gate_drop)
+
+
 def _finalize_iteration_summary(
     *,
     iter_traces: dict[int, Any],
@@ -14607,6 +14632,29 @@ def _run_lever_loop(
         clusters = _filter_tried_clusters(clusters, tried_root_causes)
         if not clusters and not soft_signal_clusters:
             logger.info("No actionable clusters remain — stopping at iteration %d", _iter_num)
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="no_actionable_clusters",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=no_actionable_clusters skipped (non-fatal)",
+                    exc_info=True,
+                )
             break
 
         # Track H — quarantine attribution audit. The strategist must
@@ -15749,6 +15797,29 @@ def _run_lever_loop(
                 _section("Strategy produced 0 action groups — nothing to do", "-") + "\n"
                 + _bar("-")
             )
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="strategy_zero_ags",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=strategy_zero_ags skipped (non-fatal)",
+                    exc_info=True,
+                )
             break
 
         ag_id = ag.get("id", f"AG{iteration_counter}")
@@ -15887,6 +15958,29 @@ def _run_lever_loop(
                 **_ag_identity_kwargs,
             ))
             _render_current_journey()
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="ag_identity_skip",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=ag_identity_skip skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         _ag_cluster_info["rationale"] = ag.get("rationale", strategy.get("rationale", "") if strategy else "")
@@ -17119,6 +17213,29 @@ def _run_lever_loop(
                 **_ag_identity_kwargs,
             ))
             _render_current_journey()
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="proposals_empty",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=proposals_empty skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         # Task 6A — RCA/patch-type compatibility gate. Drop proposals
@@ -18035,6 +18152,29 @@ def _run_lever_loop(
                 **_ag_identity_kwargs,
             ))
             _render_current_journey()
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="post_grounding_skip",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=post_grounding_skip skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         # Task 2 — Blast-radius gate. The counterfactual scan above stamps
@@ -18918,6 +19058,29 @@ def _run_lever_loop(
             pending_action_groups = _survivors
             if not pending_action_groups:
                 pending_strategy = None
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="no_pending_ags_first_pass",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=no_pending_ags_first_pass skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         # T3.3: shadow apply. When enabled, the intent is to clone the
@@ -18999,6 +19162,29 @@ def _run_lever_loop(
             pending_action_groups = _survivors
             if not pending_action_groups:
                 pending_strategy = None
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="no_pending_ags_second_pass",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=no_pending_ags_second_pass skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         metadata_snapshot = _pre_ag_snapshot_capture["snapshot"]
@@ -19331,6 +19517,29 @@ def _run_lever_loop(
                 )
             _phase_b_emit_ag_outcome_record(ag, "skipped_no_applied_patches")
             _render_current_journey()
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="skipped_no_applied_patches",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=skipped_no_applied_patches skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         _fallback_lever = int(lever_keys[0]) if lever_keys else 0
@@ -19612,6 +19821,29 @@ def _run_lever_loop(
                     )
                     break
             _render_current_journey()
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="applier_failed",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=applier_failed skipped (non-fatal)",
+                    exc_info=True,
+                )
             continue
 
         # ── Applied Patches Detail ───────────────────────────────────
@@ -20348,6 +20580,29 @@ def _run_lever_loop(
                 logger.info(
                     "No CONTENT_REGRESSION rollbacks yet — keeping cluster "
                     "available for retry (root causes NOT marked as tried)",
+                )
+            try:
+                _phase_h_a, _phase_h_r, _phase_h_s, _phase_h_g = (
+                    _compute_iteration_counters(_current_iter_inputs)
+                )
+                _finalize_iteration_summary(
+                    iter_traces=_iter_traces,
+                    iter_summaries=_iter_summaries,
+                    iteration=int(iteration_counter),
+                    current_iter_inputs=_current_iter_inputs,
+                    journey_events=_journey_events if "_journey_events" in dir() else [],
+                    journey_report=_journey_report if "_journey_report" in dir() else None,
+                    accepted_count=_phase_h_a,
+                    rolled_back_count=_phase_h_r,
+                    skipped_count=_phase_h_s,
+                    gate_drop_count=_phase_h_g,
+                    iteration_accuracy_percent=None,
+                    exit_path="rolled_back",
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H finalise on exit_path=rolled_back skipped (non-fatal)",
+                    exc_info=True,
                 )
             continue
 
