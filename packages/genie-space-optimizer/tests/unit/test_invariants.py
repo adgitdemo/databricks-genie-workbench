@@ -121,3 +121,52 @@ def test_i2_green_when_levers_coherent() -> None:
         }],
     }
     assert check_i2_lever_coherence(evidence) == []
+
+
+def test_i3_red_when_buckets_do_not_partition_target_qids() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i3_acceptance_buckets
+
+    evidence = {"iterations": [{
+        "iteration": 1,
+        "acceptance_decision": {
+            "target_qids": ["q_026"],
+            "target_fixed_qids": [],
+            "target_still_hard_qids": [],
+            "reason_code": "target_qids_not_improved",
+        },
+    }]}
+    violations = check_i3_acceptance_buckets(evidence)
+    assert any(v["invariant_id"] == "I3" for v in violations), violations
+
+
+def test_i3_green_when_buckets_partition_and_reason_names_bucket() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i3_acceptance_buckets
+
+    evidence = {"iterations": [{
+        "iteration": 1,
+        "acceptance_decision": {
+            "target_qids": ["q_026"],
+            "target_fixed_qids": [],
+            "target_still_hard_qids": ["q_026"],
+            "reason_code": "target_still_hard_qids",
+        },
+    }]}
+    assert check_i3_acceptance_buckets(evidence) == []
+
+
+def test_i3_red_when_qid_in_two_buckets() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i3_acceptance_buckets
+
+    evidence = {"iterations": [{
+        "iteration": 1,
+        "acceptance_decision": {
+            "target_qids": ["q_026"],
+            "target_fixed_qids": ["q_026"],
+            "target_still_hard_qids": ["q_026"],
+            "reason_code": "target_fixed_qids",
+        },
+    }]}
+    assert any(
+        v["invariant_id"] == "I3" and "double_counted" in v["title"]
+        for v in check_i3_acceptance_buckets(evidence)
+    )

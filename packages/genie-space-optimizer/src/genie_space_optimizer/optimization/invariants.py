@@ -149,7 +149,69 @@ def check_i2_lever_coherence(evidence: Mapping[str, Any]) -> list[dict]:
     return violations
 
 
-# Stubs for I3..I8 — populated in subsequent tasks. The aggregator
+_TARGET_BUCKET_KEYS = (
+    "target_fixed_qids",
+    "target_still_hard_qids",
+    "target_hard_to_soft_qids",
+    "target_hard_to_pass_with_judge_debt_qids",
+    "target_all_judge_fixed_qids",
+    "target_unchanged_qids",
+)
+
+
+def check_i3_acceptance_buckets(evidence: Mapping[str, Any]) -> list[dict]:
+    """I3 — target-state buckets partition target_qids; rollback
+    reason names a bucket. Closes 7NOW (target_fixed=(), still_hard=(),
+    reason=target_qids_not_improved) inconsistency."""
+    violations: list[dict] = []
+    for it in evidence.get("iterations") or []:
+        ad = dict(it.get("acceptance_decision") or {})
+        if not ad:
+            continue
+        target_qids = {str(q) for q in (ad.get("target_qids") or []) if str(q)}
+        if not target_qids:
+            continue
+        bucket_qids: dict[str, set[str]] = {}
+        union: set[str] = set()
+        seen_twice: set[str] = set()
+        for key in _TARGET_BUCKET_KEYS:
+            qids = {str(q) for q in (ad.get(key) or []) if str(q)}
+            seen_twice.update(qids & union)
+            union |= qids
+            bucket_qids[key] = qids
+        missing = target_qids - union
+        if missing:
+            violations.append(_violation(
+                invariant_id="I3",
+                title="target_qids_missing_from_all_buckets",
+                detail=(
+                    f"target_qids={sorted(target_qids)} not covered by any "
+                    f"bucket; missing={sorted(missing)}"
+                ),
+                iteration=int(it.get("iteration") or 0),
+                missing_qids=sorted(missing),
+            ))
+        if seen_twice:
+            violations.append(_violation(
+                invariant_id="I3",
+                title="target_qids_double_counted_in_buckets",
+                detail=f"qids in two buckets: {sorted(seen_twice)}",
+                iteration=int(it.get("iteration") or 0),
+                double_counted=sorted(seen_twice),
+            ))
+        reason = str(ad.get("reason_code") or "")
+        if reason and reason not in _TARGET_BUCKET_KEYS:
+            violations.append(_violation(
+                invariant_id="I3",
+                title="rollback_reason_does_not_name_a_bucket",
+                detail=f"reason_code={reason!r} is not one of {_TARGET_BUCKET_KEYS}",
+                iteration=int(it.get("iteration") or 0),
+                reason_code=reason,
+            ))
+    return violations
+
+
+# Stubs for I4..I8 — populated in subsequent tasks. The aggregator
 # tolerates missing checks so each can land in its own commit.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
@@ -159,6 +221,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
     for check in (
         check_i1_phase_b_records_present,
         check_i2_lever_coherence,
+        check_i3_acceptance_buckets,
     ):
         try:
             violations.extend(check(evidence))
