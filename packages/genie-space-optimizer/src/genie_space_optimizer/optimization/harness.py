@@ -13721,7 +13721,30 @@ def _run_lever_loop(
                 # harness's existing reflection-buffer / do-not-retry
                 # update path is unchanged and remains the canonical
                 # mutation point.
-            except Exception:
+            except Exception as _learning_stage_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="ag_retired",
+                            ag_id=str((ag or {}).get("id") or ""),
+                            exception=_learning_stage_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase F+H A6: producer_exception_record emission failed",
+                        exc_info=True,
+                    )
                 _iter_producer_exceptions.setdefault("ag_retired", 0)
                 _iter_producer_exceptions["ag_retired"] += 1
                 _phase_b_producer_exceptions["ag_retired"] = (
@@ -14192,7 +14215,30 @@ def _run_lever_loop(
                     _current_iter_inputs.setdefault(
                         "decision_records", []
                     ).append(_ag_rec.to_dict())
-            except Exception:
+            except Exception as _ag_outcome_exc:
+                try:
+                    from genie_space_optimizer.common.config import (
+                        phase_b_producer_typed_exceptions_enabled as _typed_on,
+                    )
+                    if _typed_on():
+                        from genie_space_optimizer.optimization.decision_emitters import (
+                            producer_exception_record as _producer_exception_record,
+                        )
+                        _pe_rec = _producer_exception_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            producer="ag_outcome",
+                            ag_id=str((_ag_obj or {}).get("id") or ""),
+                            exception=_ag_outcome_exc,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_pe_rec.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Phase B: producer_exception_record emission failed",
+                        exc_info=True,
+                    )
                 _iter_producer_exceptions["ag_outcome"] += 1
                 _phase_b_producer_exceptions["ag_outcome"] = (
                     _phase_b_producer_exceptions.get("ag_outcome", 0) + 1
@@ -20138,7 +20184,30 @@ def _run_lever_loop(
                 stage_key="acceptance_decision",
             )
             _ag_outcome = _accept_wrapped(_stage_ctx_a5, _accept_inp)
-        except Exception:
+        except Exception as _accept_stage_exc:
+            try:
+                from genie_space_optimizer.common.config import (
+                    phase_b_producer_typed_exceptions_enabled as _typed_on,
+                )
+                if _typed_on():
+                    from genie_space_optimizer.optimization.decision_emitters import (
+                        producer_exception_record as _producer_exception_record,
+                    )
+                    _pe_rec = _producer_exception_record(
+                        run_id=run_id,
+                        iteration=iteration_counter,
+                        producer="ag_outcome",
+                        ag_id=str((ag or {}).get("id") or ""),
+                        exception=_accept_stage_exc,
+                    )
+                    _current_iter_inputs.setdefault(
+                        "decision_records", []
+                    ).append(_pe_rec.to_dict())
+            except Exception:
+                logger.debug(
+                    "Phase F+H A5: producer_exception_record emission failed",
+                    exc_info=True,
+                )
             _iter_producer_exceptions["ag_outcome"] = (
                 _iter_producer_exceptions.get("ag_outcome", 0) + 1
             )
