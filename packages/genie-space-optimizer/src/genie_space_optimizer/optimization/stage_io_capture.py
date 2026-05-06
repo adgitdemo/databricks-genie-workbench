@@ -250,8 +250,18 @@ def wrap_with_io_capture(
             original_emit(record)
 
         ctx.decision_emit = _capturing_emit
+        # Phase H Task 9 — flush captured_decisions to MLflow even when
+        # ``execute`` raises so stage-09 (acceptance) fails loudly with
+        # an audit trail. ``out`` is None in the raise path; the
+        # downstream output.json log records that explicitly so a
+        # postmortem can distinguish "stage ran and returned nothing"
+        # from "stage raised before producing output".
+        out: Any = None
+        execute_exc: BaseException | None = None
         try:
             out = execute(ctx, inp)
+        except BaseException as exc:  # noqa: BLE001 — propagate after flush
+            execute_exc = exc
         finally:
             ctx.decision_emit = original_emit
 
@@ -259,7 +269,22 @@ def wrap_with_io_capture(
             try:
                 _log_text(
                     run_id=str(anchor),
-                    text=_serialize_io(out),
+                    text=_serialize_io(
+                        {
+                            "ok": execute_exc is None,
+                            "exception_type": (
+                                type(execute_exc).__name__
+                                if execute_exc is not None else None
+                            ),
+                            "exception_repr": (
+                                repr(execute_exc)[:512]
+                                if execute_exc is not None else None
+                            ),
+                            "out": out,
+                        }
+                        if execute_exc is not None
+                        else out
+                    ),
                     artifact_file=paths["output"],
                 )
             except Exception as exc:
@@ -289,5 +314,7 @@ def wrap_with_io_capture(
                     error_class=type(exc).__name__,
                 )
 
+        if execute_exc is not None:
+            raise execute_exc
         return out
     return wrapper
