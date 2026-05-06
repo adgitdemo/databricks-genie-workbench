@@ -139,3 +139,38 @@ def test_iteration_summary_dict_is_sorted_friendly() -> None:
         # any value that raises during str() would crash the
         # transcript.
         str(v)
+
+
+def test_iteration_summary_includes_exit_path_when_supplied() -> None:
+    """``exit_path`` is the canonical iteration-outcome field. The renderer
+    iterates ``sorted(iteration_summary.items())`` so any string returned
+    here surfaces in the operator transcript as ``- exit_path: <value>``."""
+    summary = _build_iteration_summary_dict(
+        iteration=2,
+        accepted_count=0,
+        rolled_back_count=1,
+        skipped_count=0,
+        gate_drop_count=0,
+        decision_record_count=12,
+        journey_violation_count=0,
+        iteration_accuracy_percent=91.7,
+        exit_path="rolled_back",
+    )
+    assert summary["exit_path"] == "rolled_back"
+
+
+def test_iteration_summary_omits_exit_path_when_none() -> None:
+    """``exit_path=None`` keeps the dict shape backward compatible with
+    callers that have not been migrated yet."""
+    summary = _build_iteration_summary_dict(
+        iteration=1,
+        accepted_count=1,
+        rolled_back_count=0,
+        skipped_count=0,
+        gate_drop_count=0,
+        decision_record_count=4,
+        journey_violation_count=0,
+        iteration_accuracy_percent=88.0,
+        exit_path=None,
+    )
+    assert "exit_path" not in summary

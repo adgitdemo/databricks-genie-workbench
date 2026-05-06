@@ -264,6 +264,7 @@ def _build_iteration_summary_dict(
     decision_record_count: int,
     journey_violation_count: int,
     iteration_accuracy_percent: float | None = None,
+    exit_path: str | None = None,
 ) -> dict[str, Any]:
     """Build the per-iteration summary dict for the operator transcript.
 
@@ -272,6 +273,15 @@ def _build_iteration_summary_dict(
     only. ``iteration_accuracy`` is rendered as a percent string when
     known and omitted when ``None`` so the transcript does not show a
     misleading 0.0% for iterations whose post-eval is unavailable.
+
+    ``exit_path`` is the canonical iteration-outcome label
+    (``completed``, ``rolled_back``, ``post_grounding_skip``,
+    ``applier_failed``, ``no_actionable_clusters``,
+    ``strategy_zero_ags``, ``ag_identity_skip``, ``proposals_empty``,
+    ``no_pending_ags_first_pass``, ``no_pending_ags_second_pass``,
+    ``skipped_no_applied_patches``, or ``in_progress`` for the
+    pre-stamp stub). Omitted when ``None`` to keep replay-snapshot
+    diffs minimal for callers that have not been migrated.
     """
     out: dict[str, Any] = {
         "iteration": int(iteration),
@@ -287,6 +297,8 @@ def _build_iteration_summary_dict(
             out["iteration_accuracy"] = f"{float(iteration_accuracy_percent):.1f}%"
         except (TypeError, ValueError):
             pass
+    if exit_path is not None:
+        out["exit_path"] = str(exit_path)
     return out
 
 
