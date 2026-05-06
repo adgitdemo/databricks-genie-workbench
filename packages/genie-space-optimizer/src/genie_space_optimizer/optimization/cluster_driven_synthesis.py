@@ -1158,6 +1158,44 @@ def add_qid_scope_to_predicate(
     return f"({base}) AND ({qid_column} IN ({quoted}))"
 
 
+def _narrow_expression_via_qid_case(
+    *,
+    original_patch: dict,
+    ag_target_qids: tuple[str, ...],
+) -> dict | None:
+    """P0 Branch A: wrap an L6 expression / measure SQL in a
+    question-scoped CASE so it only contributes to the named QIDs.
+
+    Returns ``None`` when the original patch has no ``sql_expression``
+    or no target QIDs. Pure: no I/O.
+    """
+    qids = tuple(str(q) for q in (ag_target_qids or ()) if str(q))
+    if not qids:
+        return None
+    expr = str((original_patch or {}).get("sql_expression") or "").strip()
+    if not expr:
+        return None
+    qid_column = str(
+        (original_patch or {}).get("qid_predicate_column") or "query_id"
+    )
+    qid_list = ", ".join(f"'{q}'" for q in qids)
+    narrowed_expr = (
+        f"CASE WHEN {qid_column} IN ({qid_list}) THEN ({expr}) ELSE NULL END"
+    )
+    if narrowed_expr == expr:
+        return None
+    proposal_id = str((original_patch or {}).get("proposal_id") or "")
+    return {
+        **original_patch,
+        "proposal_id": (
+            f"{proposal_id}_narrow" if proposal_id else "L6:NARROW"
+        ),
+        "sql_expression": narrowed_expr,
+        "narrowing_strategy": "expression_qid_scope",
+        "narrowing_target_qids": list(qids),
+    }
+
+
 # Cycle 10 W4 — patch-type-aware partition. Filter narrows via
 # ``where_predicate``; measure / expression lack a predicate and need
 # an L5 example_sql fallback instead.
@@ -1185,6 +1223,23 @@ def narrow_replacement_diagnosis(
     ptype = str((original_patch or {}).get("patch_type") or "")
     qids = tuple(str(q) for q in (ag_target_qids or ()) if str(q))
     if ptype in _MEASURE_OR_EXPR_PATCH_TYPES:
+        # P0: when the expression-narrowing flag is on AND the patch
+        # carries a non-empty sql_expression AND target qids are
+        # supplied, the synthesizer can emit a CASE-wrapped narrow
+        # variant. Otherwise preserve the legacy decline.
+        from genie_space_optimizer.common.config import (
+            l6_narrow_replacement_for_expression_enabled,
+        )
+        if (
+            l6_narrow_replacement_for_expression_enabled()
+            and qids
+            and str((original_patch or {}).get("sql_expression") or "").strip()
+        ):
+            return {
+                "applicable": True,
+                "reason": "expression_qid_scope",
+                "original_patch_type": ptype,
+            }
         return {
             "applicable": False,
             "reason": "patch_type_lacks_where_predicate",
@@ -1256,6 +1311,11 @@ def build_narrow_l6_replacement(
         )
         if not diag["applicable"]:
             return None
+        if diag["reason"] == "expression_qid_scope":
+            return _narrow_expression_via_qid_case(
+                original_patch=original_patch,
+                ag_target_qids=ag_target_qids,
+            )
     else:
         # Legacy path: only proceed for known L6 types with a
         # where_predicate present.
@@ -1286,5 +1346,7 @@ def build_narrow_l6_replacement(
         "derived_from": str(original_patch.get("proposal_id") or ""),
         "narrow_replacement_reason": "high_collateral_risk_flagged",
         "narrow_target_qids": qids,
+        "narrowing_strategy": "filter_qid_scope",
+        "narrowing_target_qids": list(qids),
         "_cycle_9_narrow_replacement": True,
     }
