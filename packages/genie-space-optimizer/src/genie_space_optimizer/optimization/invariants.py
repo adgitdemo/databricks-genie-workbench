@@ -267,7 +267,28 @@ def check_i4_no_silent_retry(evidence: Mapping[str, Any]) -> list[dict]:
     return violations
 
 
-# Stubs for I5..I8 — populated in subsequent tasks. The aggregator
+def check_i5_replay_validity(evidence: Mapping[str, Any]) -> list[dict]:
+    """I5 — committed replay fixture for this run validates with zero
+    illegal trunk transitions. Closes airline (4 illegal) and 7NOW
+    (25 illegal)."""
+    rv = dict(evidence.get("replay_validation") or {})
+    if not rv:
+        return []
+    if bool(rv.get("is_valid")):
+        return []
+    return [_violation(
+        invariant_id="I5",
+        title="replay_fixture_invalid",
+        detail=(
+            f"replay reports {int(rv.get('violation_count') or 0)} illegal "
+            f"trunk transitions: {dict(rv.get('violation_details') or {})}"
+        ),
+        violation_count=int(rv.get("violation_count") or 0),
+        violation_details=dict(rv.get("violation_details") or {}),
+    )]
+
+
+# Stubs for I6..I8 — populated in subsequent tasks. The aggregator
 # tolerates missing checks so each can land in its own commit.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
@@ -279,6 +300,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
         check_i2_lever_coherence,
         check_i3_acceptance_buckets,
         check_i4_no_silent_retry,
+        check_i5_replay_validity,
     ):
         try:
             violations.extend(check(evidence))

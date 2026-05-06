@@ -215,3 +215,29 @@ def test_i4_green_when_ag_rotates() -> None:
         {"iteration": 2, "selected_ag_id": "AG_H001", "proposal_count": 3},
     ]}
     assert check_i4_no_silent_retry(evidence) == []
+
+
+def test_i5_red_on_illegal_trunk_transitions() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i5_replay_validity
+
+    evidence = {
+        "replay_validation": {
+            "is_valid": False,
+            "violation_count": 4,
+            "violation_details": {"trunk: clustered -> already_passing": 4},
+        },
+    }
+    violations = check_i5_replay_validity(evidence)
+    assert any(v["invariant_id"] == "I5" for v in violations)
+    assert violations[0]["violation_count"] == 4
+
+
+def test_i5_green_when_replay_is_valid() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i5_replay_validity
+
+    evidence = {
+        "replay_validation": {
+            "is_valid": True, "violation_count": 0, "violation_details": {},
+        },
+    }
+    assert check_i5_replay_validity(evidence) == []
