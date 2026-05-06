@@ -690,3 +690,37 @@ C-7-C (seed): Clusterer / RCA root-cause flips for the same QID across iteration
 **Corpus delta:** corpus run on the airline space deferred — to be launched from a Databricks workspace post-deploy and documented in a follow-up postmortem under `runid_analysis/<post-cycle-10-run-id>/`.
 
 **Status:** SHIPPED.
+
+
+## Phase H — Iteration Content Completeness (2026-05-05)
+
+**Anchor run:** [`1099b152-8655-4f1e-ab43-1240a9400280`](./runid_analysis/1099b152-8655-4f1e-ab43-1240a9400280/postmortem.md)
+
+**Plan:** [`2026-05-05-phase-h-iteration-content-completeness-plan.md`](./2026-05-05-phase-h-iteration-content-completeness-plan.md)
+
+**Defects fixed:**
+
+- D1 — Iterations missing from operator transcript. Run 1099b152's transcript was 567 bytes (header only) because both rolled-back iterations exited at the content-regression `continue` before the end-of-body content-population block ran. Tasks T1-T7.
+- D2 — Stages 01 / 03 / 06 / 07 not captured to MLflow. Four `_StageCtx` initialisations hard-coded `mlflow_anchor_run_id=None`, so `wrap_with_io_capture` short-circuited. Task T8.
+- D3 — Stage 09 (acceptance) captured input but not output / decisions. `wrap_with_io_capture` skipped output / decisions writes when the wrapped stage raised. Task T9.
+
+**Iteration outcome (`exit_path`)**
+
+`_build_iteration_summary_dict` now exposes a canonical iteration-outcome label as `exit_path`. Values:
+
+- `completed` — iteration ran end-of-body cleanly.
+- `rolled_back` — content-regression rollback (the run-1099b152 path).
+- `applier_failed` — applier raised on at least one patch.
+- `post_grounding_skip` — RCA grounding gate dropped every patch.
+- `proposals_empty` — strategist returned zero proposals for the AG.
+- `ag_identity_skip` — AG collided with the do-not-retry forbidden set.
+- `no_pending_ags_first_pass` — AG was dead-on-arrival; survivors empty.
+- `no_pending_ags_second_pass` — pre-AG snapshot failed; survivors empty.
+- `skipped_no_applied_patches` — all patches dropped at blast-radius gate.
+- `no_actionable_clusters` — no hard / soft clusters remain.
+- `strategy_zero_ags` — strategist returned zero AGs.
+- `in_progress` — pre-stamp stub (set by `_stamp_iteration_stub` immediately after `iteration_counter += 1`); only visible if a future code path skips both `_finalize_iteration_summary` and the end-of-body finalise.
+
+The renderer surfaces it as `- exit_path: <value>` in the iteration's summary block.
+
+**Status:** SHIPPED.
