@@ -48,6 +48,10 @@ class DecisionType(str, Enum):
     # so the Phase B trace carries the exception class, repr, and traceback
     # head. Closes the airline / 7NOW silent-mute defect.
     PRODUCER_EXCEPTION = "producer_exception"
+    # Cycle 11 — emitted when an invariant violation occurs at end-of-iteration
+    # or end-of-run. The harness logs these typed records when running in
+    # warn-and-degrade mode (GSO_LOOP_INVARIANTS_STRICT=0); strict mode raises.
+    INVARIANT_VIOLATION = "invariant_violation"
 
 
 class DecisionOutcome(str, Enum):
@@ -148,6 +152,8 @@ class ReasonCode(str, Enum):
     AG_LEVERS_UNIONED = "ag_levers_unioned"
     # Cycle 11 — paired with DecisionType.PRODUCER_EXCEPTION.
     PRODUCER_EXCEPTION = "producer_exception"
+    # Cycle 11 — paired with DecisionType.INVARIANT_VIOLATION.
+    INVARIANT_VIOLATION = "invariant_violation"
 
 
 class RejectReason(str, Enum):
@@ -583,6 +589,11 @@ TYPE_TO_SECTION: Mapping[DecisionType, str] = {
     # operator.  SECTION_NEXT_ACTION only renders next_actions[0] and the
     # helper sets no next_action, so the exception details would be invisible.
     DecisionType.PRODUCER_EXCEPTION: SECTION_HARD_FAILURES,
+    # Cycle 11 — INVARIANT_VIOLATION is also an infrastructure hard failure
+    # (an invariant check fired). Same rationale as PRODUCER_EXCEPTION: the
+    # violation detail must be visible to the operator, so route to
+    # SECTION_HARD_FAILURES where _format_record_line renders reason_detail.
+    DecisionType.INVARIANT_VIOLATION: SECTION_HARD_FAILURES,
 }
 
 

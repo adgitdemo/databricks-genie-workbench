@@ -5652,3 +5652,19 @@ def phase_h_manifest_strict_validation_enabled() -> bool:
     Default-on; rollback via ``GSO_PHASE_H_MANIFEST_STRICT_VALIDATION=0``.
     """
     return _flag_default_on("GSO_PHASE_H_MANIFEST_STRICT_VALIDATION")
+
+
+def loop_invariants_enabled() -> bool:
+    """Cycle 11 — run the invariant suite at end-of-iteration and
+    end-of-run. Default-on; rollback via ``GSO_LOOP_INVARIANTS_ENABLED=0``.
+    """
+    return _flag_default_on("GSO_LOOP_INVARIANTS_ENABLED")
+
+
+def loop_invariants_strict() -> bool:
+    """Cycle 11 — when on, an invariant violation is fatal (assert).
+    When off, the violation is recorded as an ``INVARIANT_VIOLATION``
+    decision record and the run continues. Default-on (CI / replay);
+    production rollback via ``GSO_LOOP_INVARIANTS_STRICT=0``.
+    """
+    return _flag_default_on("GSO_LOOP_INVARIANTS_STRICT")

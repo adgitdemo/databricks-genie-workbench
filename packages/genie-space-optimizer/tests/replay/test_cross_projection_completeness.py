@@ -218,6 +218,22 @@ def _build_full_iteration_fixture() -> dict:
                             "traceback_head": "",
                         },
                     },
+                    {
+                        # Cycle 11: INVARIANT_VIOLATION — typed record emitted
+                        # when an invariant check fires in warn-and-degrade mode.
+                        # Added to the fixture to satisfy the exhaustiveness check
+                        # in test_replay_decision_records_cover_every_decision_type.
+                        "run_id": "run_synth", "iteration": 1,
+                        "decision_type": "invariant_violation",
+                        "outcome": "failed",
+                        "reason_code": "invariant_violation",
+                        "evidence_refs": ["invariant:I1"],
+                        "reason_detail": "I1: phase_b.total_records below replay_fixture.records",
+                        "metrics": {
+                            "invariant_id": "I1",
+                            "title": "phase_b.total_records below replay_fixture.records",
+                        },
+                    },
                 ],
             }
         ],

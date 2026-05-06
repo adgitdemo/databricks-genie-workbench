@@ -1277,6 +1277,34 @@ def producer_exception_record(
     )
 
 
+def invariant_violation_record(
+    *,
+    run_id: str,
+    iteration: int,
+    violation: Mapping[str, Any],
+) -> DecisionRecord:
+    """Cycle 11 — wrap a single invariant violation dict in a
+    ``DecisionRecord``. The dict shape is whatever ``invariants.py``
+    produced; the relevant fields are ``invariant_id``, ``title``,
+    and ``detail``.
+    """
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.INVARIANT_VIOLATION,
+        outcome=DecisionOutcome.FAILED,
+        reason_code=ReasonCode.INVARIANT_VIOLATION,
+        reason_detail=str(violation.get("detail") or ""),
+        evidence_refs=(f"invariant:{violation.get('invariant_id', '')}",),
+        metrics={
+            "invariant_id": str(violation.get("invariant_id") or ""),
+            "title": str(violation.get("title") or ""),
+            **{k: v for k, v in violation.items()
+               if k not in {"invariant_id", "title", "detail"}},
+        },
+    )
+
+
 def classify_no_records_reason(
     *,
     iteration_inputs: Mapping[str, Any],
