@@ -466,3 +466,65 @@ def test_no_baseline_rows_for_control_plane_nameerror_in_committed_fixtures(
                 f"harness.py:_run_lever_loop rollback-side "
                 f"AcceptanceInput fix has regressed. Record: {rec}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Pre-step Cycle 11 invariant projection — regression fixture
+# ---------------------------------------------------------------------------
+
+_FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture
+def invariants_evidence_for_fixture():
+    from genie_space_optimizer.optimization.invariant_projection import (
+        project_iter_evidence,
+    )
+
+    def _build(fixture_name: str) -> dict:
+        path = _FIXTURES_DIR / f"{fixture_name}.json"
+        data = json.loads(path.read_text())
+        prior: dict | None = None
+        latest_evidence: dict = {}
+        for it in (data.get("iterations") or []):
+            latest_evidence = project_iter_evidence(
+                current_iter_inputs=it,
+                iteration=int(it.get("iteration") or 0),
+                run_id=str(data.get("run_id") or "fixture_run"),
+                iter_producer_exceptions=None,
+                prior_iter_evidence=prior,
+            )
+            prior = latest_evidence
+        return latest_evidence
+
+    return _build
+
+
+_INVARIANTS_MUST_FIRE_FIXTURES: frozenset[str] = frozenset({
+    "run_809960554692716_3b050ec5_pre_invariant_projection_fix",
+})
+
+
+def test_invariants_fire_on_run_809960554692716_pre_projection_fixture(
+    invariants_evidence_for_fixture,
+) -> None:
+    """The latest 3b050ec5 attempt produced 0 invariant violations even
+    though F2/F3/F5/F6 in the postmortem are textbook fires for
+    I3/I4/I7/I8. After the projector lands the same fixture must
+    surface at least one violation across I3 and I7.
+
+    Closes the Pre-step contract: post-fix, zero violations on a
+    rolled-back-with-still-hard-target run is itself a regression.
+    """
+    from genie_space_optimizer.optimization.invariants import run_invariants
+
+    fixture_name = (
+        "run_809960554692716_3b050ec5_pre_invariant_projection_fix"
+    )
+    evidence = invariants_evidence_for_fixture(fixture_name)
+    violations = run_invariants(evidence)
+    by_id = {str(v.get("invariant_id")) for v in violations}
+    assert "I3" in by_id or "I7" in by_id, (
+        "Expected I3 (acceptance buckets) or I7 (RCA grounding) to "
+        f"fire on {fixture_name}; got {sorted(by_id)}"
+    )
