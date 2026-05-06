@@ -464,6 +464,7 @@ def _run_iteration_invariants_and_append_records(
     iteration: int,
     current_iter_inputs: dict[str, Any],
     iter_producer_exceptions: dict | None = None,
+    prior_iter_evidence: dict | None = None,
 ) -> None:
     """Cycle 11 Task 12 — run the invariant suite and append typed
     ``INVARIANT_VIOLATION`` decision records to
@@ -500,26 +501,29 @@ def _run_iteration_invariants_and_append_records(
         )
         if not _inv_enabled():
             return
-        from genie_space_optimizer.optimization.invariants import (
-            run_invariants as _run_invariants,
-        )
+        from genie_space_optimizer.optimization import invariants as _invariants_mod
         from genie_space_optimizer.optimization.decision_emitters import (
             invariant_violation_record as _invariant_violation_record,
         )
+        from genie_space_optimizer.optimization.invariant_projection import (
+            project_iter_evidence,
+        )
 
-        _iter_evidence = {
-            "phase_b": {
-                "total_records": len(
-                    current_iter_inputs.get("decision_records") or []
-                ),
-                "producer_exceptions": dict(iter_producer_exceptions or {}),
-            },
-            "replay_fixture_records": 0,
-            "iterations": [],
-            "manifest": {"declared_paths": [], "materialized_paths": []},
-            "convergence": {},
-        }
-        _violations = _run_invariants(_iter_evidence)
+        _iter_evidence = project_iter_evidence(
+            current_iter_inputs=current_iter_inputs,
+            iteration=iteration,
+            run_id=run_id,
+            iter_producer_exceptions=iter_producer_exceptions,
+            prior_iter_evidence=prior_iter_evidence,
+        )
+        # Pre-step Cycle 11: stash this iteration's projection in the
+        # caller's holder so the next finalize call can pass it as
+        # prior_iter_evidence (I4 needs prev+curr in one evidence dict).
+        if isinstance(current_iter_inputs, dict):
+            current_iter_inputs["_invariant_evidence_for_next_iter"] = (
+                _iter_evidence
+            )
+        _violations = _invariants_mod.run_invariants(_iter_evidence)
         if _violations and _inv_strict():
             raise AssertionError(
                 f"INVARIANT_VIOLATION (strict): {_violations}"
@@ -564,6 +568,7 @@ def _finalize_iteration_summary(
     exit_path: str,
     run_id: str = "",
     iter_producer_exceptions: dict | None = None,
+    prior_iter_evidence: dict | None = None,
 ) -> None:
     """Overwrite the iteration's pre-stamped stub with rich data.
 
@@ -586,6 +591,7 @@ def _finalize_iteration_summary(
         iteration=iteration,
         current_iter_inputs=current_iter_inputs,
         iter_producer_exceptions=iter_producer_exceptions,
+        prior_iter_evidence=prior_iter_evidence,
     )
 
     # Phase H Fidelity Task 4: emit one typed learning / next-action
@@ -13863,6 +13869,13 @@ def _run_lever_loop(
     _lever_loop_divergence_label: str | None = None
     _lever_loop_retired_ags: list[tuple[str, tuple[str, ...]]] = []
 
+    # Pre-step Cycle 11: thread per-iteration projected evidence
+    # forward so I4 (no silent retry) sees prev+curr in one
+    # evidence dict. Reset to None at loop start; the runner
+    # writes the latest projection via _last_iter_evidence_holder
+    # so the next finalize call can read it.
+    _last_iter_evidence_holder: dict = {"prev": None}
+
     for _iter_num in range(1, max_iterations + 1):
         try:
             # ── Exit checks ──────────────────────────────────────────────
@@ -15250,12 +15263,18 @@ def _run_lever_loop(
                         exit_path="no_actionable_clusters",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=no_actionable_clusters skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 break
 
             # Track H — quarantine attribution audit. The strategist must
@@ -16417,12 +16436,18 @@ def _run_lever_loop(
                         exit_path="strategy_zero_ags",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=strategy_zero_ags skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 break
 
             ag_id = ag.get("id", f"AG{iteration_counter}")
@@ -16580,12 +16605,18 @@ def _run_lever_loop(
                         exit_path="ag_identity_skip",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=ag_identity_skip skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             _ag_cluster_info["rationale"] = ag.get("rationale", strategy.get("rationale", "") if strategy else "")
@@ -17906,12 +17937,18 @@ def _run_lever_loop(
                         exit_path="proposals_empty",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=proposals_empty skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             # Task 6A — RCA/patch-type compatibility gate. Drop proposals
@@ -18946,12 +18983,18 @@ def _run_lever_loop(
                         exit_path="post_grounding_skip",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=post_grounding_skip skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             # Task 2 — Blast-radius gate. The counterfactual scan above stamps
@@ -19893,12 +19936,18 @@ def _run_lever_loop(
                         exit_path="no_pending_ags_first_pass",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=no_pending_ags_first_pass skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             # T3.3: shadow apply. When enabled, the intent is to clone the
@@ -19999,12 +20048,18 @@ def _run_lever_loop(
                         exit_path="no_pending_ags_second_pass",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=no_pending_ags_second_pass skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             metadata_snapshot = _pre_ag_snapshot_capture["snapshot"]
@@ -20379,12 +20434,18 @@ def _run_lever_loop(
                         exit_path="skipped_no_applied_patches",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=skipped_no_applied_patches skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             _fallback_lever = int(lever_keys[0]) if lever_keys else 0
@@ -20708,12 +20769,18 @@ def _run_lever_loop(
                         exit_path="applier_failed",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=applier_failed skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             # ── Applied Patches Detail ───────────────────────────────────
@@ -21519,12 +21586,18 @@ def _run_lever_loop(
                         exit_path="rolled_back",
                         run_id=run_id,
                         iter_producer_exceptions=_iter_producer_exceptions,
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
                     )
                 except Exception:
                     logger.debug(
                         "Phase H finalise on exit_path=rolled_back skipped (non-fatal)",
                         exc_info=True,
                     )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
+                )
                 continue
 
             # ── Accept action group ──────────────────────────────────────
@@ -22582,6 +22655,12 @@ def _run_lever_loop(
                     exit_path="completed",
                     run_id=run_id,
                     iter_producer_exceptions=_iter_producer_exceptions,
+                    prior_iter_evidence=_last_iter_evidence_holder["prev"],
+                )
+                _last_iter_evidence_holder["prev"] = (
+                    _current_iter_inputs.pop(
+                        "_invariant_evidence_for_next_iter", None
+                    )
                 )
             except Exception:
                 logger.debug(
@@ -22637,6 +22716,12 @@ def _run_lever_loop(
                         iter_producer_exceptions=locals().get(
                             "_iter_producer_exceptions"
                         ),
+                        prior_iter_evidence=_last_iter_evidence_holder["prev"],
+                    )
+                    _last_iter_evidence_holder["prev"] = (
+                        _f_cur.pop(
+                            "_invariant_evidence_for_next_iter", None
+                        )
                     )
                 except Exception:
                     logger.debug(
