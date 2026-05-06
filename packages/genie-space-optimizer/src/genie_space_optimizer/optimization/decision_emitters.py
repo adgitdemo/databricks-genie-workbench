@@ -1228,6 +1228,56 @@ def dead_on_arrival_decision_records(
     return records
 
 
+def producer_exception_record(
+    *,
+    run_id: str,
+    iteration: int,
+    producer: str,
+    ag_id: str | None,
+    exception: BaseException,
+) -> DecisionRecord:
+    """Cycle 11 — typed PRODUCER_EXCEPTION record for every harness
+    producer try/except site.
+
+    Today every producer try/except only increments
+    ``_iter_producer_exceptions[<producer>]`` and debug-logs. The
+    exception class, message, and traceback head are nowhere in the
+    Phase B trace, so postmortems see ``producer_exceptions={...}``
+    with no payload. This helper builds a typed ``DecisionRecord``
+    the harness appends to ``_current_iter_inputs["decision_records"]``
+    *before* the existing counter increment. The strict-mode re-raise
+    is unchanged.
+
+    Pure: no I/O, no clock, no logger.
+    """
+    import traceback as _traceback
+
+    repr_text = repr(exception)[:512]
+    try:
+        tb_lines = _traceback.format_exception(
+            type(exception), exception, exception.__traceback__,
+        )
+        tb_head = ("".join(tb_lines))[:2048]
+    except Exception:
+        tb_head = ""
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.PRODUCER_EXCEPTION,
+        outcome=DecisionOutcome.FAILED,
+        reason_code=ReasonCode.PRODUCER_EXCEPTION,
+        reason_detail=f"{type(exception).__name__}: {repr_text}",
+        ag_id=str(ag_id or ""),
+        evidence_refs=(f"producer:{producer}",),
+        metrics={
+            "producer": str(producer),
+            "exception_class": type(exception).__name__,
+            "exception_repr": repr_text,
+            "traceback_head": tb_head,
+        },
+    )
+
+
 def classify_no_records_reason(
     *,
     iteration_inputs: Mapping[str, Any],

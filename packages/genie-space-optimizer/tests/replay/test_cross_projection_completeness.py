@@ -199,6 +199,25 @@ def _build_full_iteration_fixture() -> dict:
                             "consumed": True,
                         },
                     },
+                    {
+                        # Cycle 11: PRODUCER_EXCEPTION — typed record emitted
+                        # when a harness producer try/except catches. Added to
+                        # the fixture to satisfy the exhaustiveness check in
+                        # test_replay_decision_records_cover_every_decision_type.
+                        "run_id": "run_synth", "iteration": 1,
+                        "decision_type": "producer_exception",
+                        "outcome": "failed",
+                        "reason_code": "producer_exception",
+                        "ag_id": "",
+                        "evidence_refs": ["producer:synthetic"],
+                        "reason_detail": "ValueError: synthetic fixture exception",
+                        "metrics": {
+                            "producer": "synthetic",
+                            "exception_class": "ValueError",
+                            "exception_repr": "ValueError('synthetic fixture exception')",
+                            "traceback_head": "",
+                        },
+                    },
                 ],
             }
         ],

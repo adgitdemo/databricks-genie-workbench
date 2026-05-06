@@ -44,6 +44,10 @@ class DecisionType(str, Enum):
     # Cycle 5 T1 — productive-iteration budget accounting; appears in
     # the Learning / Next Action section of the operator transcript.
     ITERATION_BUDGET_DECISION = "iteration_budget_decision"
+    # Cycle 11 — typed exception emitted at every producer try/except site
+    # so the Phase B trace carries the exception class, repr, and traceback
+    # head. Closes the airline / 7NOW silent-mute defect.
+    PRODUCER_EXCEPTION = "producer_exception"
 
 
 class DecisionOutcome(str, Enum):
@@ -56,6 +60,8 @@ class DecisionOutcome(str, Enum):
     RESOLVED = "resolved"
     UNRESOLVED = "unresolved"
     RETIRED = "retired"
+    # Cycle 11 — paired with PRODUCER_EXCEPTION / INVARIANT_VIOLATION.
+    FAILED = "failed"
 
 
 class ReasonCode(str, Enum):
@@ -140,6 +146,8 @@ class ReasonCode(str, Enum):
     # when ``union_ag_levers_with_recommended`` widened the AG's
     # lever set with cluster.recommended_levers entries.
     AG_LEVERS_UNIONED = "ag_levers_unioned"
+    # Cycle 11 — paired with DecisionType.PRODUCER_EXCEPTION.
+    PRODUCER_EXCEPTION = "producer_exception"
 
 
 class RejectReason(str, Enum):
@@ -568,6 +576,10 @@ TYPE_TO_SECTION: Mapping[DecisionType, str] = {
     # Cycle 5 T1: budget decisions answer "what did the loop do next?"
     # — they belong in the Next Suggested Action section.
     DecisionType.ITERATION_BUDGET_DECISION: SECTION_NEXT_ACTION,
+    # Cycle 11 — producer exceptions surface in Next Suggested Action so
+    # the operator sees them alongside budget accounting (both are
+    # harness-level signals that require follow-up action).
+    DecisionType.PRODUCER_EXCEPTION: SECTION_NEXT_ACTION,
 }
 
 
