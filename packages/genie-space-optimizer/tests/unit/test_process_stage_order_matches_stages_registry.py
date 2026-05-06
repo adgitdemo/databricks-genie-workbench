@@ -50,3 +50,60 @@ def test_transcript_only_keys_are_documented() -> None:
         f"transcript-only keys drift: actual={transcript_only}, "
         f"expected={_TRANSCRIPT_ONLY_KEYS}"
     )
+
+
+# ── Phase H Fidelity Task 6 — manifest stage-order contract ──────
+
+
+def test_manifest_stage_keys_in_process_order_uses_full_11_stage_contract() -> None:
+    """Run ``3b050ec5`` showed ``manifest.stage_keys_in_process_order``
+    contained only 9 entries (the executable ``STAGES`` registry) while
+    the 11-stage transcript contract includes ``post_patch_evaluation``
+    and ``contract_health``. The mismatch made postmortem skills walk
+    only 9/11 stages and report missing pieces for stages that never
+    had an executable producer.
+
+    Phase H Fidelity Task 6: ``manifest.stage_keys_in_process_order``
+    MUST mirror ``PROCESS_STAGE_ORDER`` (11 keys) so the transcript and
+    manifest agree on what a complete iteration looks like.
+    """
+    from genie_space_optimizer.optimization.run_output_bundle import (
+        build_manifest,
+    )
+    from genie_space_optimizer.optimization.run_output_contract import (
+        PROCESS_STAGE_ORDER,
+    )
+
+    manifest = build_manifest(
+        optimization_run_id="r1",
+        databricks_job_id="job1",
+        databricks_parent_run_id="parent1",
+        lever_loop_task_run_id="task1",
+        iterations=[1],
+        missing_pieces=[],
+    )
+    expected_keys = [s.key for s in PROCESS_STAGE_ORDER]
+    assert len(expected_keys) == 11
+    assert manifest["stage_keys_in_process_order"] == expected_keys
+
+
+def test_manifest_executable_stage_keys_field_lists_9_executable_stages() -> None:
+    """For consumers that need the executable subset (e.g. the bundle
+    walker that reads stage I/O artifacts), the manifest exposes a
+    separate ``executable_stage_keys`` field sourced from ``STAGES``."""
+    from genie_space_optimizer.optimization.run_output_bundle import (
+        build_manifest,
+    )
+    from genie_space_optimizer.optimization.stages import STAGES
+
+    manifest = build_manifest(
+        optimization_run_id="r1",
+        databricks_job_id="job1",
+        databricks_parent_run_id="parent1",
+        lever_loop_task_run_id="task1",
+        iterations=[1],
+        missing_pieces=[],
+    )
+    expected_executable = [e.stage_key for e in STAGES]
+    assert len(expected_executable) == 9
+    assert manifest["executable_stage_keys"] == expected_executable

@@ -805,6 +805,56 @@ _OUTCOME_TO_DECISION: Mapping[str, tuple[DecisionOutcome, ReasonCode, str, str]]
 }
 
 
+def _resolve_acceptance_reason_code(
+    cp_reason_code: str,
+    *,
+    accepted: bool,
+) -> ReasonCode:
+    """Map a ``ControlPlaneAcceptance.reason_code`` string to a typed
+    ``ReasonCode`` enum value.
+
+    Phase H Fidelity Task 3 — preserves the operator-relevant cause of
+    rejection (or acceptance variant) instead of collapsing every
+    rolled-back outcome into the generic ``PATCH_SKIPPED``. Unknown
+    strings degrade to the legacy default for the outcome class
+    (``PATCH_APPLIED`` for accepted, ``PATCH_SKIPPED`` for rejected) so
+    the emitter never crashes on a future / unrecognised reason.
+    """
+    raw = str(cp_reason_code or "").strip().lower()
+    if not raw:
+        return ReasonCode.PATCH_APPLIED if accepted else ReasonCode.PATCH_SKIPPED
+    try:
+        return ReasonCode(raw)
+    except ValueError:
+        return ReasonCode.PATCH_APPLIED if accepted else ReasonCode.PATCH_SKIPPED
+
+
+def _acceptance_detail_metrics(detail: Any) -> dict[str, Any]:
+    """Project the per-bucket counts off a ``ControlPlaneAcceptance``-shaped
+    object into a flat metrics dict for the operator transcript."""
+    if detail is None:
+        return {}
+    metrics: dict[str, Any] = {}
+    for src_attr, dst_key in (
+        ("target_qids", "target_qids_count"),
+        ("target_fixed_qids", "target_fixed_count"),
+        ("target_still_hard_qids", "target_still_hard_count"),
+        ("out_of_target_regressed_qids", "out_of_target_regressed_count"),
+        ("regression_debt_qids", "regression_debt_count"),
+        ("protected_regressed_qids", "protected_regressed_count"),
+        ("soft_to_hard_regressed_qids", "soft_to_hard_regressed_count"),
+        ("passing_to_hard_regressed_qids", "passing_to_hard_regressed_count"),
+        ("unknown_to_hard_regressed_qids", "unknown_to_hard_regressed_count"),
+    ):
+        try:
+            value = getattr(detail, src_attr, None)
+        except Exception:
+            value = None
+        if isinstance(value, (list, tuple, set)):
+            metrics[dst_key] = len(value)
+    return metrics
+
+
 def ag_outcome_decision_record(
     *,
     run_id: str,
@@ -814,6 +864,7 @@ def ag_outcome_decision_record(
     source_clusters_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     rca_id_by_cluster: Mapping[str, str] | None = None,
     regression_qids: Sequence[str] | None = None,
+    acceptance_detail: Any = None,
 ) -> DecisionRecord | None:
     """One ``ACCEPTANCE_DECIDED`` ``DecisionRecord`` for one AG outcome.
 
@@ -824,6 +875,18 @@ def ag_outcome_decision_record(
             ``skipped_dead_on_arrival``, ``skipped_pre_ag_snapshot_failed``.
             Returns ``None`` for unknown outcome strings (defensive — the
             harness should never call with one).
+        acceptance_detail: Optional ``ControlPlaneAcceptance`` (or shape-
+            compatible object) carrying the rich rejection cause. When
+            supplied, ``reason_code`` is upgraded from the generic
+            ``PATCH_SKIPPED`` / ``PATCH_APPLIED`` to the typed control-
+            plane reason (e.g. ``TARGET_QIDS_NOT_IMPROVED``),
+            ``reason_detail`` is populated with
+            ``format_control_plane_acceptance_detail(decision)``,
+            ``regression_qids`` is sourced from
+            ``out_of_target_regressed_qids``, and ``metrics`` carries
+            per-bucket counts. This is Phase H Fidelity Task 3 — without
+            it, the operator transcript Stage 9 collapses every rollback
+            into a single line lacking the actual rejection cause.
     """
     ag_id = str(ag.get("id") or ag.get("ag_id") or "")
     if not ag_id:
@@ -832,6 +895,42 @@ def ag_outcome_decision_record(
     if not mapping:
         return None
     decision_outcome, reason_code, observed_effect, next_action = mapping
+
+    reason_detail = ""
+    metrics: dict[str, Any] = {}
+    detail_regression_qids: tuple[str, ...] | None = None
+    if acceptance_detail is not None:
+        try:
+            cp_reason_code = str(getattr(acceptance_detail, "reason_code", "") or "")
+            cp_accepted = bool(getattr(acceptance_detail, "accepted", False))
+            reason_code = _resolve_acceptance_reason_code(
+                cp_reason_code, accepted=cp_accepted,
+            )
+            from genie_space_optimizer.optimization.control_plane import (
+                format_control_plane_acceptance_detail,
+            )
+            try:
+                reason_detail = format_control_plane_acceptance_detail(
+                    acceptance_detail,
+                )
+            except Exception:
+                reason_detail = (
+                    f"reason={cp_reason_code}" if cp_reason_code else ""
+                )
+            metrics = _acceptance_detail_metrics(acceptance_detail)
+            cp_regress = getattr(
+                acceptance_detail, "out_of_target_regressed_qids", None,
+            )
+            if isinstance(cp_regress, (list, tuple, set)):
+                detail_regression_qids = tuple(
+                    str(q) for q in cp_regress if str(q)
+                )
+        except Exception:
+            # Defensive: never let a malformed detail shape crash the
+            # emitter — fall back to the legacy reason mapping.
+            reason_detail = ""
+            metrics = {}
+            detail_regression_qids = None
 
     cluster_lookup = dict(source_clusters_by_id or {})
     rca_lookup = dict(rca_id_by_cluster or {})
@@ -852,6 +951,11 @@ def ag_outcome_decision_record(
             rca_id = str(rca_lookup.get(cid) or "")
         if root_cause and rca_id:
             break
+    final_regression_qids = (
+        detail_regression_qids
+        if detail_regression_qids is not None
+        else tuple(str(q) for q in (regression_qids or ()) if str(q))
+    )
     return DecisionRecord(
         run_id=run_id,
         iteration=int(iteration),
@@ -861,12 +965,11 @@ def ag_outcome_decision_record(
         ag_id=ag_id,
         rca_id=rca_id,
         root_cause=root_cause,
+        reason_detail=reason_detail,
         evidence_refs=tuple(f"cluster:{cid}" for cid in source_cluster_ids),
         affected_qids=affected_qids,
         target_qids=affected_qids,
-        regression_qids=tuple(
-            str(q) for q in (regression_qids or ()) if str(q)
-        ),
+        regression_qids=final_regression_qids,
         source_cluster_ids=source_cluster_ids,
         expected_effect=(
             f"AG {ag_id} should land patches that improve "
@@ -874,6 +977,7 @@ def ag_outcome_decision_record(
         ),
         observed_effect=observed_effect,
         next_action=next_action,
+        metrics=metrics,
     )
 
 
@@ -1673,6 +1777,146 @@ def iteration_budget_decision_record(
             "applied_patches": int(applied_patches),
             "no_op_cause": str(no_op_cause or ""),
             "consumed": bool(consumed),
+        },
+    )
+
+
+_LEARNING_EXIT_PATH_TO_REASON: Mapping[str, ReasonCode] = {
+    "proposals_empty": ReasonCode.PROPOSAL_GENERATION_EMPTY,
+    "no_pending_ags_first_pass": ReasonCode.PROPOSAL_GENERATION_EMPTY,
+    "no_pending_ags_second_pass": ReasonCode.PROPOSAL_GENERATION_EMPTY,
+    "ag_identity_skip": ReasonCode.PROPOSAL_GENERATION_EMPTY,
+    "no_actionable_clusters": ReasonCode.PROPOSAL_GENERATION_EMPTY,
+    "strategy_zero_ags": ReasonCode.PROPOSAL_GENERATION_EMPTY,
+    "skipped_no_applied_patches": ReasonCode.NO_APPLIED_PATCHES,
+    "applier_failed": ReasonCode.NO_APPLIED_PATCHES,
+    "post_grounding_skip": ReasonCode.RCA_UNGROUNDED,
+    "rolled_back": ReasonCode.PATCH_SKIPPED,
+    "completed": ReasonCode.PATCH_APPLIED,
+}
+
+
+def _learning_outcome_for_exit_path(
+    exit_path: str,
+    *,
+    accepted_count: int,
+    rolled_back_count: int,
+) -> DecisionOutcome:
+    raw = (exit_path or "").strip().lower()
+    if raw == "rolled_back" or rolled_back_count > 0:
+        return DecisionOutcome.ROLLED_BACK
+    if raw == "completed" and accepted_count > 0:
+        return DecisionOutcome.ACCEPTED
+    if raw in _LEARNING_EXIT_PATH_TO_REASON and raw != "completed":
+        return DecisionOutcome.SKIPPED
+    return DecisionOutcome.INFO
+
+
+def _learning_next_action_for_exit_path(
+    exit_path: str,
+    *,
+    accepted_count: int,
+    rolled_back_count: int,
+    gate_drop_count: int,
+) -> str:
+    raw = (exit_path or "").strip().lower()
+    if raw == "proposals_empty":
+        return (
+            "Proposal generation produced 0 candidates; the strategist "
+            "should switch approach or the operator should add evidence."
+        )
+    if raw in (
+        "no_pending_ags_first_pass",
+        "no_pending_ags_second_pass",
+        "no_actionable_clusters",
+        "strategy_zero_ags",
+        "ag_identity_skip",
+    ):
+        return (
+            "No actionable AG produced this iteration; consider "
+            "re-clustering or expanding the strategist's failure scope."
+        )
+    if raw == "rolled_back":
+        return (
+            "Iteration rolled back; consult Stage 9 reason_detail for "
+            "the control-plane rejection cause and adjust the AG."
+        )
+    if raw in ("skipped_no_applied_patches", "applier_failed"):
+        return (
+            "All proposals dropped before apply; inspect Stage 7 "
+            "applier-decision counts to identify the rejection reason."
+        )
+    if raw == "post_grounding_skip":
+        return "Skipped post-grounding gate; cluster lacked an RCA-grounded card."
+    if raw == "completed" and accepted_count > 0:
+        return "Iteration accepted; carry the patch into the next iteration's baseline."
+    if gate_drop_count:
+        return (
+            f"{gate_drop_count} patch(es) dropped by safety gates; "
+            f"review Stage 6 for blast-radius / RCA-groundedness issues."
+        )
+    return "Iteration produced no learning signal; advance to next iteration."
+
+
+def iteration_learning_record(
+    *,
+    run_id: str,
+    iteration: int,
+    exit_path: str,
+    accepted_count: int = 0,
+    rolled_back_count: int = 0,
+    skipped_count: int = 0,
+    gate_drop_count: int = 0,
+) -> DecisionRecord:
+    """Phase H Fidelity Task 4 — emit one ``ITERATION_BUDGET_DECISION``
+    per iteration so the operator transcript Stage 10 always has at
+    least one record describing what happened and what the operator /
+    next iteration should do.
+
+    Run ``3b050ec5-4032-457f-a785-2d1a3942a097`` showed Stage 10 empty
+    for every iteration despite the postmortem identifying
+    ``proposals_empty`` four times in a row plus a rollback in
+    iteration 1. The empty stage hid the most operator-relevant signal
+    in the entire transcript.
+
+    Maps the iteration's ``exit_path`` to a typed reason code (see
+    ``_LEARNING_EXIT_PATH_TO_REASON``) and a per-bucket metrics block
+    so postmortems can tell terminal no-op causes apart without
+    reparsing freeform logs. Unknown exit paths degrade to
+    ``DecisionOutcome.INFO`` with ``ReasonCode.NONE`` so the helper
+    never crashes on a future / unrecognised exit label.
+    """
+    raw = (exit_path or "").strip().lower()
+    reason = _LEARNING_EXIT_PATH_TO_REASON.get(raw, ReasonCode.NONE)
+    outcome = _learning_outcome_for_exit_path(
+        raw,
+        accepted_count=accepted_count,
+        rolled_back_count=rolled_back_count,
+    )
+    next_action = _learning_next_action_for_exit_path(
+        raw,
+        accepted_count=accepted_count,
+        rolled_back_count=rolled_back_count,
+        gate_drop_count=gate_drop_count,
+    )
+    return DecisionRecord(
+        run_id=str(run_id),
+        iteration=int(iteration),
+        decision_type=DecisionType.ITERATION_BUDGET_DECISION,
+        outcome=outcome,
+        reason_code=reason,
+        next_action=next_action,
+        observed_effect=(
+            f"Iteration {iteration} exit_path={raw or 'unknown'}: "
+            f"{accepted_count} accepted, {rolled_back_count} rolled back, "
+            f"{skipped_count} skipped, {gate_drop_count} gate drops."
+        ),
+        metrics={
+            "exit_path": str(raw or ""),
+            "accepted_count": int(accepted_count or 0),
+            "rolled_back_count": int(rolled_back_count or 0),
+            "skipped_count": int(skipped_count or 0),
+            "gate_drop_count": int(gate_drop_count or 0),
         },
     )
 

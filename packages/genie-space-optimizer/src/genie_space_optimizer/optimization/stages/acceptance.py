@@ -213,6 +213,14 @@ def decide(ctx, inp: AcceptanceInput) -> AgOutcome:
             outcome=outcome_str,
             rca_id_by_cluster=inp.rca_id_by_cluster,
             regression_qids=decision.out_of_target_regressed_qids,
+            # Phase H Fidelity Task 3: thread the rich
+            # ControlPlaneAcceptance through so the emitted
+            # ACCEPTANCE_DECIDED record preserves reason_code,
+            # reason_detail (formatted bucket breakdown), and per-bucket
+            # metric counts. Without this, the operator transcript
+            # Stage 9 would still collapse every rollback into a generic
+            # PATCH_SKIPPED line.
+            acceptance_detail=decision,
         )
         if record is not None:
             ctx.decision_emit(record)

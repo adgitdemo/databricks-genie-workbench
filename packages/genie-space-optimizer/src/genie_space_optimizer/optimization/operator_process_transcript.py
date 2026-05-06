@@ -42,8 +42,24 @@ _STAGE_DECISION_TYPE_MAP: dict[str, tuple[DecisionType, ...]] = {
     "applied_patches":          (DecisionType.PATCH_APPLIED, DecisionType.PATCH_SKIPPED),
     "post_patch_evaluation":    (DecisionType.EVAL_CLASSIFIED,),
     "acceptance_decision":      (DecisionType.ACCEPTANCE_DECIDED,),
-    "learning_next_action":     (DecisionType.AG_RETIRED, DecisionType.QID_RESOLUTION),
-    "contract_health":          (),
+    "learning_next_action":     (
+        DecisionType.AG_RETIRED,
+        DecisionType.QID_RESOLUTION,
+        # Phase H Fidelity Task 4: surface the per-iteration learning
+        # / next-action record (proposals_empty, rolled_back, etc.) in
+        # Stage 10 so the operator transcript always carries the
+        # iteration outcome and operator-facing guidance.
+        DecisionType.ITERATION_BUDGET_DECISION,
+    ),
+    # Phase H Fidelity Task 5: Stage 11 was permanently empty because
+    # ``contract_health`` mapped to an empty tuple. Surface producer
+    # exceptions and invariant violations here so the operator
+    # transcript reports whether decision-record persistence and the
+    # invariant suite are healthy enough to base a postmortem on.
+    "contract_health":          (
+        DecisionType.PRODUCER_EXCEPTION,
+        DecisionType.INVARIANT_VIOLATION,
+    ),
 }
 
 
@@ -136,9 +152,17 @@ def _format_record(rec: DecisionRecord) -> str:
         if rec.reason_code and rec.reason_code.value != "none"
         else ""
     )
+    # Phase H Fidelity Task 3: surface the detailed bucket breakdown
+    # (e.g. target_qids_not_improved + target_fixed/regressed lists) and
+    # any explicit regression qids so Stage 9 reads as the operator
+    # source of truth instead of one collapsed line per outcome.
+    regression_str = (
+        f" regressions={list(rec.regression_qids)}" if rec.regression_qids else ""
+    )
+    detail_str = f" detail={rec.reason_detail}" if rec.reason_detail else ""
     return (
         f"{rec.decision_type.value} outcome={rec.outcome.value}"
-        f"{target_str}{reason_str}"
+        f"{target_str}{reason_str}{regression_str}{detail_str}"
     )
 
 

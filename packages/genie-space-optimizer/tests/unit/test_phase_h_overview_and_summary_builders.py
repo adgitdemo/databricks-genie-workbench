@@ -28,6 +28,7 @@ import pytest
 from genie_space_optimizer.optimization.harness import (
     _build_baseline_overview_dict,
     _build_iteration_summary_dict,
+    _compute_baseline_overview_evidence,
 )
 
 
@@ -174,3 +175,74 @@ def test_iteration_summary_omits_exit_path_when_none() -> None:
         exit_path=None,
     )
     assert "exit_path" not in summary
+
+
+# ── Baseline overview evidence (Phase H Fidelity, Task 1) ────────────
+
+
+def _hard_row(qid: str, root_cause: str = "", symptom: str = "") -> dict:
+    """Helper: build an eval-row dict that ``row_is_hard_failure`` flags."""
+    return {
+        "question_id": qid,
+        "result_correctness": "no",
+        "arbiter": "neither_correct",
+        "asi_metadata": {"root_cause": root_cause, "symptom": symptom},
+    }
+
+
+def _passing_row(qid: str) -> dict:
+    return {
+        "question_id": qid,
+        "result_correctness": "yes",
+        "arbiter": "both_correct",
+    }
+
+
+def test_baseline_overview_evidence_counts_hard_failures_from_rows() -> None:
+    rows = [
+        _hard_row("q1", "wrong_filter", "missing date"),
+        _hard_row("q2", "wrong_join", "fan-out"),
+        _hard_row("q3"),
+        _passing_row("q4"),
+    ]
+    evidence = _compute_baseline_overview_evidence(
+        eval_rows=rows,
+        soft_signal_qids=[],
+    )
+    assert evidence["hard_failure_count"] == 3
+    assert evidence["soft_signal_count"] == 0
+    qids = [t[0] for t in evidence["hard_failures"]]
+    assert set(qids) == {"q1", "q2", "q3"}
+
+
+def test_baseline_overview_evidence_counts_soft_signals_uniquely() -> None:
+    evidence = _compute_baseline_overview_evidence(
+        eval_rows=[],
+        soft_signal_qids=["s1", "s2", "s2", "s3"],
+    )
+    assert evidence["soft_signal_count"] == 3
+    assert evidence["hard_failure_count"] == 0
+    assert evidence["hard_failures"] == []
+
+
+def test_baseline_overview_evidence_handles_empty_inputs() -> None:
+    evidence = _compute_baseline_overview_evidence(
+        eval_rows=None,
+        soft_signal_qids=None,
+    )
+    assert evidence["hard_failure_count"] == 0
+    assert evidence["soft_signal_count"] == 0
+    assert evidence["hard_failures"] == []
+
+
+def test_baseline_overview_evidence_hard_failures_carry_metadata() -> None:
+    rows = [_hard_row("q1", "wrong_filter", "missing date")]
+    evidence = _compute_baseline_overview_evidence(
+        eval_rows=rows,
+        soft_signal_qids=[],
+    )
+    qid, root_cause, symptom = evidence["hard_failures"][0]
+    assert qid == "q1"
+    assert root_cause == "wrong_filter"
+    assert symptom == "missing date"
+

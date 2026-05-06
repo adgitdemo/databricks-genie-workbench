@@ -255,6 +255,75 @@ def _build_baseline_overview_dict(
     }
 
 
+def _compute_baseline_overview_evidence(
+    *,
+    eval_rows: list[dict] | None,
+    soft_signal_qids: list[str] | None,
+) -> dict[str, Any]:
+    """Derive baseline run-overview counts and a hard-failure preview list
+    from baseline evaluation evidence.
+
+    Phase H Fidelity Task 1: the harness used to hardcode
+    ``hard_failure_count=0`` and ``soft_signal_count=0`` when constructing
+    ``_baseline_for_summary``, and ``_hard_failures_for_overview`` was
+    initialized empty and never populated. The transcript header therefore
+    always rendered ``Hard failures: 0`` / ``Soft signals: 0`` even when
+    baseline evidence had real hard clusters or soft signals.
+
+    Returns a small dict with deterministic keys:
+
+    - ``hard_failure_count``: count of rows where
+      :func:`row_is_hard_failure` is true (the unified predicate shared
+      with clustering and the accept gate).
+    - ``soft_signal_count``: number of unique soft-signal qids supplied
+      by the baseline evaluator.
+    - ``hard_failures``: list of ``(question_id, root_cause, symptom)``
+      tuples for the operator overview's optional preview block. Pulled
+      from each hard-failure row's ASI metadata when available; missing
+      metadata renders as empty strings.
+
+    The helper is pure (no I/O, no logging) so it can be unit-tested at
+    the boundary and reused by both the internal lever-loop refresh path
+    and any future top-level orchestrator wiring.
+    """
+    from genie_space_optimizer.optimization.evaluation import (
+        row_is_hard_failure as _row_is_hard_failure,
+    )
+
+    rows = list(eval_rows or [])
+    soft_qids = list(soft_signal_qids or [])
+
+    hard_failures: list[tuple[str, str, str]] = []
+    seen_qids: set[str] = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            if not _row_is_hard_failure(r):
+                continue
+        except Exception:
+            continue
+        qid = str(r.get("question_id") or r.get("qid") or "").strip()
+        if not qid or qid in seen_qids:
+            if not qid:
+                continue
+        if qid in seen_qids:
+            continue
+        seen_qids.add(qid)
+        asi = r.get("asi_metadata")
+        if not isinstance(asi, dict):
+            asi = {}
+        root_cause = str(asi.get("root_cause") or r.get("root_cause") or "")
+        symptom = str(asi.get("symptom") or r.get("symptom") or "")
+        hard_failures.append((qid, root_cause, symptom))
+
+    return {
+        "hard_failure_count": len(hard_failures),
+        "soft_signal_count": len({str(q) for q in soft_qids if q}),
+        "hard_failures": hard_failures,
+    }
+
+
 def _build_iteration_summary_dict(
     *,
     iteration: int,
@@ -350,6 +419,16 @@ def _compute_iteration_counters(
     exit so the counters reflect the actual outcomes recorded so far —
     even at early exits, where the end-of-body counter computation has
     not yet run.
+
+    Phase H Fidelity Task 2: ``gate_drop_count`` was previously derived
+    *only* from AG-level outcomes (``ag_outcomes`` values prefixed with
+    ``gate_drop``). That undercounts when individual patches are dropped
+    by the blast-radius / safety gates while their parent AG continues
+    (e.g. run ``3b050ec5`` had three blast-radius drops but
+    ``gate_drop_count == 0`` in the iteration summary). The blast-radius
+    gate emits a typed ``GATE_DECISION`` record per dropped patch, so
+    we now also derive a count from ``decision_records`` and return the
+    larger of the two so neither source can undercount.
     """
     outcomes = (current_iter_inputs.get("ag_outcomes") or {}) if isinstance(
         current_iter_inputs, dict
@@ -359,9 +438,23 @@ def _compute_iteration_counters(
     skipped = sum(
         1 for v in outcomes.values() if str(v).startswith("skipped")
     )
-    gate_drop = sum(
+    gate_drop_outcomes = sum(
         1 for v in outcomes.values() if str(v).startswith("gate_drop")
     )
+
+    records = (
+        current_iter_inputs.get("decision_records") or []
+    ) if isinstance(current_iter_inputs, dict) else []
+    gate_drop_records = 0
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        dtype = str(r.get("decision_type") or "").lower()
+        outcome = str(r.get("outcome") or "").lower()
+        if dtype == "gate_decision" and outcome == "dropped":
+            gate_drop_records += 1
+
+    gate_drop = max(gate_drop_outcomes, gate_drop_records)
     return (accepted, rolled_back, skipped, gate_drop)
 
 
@@ -494,6 +587,46 @@ def _finalize_iteration_summary(
         current_iter_inputs=current_iter_inputs,
         iter_producer_exceptions=iter_producer_exceptions,
     )
+
+    # Phase H Fidelity Task 4: emit one typed learning / next-action
+    # record per iteration finalise so the operator transcript Stage 10
+    # always carries the iteration outcome (proposals_empty,
+    # rolled_back, completed, …) and operator-facing guidance. Without
+    # this, terminal no-op iterations leave Stage 10 empty (run
+    # ``3b050ec5`` exhibited four ``proposals_empty`` iterations all
+    # rendering the same "no decisions emitted for this stage" line).
+    # Idempotent: skips emission when a learning record for this
+    # iteration already exists in ``decision_records``.
+    try:
+        from genie_space_optimizer.optimization.decision_emitters import (
+            iteration_learning_record as _phase_h_learning_record,
+        )
+        _existing_records = current_iter_inputs.get("decision_records") or []
+        _has_learning = any(
+            isinstance(r, dict)
+            and str(r.get("decision_type") or "") == "iteration_budget_decision"
+            and int(r.get("iteration") or -1) == int(iteration)
+            for r in _existing_records
+        )
+        if not _has_learning:
+            _learning_rec = _phase_h_learning_record(
+                run_id=str(run_id),
+                iteration=int(iteration),
+                exit_path=str(exit_path or ""),
+                accepted_count=int(accepted_count or 0),
+                rolled_back_count=int(rolled_back_count or 0),
+                skipped_count=int(skipped_count or 0),
+                gate_drop_count=int(gate_drop_count or 0),
+            )
+            current_iter_inputs.setdefault(
+                "decision_records", []
+            ).append(_learning_rec.to_dict())
+    except Exception:
+        logger.debug(
+            "Phase H Fidelity Task 4: iteration_learning_record emission "
+            "failed (non-fatal)",
+            exc_info=True,
+        )
 
     from genie_space_optimizer.optimization.rca_decision_trace import (
         DecisionRecord as _PhaseH_DecisionRecord,
@@ -12630,6 +12763,7 @@ def _run_lever_loop(
     max_benchmark_count: int = MAX_BENCHMARK_COUNT,
     iq_scan_recommended_levers: list[int] | None = None,
     iq_scan_summary: dict | None = None,
+    baseline_overview_evidence: dict | None = None,
 ) -> dict:
     """Stage 3: Iterate levers with convergence checking.
 
@@ -12765,15 +12899,31 @@ def _run_lever_loop(
     # render whatever is available — empty iteration transcripts are
     # acceptable for the MVP bundle).
     from typing import Any as _AnyPhaseH
+    # Phase H Fidelity Task 1: derive hard/soft counts and the optional
+    # hard-failures preview list from the baseline evaluator's evidence
+    # when available. ``baseline_overview_evidence`` is supplied by the
+    # orchestrator (``lever_loop``) which has access to ``baseline_out``;
+    # when None (resume / unit-test paths), we fall back to zeros so the
+    # transcript header still renders deterministically instead of
+    # crashing.
+    _baseline_overview_ev: dict[str, _AnyPhaseH] = (
+        baseline_overview_evidence
+        if isinstance(baseline_overview_evidence, dict)
+        else {}
+    )
+    _baseline_hard_count = int(_baseline_overview_ev.get("hard_failure_count") or 0)
+    _baseline_soft_count = int(_baseline_overview_ev.get("soft_signal_count") or 0)
     _baseline_for_summary: dict[str, _AnyPhaseH] = _build_baseline_overview_dict(
         prev_accuracy_percent=float(prev_accuracy),
         prev_scores=prev_scores,
-        hard_failure_count=0,
-        soft_signal_count=0,
+        hard_failure_count=_baseline_hard_count,
+        soft_signal_count=_baseline_soft_count,
     )
     _iter_traces: dict[int, _AnyPhaseH] = {}
     _iter_summaries: dict[int, dict[str, _AnyPhaseH]] = {}
-    _hard_failures_for_overview: list[tuple[str, str, str]] = []
+    _hard_failures_for_overview: list[tuple[str, str, str]] = list(
+        _baseline_overview_ev.get("hard_failures") or []
+    )
     # ── Modular spine carry-over state (cross-iteration) ─────────────
     # The lever loop's modular spine is:
     #   1. Evaluation State
@@ -13568,6 +13718,46 @@ def _run_lever_loop(
         # `_run_gate_checks` (applier-skip-eval, dead-on-arrival retry)
         # still capture the baseline state in the replay fixture.
         _baseline_rows_seed = _rows_from_iteration_payload(baseline_iter)
+        # Phase H Fidelity Task 1 (notebook DAG fallback): when the
+        # orchestrator did not pass ``baseline_overview_evidence`` (e.g.
+        # the 6-task DAG path where this function is called from
+        # ``run_lever_loop.py``), refresh ``_baseline_for_summary`` and
+        # ``_hard_failures_for_overview`` from the baseline-iteration
+        # rows now that they are extracted. Without this, the operator
+        # transcript header always reports "Hard failures: 0 / Soft
+        # signals: 0" in production even when baseline evidence has
+        # real hard clusters.
+        if (
+            not isinstance(baseline_overview_evidence, dict)
+            or not baseline_overview_evidence
+        ) and _baseline_rows_seed:
+            try:
+                _evidence_fallback = _compute_baseline_overview_evidence(
+                    eval_rows=_baseline_rows_seed,
+                    soft_signal_qids=(
+                        baseline_iter.get("soft_signal_qids")
+                        if isinstance(baseline_iter, dict) else None
+                    ) or [],
+                )
+                _baseline_for_summary = _build_baseline_overview_dict(
+                    prev_accuracy_percent=float(prev_accuracy),
+                    prev_scores=prev_scores,
+                    hard_failure_count=int(
+                        _evidence_fallback.get("hard_failure_count") or 0
+                    ),
+                    soft_signal_count=int(
+                        _evidence_fallback.get("soft_signal_count") or 0
+                    ),
+                )
+                _hard_failures_for_overview = list(
+                    _evidence_fallback.get("hard_failures") or []
+                )
+            except Exception:
+                logger.debug(
+                    "Phase H Fidelity Task 1: notebook-path baseline overview "
+                    "refresh failed (non-fatal)",
+                    exc_info=True,
+                )
         if not _baseline_rows_seed:
             logger.warning(
                 "Phase A: baseline payload yielded 0 extractable eval rows "
@@ -24282,6 +24472,22 @@ def optimize_genie_space(
             _baseline_eval_result.get("rows") or []
             if isinstance(_baseline_eval_result, dict) else []
         )
+        # Phase H Fidelity Task 1: derive baseline run-overview evidence
+        # (hard-failure count, soft-signal count, hard-failure preview)
+        # from baseline_out so the operator transcript header reflects
+        # real evidence instead of always reporting zeros. Soft-signal
+        # qids live inside the embedded eval_result dict; hard failures
+        # are derived from the evaluation rows directly.
+        _baseline_soft_signal_qids = (
+            (_baseline_eval_result.get("soft_signal_qids")
+             if isinstance(_baseline_eval_result, dict) else None)
+            or baseline_out.get("soft_signal_qids")
+            or []
+        )
+        _baseline_overview_evidence = _compute_baseline_overview_evidence(
+            eval_rows=_baseline_rows,
+            soft_signal_qids=_baseline_soft_signal_qids,
+        )
         _baseline_both_correct = [
             r for r in _baseline_rows
             if str(
@@ -24470,6 +24676,7 @@ def optimize_genie_space(
                 iq_scan_summary=cast(
                     dict | None, preflight_out.get("iq_scan_summary"),
                 ),
+                baseline_overview_evidence=_baseline_overview_evidence,
             )
             result.levers_attempted = cast(list[int], loop_out["levers_attempted"])
             result.levers_accepted = cast(list[int], loop_out["levers_accepted"])

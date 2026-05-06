@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from genie_space_optimizer.optimization.run_output_contract import (
+    PROCESS_STAGE_ORDER,
     bundle_artifact_paths,
     iteration_bundle_prefix,
     stage_artifact_paths,
@@ -61,7 +62,14 @@ def build_manifest(
         "iteration_count": len(iterations),
         "iterations": list(iterations),
         "missing_pieces": missing_pieces,
-        "stage_keys_in_process_order": [e.stage_key for e in STAGES],
+        # Phase H Fidelity Task 6 — manifest stage order must mirror the
+        # 11-entry transcript contract (``PROCESS_STAGE_ORDER``) so
+        # postmortem skills walk every stage the operator transcript
+        # renders, not just the 9 executable stages. The executable
+        # subset is published separately for consumers that need to
+        # locate stage I/O artifacts.
+        "stage_keys_in_process_order": [s.key for s in PROCESS_STAGE_ORDER],
+        "executable_stage_keys": [e.stage_key for e in STAGES],
     }
 
 

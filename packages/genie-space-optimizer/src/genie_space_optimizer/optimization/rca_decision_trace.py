@@ -154,6 +154,30 @@ class ReasonCode(str, Enum):
     PRODUCER_EXCEPTION = "producer_exception"
     # Cycle 11 — paired with DecisionType.INVARIANT_VIOLATION.
     INVARIANT_VIOLATION = "invariant_violation"
+    # Phase H Fidelity Task 3 — control-plane acceptance reason codes.
+    # ``ag_outcome_decision_record`` previously collapsed every rolled-back
+    # outcome into ``PATCH_SKIPPED``, which erased the operator-relevant
+    # signal of *why* the gate rejected the patch (e.g. target qids never
+    # flipped vs. unbounded collateral regressions). These mirror the
+    # string reason codes emitted by ``decide_control_plane_acceptance``
+    # so the operator transcript Stage 9 (Acceptance / Rollback) can
+    # render the precise rejection cause.
+    TARGET_QIDS_NOT_IMPROVED = "target_qids_not_improved"
+    TARGET_FIXED_OFFSET_BY_REGRESSION = "target_fixed_offset_by_regression"
+    TARGET_FIXED_WITH_UNRESOLVED_OTHER_HARD = (
+        "target_fixed_with_unresolved_other_hard"
+    )
+    REJECTED_BELOW_THRESHOLD_NO_TARGET_PROGRESS = (
+        "rejected_below_threshold_no_target_progress"
+    )
+    REJECTED_UNBOUNDED_COLLATERAL = "rejected_unbounded_collateral"
+    POST_ARBITER_NOT_IMPROVED = "post_arbiter_not_improved"
+    ACCEPTED_PRE_ARBITER_IMPROVEMENT = "accepted_pre_arbiter_improvement"
+    ACCEPTED_WITH_REGRESSION_DEBT = "accepted_with_regression_debt"
+    ACCEPTED_WITH_ATTRIBUTION_DRIFT = "accepted_with_attribution_drift"
+    MISSING_PRE_ROWS = "missing_pre_rows"
+    STALE_OR_CANDIDATE_PRE_ROWS = "stale_or_candidate_pre_rows"
+    ACCEPTED = "accepted"
 
 
 class RejectReason(str, Enum):
