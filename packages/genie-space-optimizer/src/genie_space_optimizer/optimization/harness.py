@@ -10366,6 +10366,7 @@ def _analyze_and_distribute(
     verbose: bool = True,
     quarantined_qids: set[str] | None = None,
     exclude_qids: set[str] | None = None,
+    phase_h_anchor_run_id: str | None = None,
 ) -> dict:
     """Analyze failures once, cluster, and distribute clusters to levers.
 
@@ -10634,7 +10635,7 @@ def _analyze_and_distribute(
         apply_mode="",    # form() does not read
         journey_emit=lambda *a, **k: None,  # form() does not emit
         decision_emit=lambda r: None,        # form() does not emit
-        mlflow_anchor_run_id=None,
+        mlflow_anchor_run_id=phase_h_anchor_run_id,
         feature_flags={},
     )
     _clust_inp = _clust_stage.ClusteringInput(
@@ -10960,6 +10961,7 @@ def _run_gate_checks(
     prev_failure_qids: set[str] | None = None,
     prev_iter_pre_accept_baseline: float | None = None,
     accepted_baseline_rows_for_control_plane: list[dict] | None = None,
+    phase_h_anchor_run_id: str | None = None,
 ) -> dict:
     """Run slice → P0 → full eval gate sequence for an action group.
 
@@ -11460,7 +11462,7 @@ def _run_gate_checks(
         apply_mode="real",
         journey_emit=lambda *a, **k: None,
         decision_emit=lambda record: None,
-        mlflow_anchor_run_id=None,
+        mlflow_anchor_run_id=phase_h_anchor_run_id,
         feature_flags={},
     )
     _eval_kwargs_full: RunEvaluationKwargs = {
@@ -14010,6 +14012,7 @@ def _run_lever_loop(
             iteration_counter - 1, lever_label=0,
             quarantined_qids=_correction_state["quarantined_qids"],
             exclude_qids=escalated_gt_repair_qids,
+            phase_h_anchor_run_id=_phase_h_anchor_run_id,
         )
         clusters = _analysis["all_clusters"]
         soft_signal_clusters = _analysis["soft_signal_clusters"]
@@ -18551,7 +18554,7 @@ def _run_lever_loop(
                 apply_mode="real",
                 journey_emit=lambda *a, **k: None,
                 decision_emit=lambda r: None,
-                mlflow_anchor_run_id=None,
+                mlflow_anchor_run_id=_phase_h_anchor_run_id,
                 feature_flags={},
             )
             _f6_wrapped = _wrap_capture_f6(
@@ -19664,7 +19667,7 @@ def _run_lever_loop(
                             "decision_records", []
                         ).append(record.to_dict())
                 ),
-                mlflow_anchor_run_id=None,  # set by Phase C Commit 17
+                mlflow_anchor_run_id=_phase_h_anchor_run_id,
                 feature_flags={},
             )
             _app_inp = _app_stage.ApplicationInput(
@@ -19908,6 +19911,7 @@ def _run_lever_loop(
             accepted_baseline_rows_for_control_plane=(
                 _accepted_baseline_rows_for_control_plane
             ),
+            phase_h_anchor_run_id=_phase_h_anchor_run_id,
         )
 
         # Phase A — Lossless contract: refresh the deterministic eval-result
