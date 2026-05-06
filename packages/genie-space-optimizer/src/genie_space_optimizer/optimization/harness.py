@@ -20478,21 +20478,43 @@ def _run_lever_loop(
                 or []
             )
 
-            _accept_inp = _accept_stage.AcceptanceInput(
-                applied_entries_by_ag=_accept_applied_by_ag_t,
-                ags=(ag,),  # single-AG slate
-                baseline_accuracy=float(best_accuracy),
-                candidate_accuracy=_accept_candidate_accuracy,
-                baseline_pre_arbiter_accuracy=float(_best_pre_arbiter),
-                candidate_pre_arbiter_accuracy=_accept_candidate_pre_arbiter,
-                pre_rows=tuple(_baseline_rows_for_control_plane or []),
-                post_rows=tuple(_accept_post_rows),
-                protected_qids=(),
-                min_gain_pp=float(MIN_POST_ARBITER_GAIN_PP),
-                min_pre_arbiter_gain_pp=2.0,
-                rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
-                cluster_by_qid={},
-            )
+            try:
+                _accept_inp = _accept_stage.AcceptanceInput(
+                    applied_entries_by_ag=_accept_applied_by_ag_t,
+                    ags=(ag,),  # single-AG slate
+                    baseline_accuracy=float(best_accuracy),
+                    candidate_accuracy=_accept_candidate_accuracy,
+                    baseline_pre_arbiter_accuracy=float(_best_pre_arbiter),
+                    candidate_pre_arbiter_accuracy=_accept_candidate_pre_arbiter,
+                    pre_rows=tuple(_baseline_rows_for_control_plane or []),
+                    post_rows=tuple(_accept_post_rows),
+                    protected_qids=(),
+                    min_gain_pp=float(MIN_POST_ARBITER_GAIN_PP),
+                    min_pre_arbiter_gain_pp=2.0,
+                    rca_id_by_cluster=dict(_iter_rca_id_by_cluster),
+                    cluster_by_qid={},
+                )
+            except Exception as _accept_inp_exc:
+                from genie_space_optimizer.optimization.stage_io_capture import (
+                    record_capture_failure as _record_capture_failure,
+                    stage_artifact_paths as _stage_artifact_paths,
+                )
+                try:
+                    _paths = _stage_artifact_paths(
+                        int(iteration_counter), "acceptance_decision",
+                    )
+                    _record_capture_failure(
+                        stage_key="acceptance_decision",
+                        artifact_path=_paths["input"],
+                        error_class=type(_accept_inp_exc).__name__,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Phase F+H A5: record_capture_failure for "
+                        "AcceptanceInput build failed",
+                        exc_info=True,
+                    )
+                raise
             # Phase F+H Commit B15: wrap F8 with stage_io_capture
             # decorator. Replay-byte-stable — wrap_with_io_capture
             # returns the stage output unchanged; MLflow log_text
