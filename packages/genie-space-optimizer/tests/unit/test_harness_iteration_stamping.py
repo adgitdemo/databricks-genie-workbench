@@ -142,3 +142,31 @@ def test_finalize_iteration_summary_handles_unparseable_records_gracefully() -> 
 
     assert iter_summaries[1]["exit_path"] == "completed"
     assert iter_summaries[1]["decision_record_count"] == 0
+
+
+def test_render_filter_includes_stub_iterations() -> None:
+    """A stub iteration (only the pre-stamp ran, no finalise) must still
+    appear in the rendered transcript so the operator can see that the
+    iteration started but did not complete its body. This pins the
+    Task-7 filter loosening."""
+    from genie_space_optimizer.optimization.harness import (
+        _stamp_iteration_stub,
+    )
+    from genie_space_optimizer.optimization.operator_process_transcript import (
+        render_iteration_transcript,
+    )
+
+    iter_traces: dict[int, Any] = {}
+    iter_summaries: dict[int, dict[str, Any]] = {}
+    _stamp_iteration_stub(
+        iter_traces=iter_traces,
+        iter_summaries=iter_summaries,
+        iteration=1,
+    )
+    rendered = render_iteration_transcript(
+        iteration=1,
+        trace=iter_traces[1],
+        iteration_summary=iter_summaries[1],
+    )
+    assert "## Iteration 1" in rendered
+    assert "exit_path: in_progress" in rendered

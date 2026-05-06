@@ -21944,15 +21944,43 @@ def _run_lever_loop(
             baseline=_baseline_for_summary,
             hard_failures=_hard_failures_for_overview,
         )
-        _iter_transcripts = [
-            _render_iteration_transcript(
-                iteration=_i,
-                trace=_iter_traces.get(_i),
-                iteration_summary=_iter_summaries.get(_i, {}),
+        # Phase H iteration content completeness — every iteration that
+        # ``iteration_counter`` reached has a pre-stamped stub trace
+        # (see Task 4). The filter that previously skipped ``None`` entries
+        # is no longer needed; if a future regression nevertheless leaves
+        # an entry unset, fall back to the stub on the fly so the
+        # iteration still appears in the transcript with
+        # ``exit_path=in_progress``.
+        from genie_space_optimizer.optimization.rca_decision_trace import (
+            OptimizationTrace as _PhaseH_OptimizationTrace_render,
+        )
+        _iter_transcripts: list[str] = []
+        for _i in _phase_h_iterations_completed:
+            _trace = _iter_traces.get(_i)
+            _summary = _iter_summaries.get(_i, {})
+            if _trace is None:
+                _trace = _PhaseH_OptimizationTrace_render(
+                    journey_events=tuple(),
+                    decision_records=tuple(),
+                )
+                if not _summary:
+                    _summary = _build_iteration_summary_dict(
+                        iteration=int(_i),
+                        accepted_count=0,
+                        rolled_back_count=0,
+                        skipped_count=0,
+                        gate_drop_count=0,
+                        decision_record_count=0,
+                        journey_violation_count=0,
+                        exit_path="in_progress",
+                    )
+            _iter_transcripts.append(
+                _render_iteration_transcript(
+                    iteration=_i,
+                    trace=_trace,
+                    iteration_summary=_summary,
+                )
             )
-            for _i in _phase_h_iterations_completed
-            if _iter_traces.get(_i) is not None
-        ]
         _full_transcript = _render_full_transcript(
             run_overview=_run_overview,
             iteration_transcripts=_iter_transcripts,
