@@ -5631,3 +5631,14 @@ def proposal_trace_one_source_enabled() -> bool:
     ``GSO_PROPOSAL_TRACE_ONE_SOURCE=0`` to preserve legacy.
     """
     return _flag_default_on("GSO_PROPOSAL_TRACE_ONE_SOURCE")
+
+
+def phase_b_producer_typed_exceptions_enabled() -> bool:
+    """Cycle 11 — emit a typed ``PRODUCER_EXCEPTION`` ``DecisionRecord``
+    at every harness producer try/except site so the Phase B trace
+    carries the exception class, ``repr``, and traceback head. Closes
+    the airline / 7NOW silent-mute defect (``producer_exceptions={...}``
+    with no payload). Default-on; production rollback via
+    ``GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS=0``.
+    """
+    return _flag_default_on("GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS")

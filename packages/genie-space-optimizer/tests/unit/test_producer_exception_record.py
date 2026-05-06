@@ -70,3 +70,19 @@ def test_producer_exception_record_without_ag_id_still_emits() -> None:
     assert record is not None
     assert record.decision_type == DecisionType.PRODUCER_EXCEPTION
     assert record.ag_id == ""
+
+
+def test_phase_b_producer_typed_exceptions_flag_default_on(monkeypatch) -> None:
+    monkeypatch.delenv("GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS", raising=False)
+    from genie_space_optimizer.common.config import (
+        phase_b_producer_typed_exceptions_enabled,
+    )
+    assert phase_b_producer_typed_exceptions_enabled() is True
+
+
+def test_phase_b_producer_typed_exceptions_flag_override_off(monkeypatch) -> None:
+    monkeypatch.setenv("GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS", "0")
+    from genie_space_optimizer.common.config import (
+        phase_b_producer_typed_exceptions_enabled,
+    )
+    assert phase_b_producer_typed_exceptions_enabled() is False
