@@ -339,6 +339,73 @@ def _stamp_iteration_stub(
     )
 
 
+def _finalize_iteration_summary(
+    *,
+    iter_traces: dict[int, Any],
+    iter_summaries: dict[int, dict[str, Any]],
+    iteration: int,
+    current_iter_inputs: dict[str, Any],
+    journey_events: list[Any] | tuple[Any, ...] | None,
+    journey_report: Any | None,
+    accepted_count: int,
+    rolled_back_count: int,
+    skipped_count: int,
+    gate_drop_count: int,
+    iteration_accuracy_percent: float | None,
+    exit_path: str,
+) -> None:
+    """Overwrite the iteration's pre-stamped stub with rich data.
+
+    Called from every iteration-body-level exit point AND from the
+    end-of-body block, so the operator transcript always reflects the
+    iteration's final outcome. Unparseable decision-record dicts are
+    dropped silently so a partial / legacy record does not prevent the
+    iteration from being finalised — the iteration still renders with
+    its ``exit_path`` label.
+    """
+    from genie_space_optimizer.optimization.rca_decision_trace import (
+        DecisionRecord as _PhaseH_DecisionRecord,
+        OptimizationTrace as _PhaseH_OptimizationTrace,
+    )
+
+    records_raw = list(current_iter_inputs.get("decision_records") or [])
+    records: list[Any] = []
+    for r in records_raw:
+        if not isinstance(r, dict):
+            continue
+        # A real DecisionRecord dict always carries ``decision_type``;
+        # ``from_dict`` is permissive enough to accept missing fields
+        # via defaults, so guard at this layer to drop legacy/partial
+        # dicts before they leak into the rendered transcript.
+        if "decision_type" not in r:
+            continue
+        try:
+            records.append(_PhaseH_DecisionRecord.from_dict(r))
+        except Exception:
+            continue
+
+    iter_traces[iteration] = _PhaseH_OptimizationTrace(
+        journey_events=tuple(journey_events or ()),
+        decision_records=tuple(records),
+    )
+
+    journey_violation_count = (
+        0 if journey_report is None else len(getattr(journey_report, "violations", ()))
+    )
+
+    iter_summaries[iteration] = _build_iteration_summary_dict(
+        iteration=iteration,
+        accepted_count=int(accepted_count or 0),
+        rolled_back_count=int(rolled_back_count or 0),
+        skipped_count=int(skipped_count or 0),
+        gate_drop_count=int(gate_drop_count or 0),
+        decision_record_count=len(records),
+        journey_violation_count=int(journey_violation_count),
+        iteration_accuracy_percent=iteration_accuracy_percent,
+        exit_path=exit_path,
+    )
+
+
 def _build_loop_out_with_pretty_print(
     *,
     loop_out_base: dict,
