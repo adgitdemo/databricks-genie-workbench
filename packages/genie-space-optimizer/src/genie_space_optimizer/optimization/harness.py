@@ -13796,6 +13796,17 @@ def _run_lever_loop(
 
         iteration_counter += 1
 
+        # Phase H iteration content completeness — pre-stamp the trace /
+        # summary entries so any subsequent ``continue`` / ``break``
+        # leaves a renderable iteration in the operator transcript. The
+        # rich data is written in by ``_finalize_iteration_summary`` at
+        # every iteration-body-level exit and at the end-of-body block.
+        _stamp_iteration_stub(
+            iter_traces=_iter_traces,
+            iter_summaries=_iter_summaries,
+            iteration=iteration_counter,
+        )
+
         # Phase A — append-on-begin: allocate the per-iteration snapshot
         # AND register it in ``_replay_fixture_iterations`` immediately,
         # so any subsequent ``continue`` / ``break`` (rollback paths,
