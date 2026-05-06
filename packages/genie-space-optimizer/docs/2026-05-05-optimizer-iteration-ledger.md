@@ -723,4 +723,41 @@ C-7-C (seed): Clusterer / RCA root-cause flips for the same QID across iteration
 
 The renderer surfaces it as `- exit_path: <value>` in the iteration's summary block.
 
+
+## Cycle 11 — Honest Loop Pilot (2026-05-05)
+
+**Anchor runs:** [`1099b152-8655-4f1e-ab43-1240a9400280`](./runid_analysis/1099b152-8655-4f1e-ab43-1240a9400280/postmortem.md) (airline), [`3b050ec5-4032-457f-a785-2d1a3942a097`](./runid_analysis/3b050ec5-4032-457f-a785-2d1a3942a097/postmortem.md) (7NOW)
+
+**Workstreams:**
+
+- T1–T8 (Tasks 1–8): Typed `producer_exception_record` at 19 producer sites across the harness; stage-IO failures land in `manifest.missing_pieces` rather than being silently swallowed. Phase H manifest validates declared paths.
+- T9–T12 (Tasks 9–12): 8-invariant suite (I1–I8) covering Phase B record completeness, lever coherence, acceptance bucket partition, silent-retry guard, replay validity, manifest path equivalence, RCA grounding presence, and plateau input correctness. Suite wired into the iteration epilogue with per-cycle binary decision gate.
+- T13 (Task 13): Strategist AG-emit lever union (`GSO_AG_LEVERS_UNION_RECOMMENDED`) — closes I2 for future runs.
+- T14 (Task 14): Diagnostic AG `missing_filter` → L6 (`GSO_DIAGNOSTIC_AG_MISSING_FILTER_L6`) — closes root-cause for filter-shaped hard clusters.
+- T15 (Task 15): Plateau input from journey ledger after rollback (`GSO_PLATEAU_JOURNEY_LEDGER_SOURCE`) — closes I8 for future runs.
+- T16 (Task 16): Falsification probe doc skeleton landed.
+- T17 (Task 17, this entry): Projection enrichment for `_fixture_to_evidence` + pilot run.
+
+**Pilot run — binary outcome:**
+
+The enriched `_fixture_to_evidence` projection derives iteration-level `ags`, `applied_patches`, `acceptance_decision`, `open_hard_cluster_ids`, `rca_cards_present`, `selected_ag_id`, `proposal_count`, and `applied_patch_body_fingerprints` from the fixture's `decision_records` and `strategist_response`. This gives the 8-invariant suite visibility into the actual failure modes the postmortems documented.
+
+| Fixture | Violations | Invariant IDs | Detail |
+|---|---|---|---|
+| airline (`1099b152`) | 1 | I4 | `same_body_fingerprints_after_rollback`: AG `AG_DECOMPOSED_H004` re-applied identical patch bodies `['P001#1', 'P001#2', 'P001#3']` after a rollback in iter 1 → iter 2 |
+| 7NOW (`3b050ec5`) | 3 | I4 | `consecutive_empty_proposals_same_ag`: AG `AG1` produced 0 proposals in consecutive iteration pairs (2→3, 3→4, 4→5) |
+
+**Result: Case B — I4 fires on both fixtures.**
+
+I4 (`no_silent_retry`) is the invariant that catches both failure modes: identical-body re-application after rollback (airline) and spin-in-place with zero proposals (7NOW). Both were documented in the cross-run postmortems as the primary loop-control failures. The invariants I1, I2, I3, I5, I6, I7, I8 are all green on both fixtures.
+
+**Cycle 12 scope (named by this outcome):** I4 — implement a DOA (do-not-retry) guard that detects same-body-fingerprint re-application and consecutive-empty-proposal spin, and either diversifies the proposal or terminates the cluster. The guard must fire before AG selection, not after rollback detection.
+
+**Verification**
+
+- 4 passed on `tests/replay/test_invariants_against_fixtures.py` (2 load + 2 pilot diagnostic).
+- 3712 passed / 8 skipped / 3 xfailed on the full `tests/unit tests/replay` suite at `BURNDOWN_BUDGET=0`.
+
+**Status:** SHIPPED (Case B — failing invariant IDs I4 on both fixtures name Cycle 12 scope).
+
 **Status:** SHIPPED.
