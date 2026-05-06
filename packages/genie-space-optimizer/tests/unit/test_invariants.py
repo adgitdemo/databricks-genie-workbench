@@ -56,3 +56,68 @@ def test_loop_invariants_strict_flag_default_on(monkeypatch) -> None:
     monkeypatch.delenv("GSO_LOOP_INVARIANTS_STRICT", raising=False)
     from genie_space_optimizer.common.config import loop_invariants_strict
     assert loop_invariants_strict() is True
+
+
+def test_i2_red_when_patch_lever_outside_ag_levers() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i2_lever_coherence
+
+    evidence = {
+        "iterations": [{
+            "iteration": 1,
+            "ags": [{
+                "id": "AG1",
+                "levers": [1, 5],
+                "source_cluster_ids": ["H002"],
+            }],
+            "applied_patches": [
+                {"ag_id": "AG1", "lever": 6, "proposal_id": "P5"},
+            ],
+            "clusters": [{"cluster_id": "H002", "recommended_levers": [3, 5]}],
+        }],
+    }
+    violations = check_i2_lever_coherence(evidence)
+    assert any(v["invariant_id"] == "I2" and "patch_lever_outside_ag" in v["title"]
+               for v in violations), violations
+
+
+def test_i2_red_when_ag_levers_missing_recommended() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i2_lever_coherence
+
+    evidence = {
+        "iterations": [{
+            "iteration": 1,
+            "ags": [{
+                "id": "AG1",
+                "levers": [1, 5],
+                "source_cluster_ids": ["H002"],
+            }],
+            "applied_patches": [
+                {"ag_id": "AG1", "lever": 5, "proposal_id": "P1"},
+            ],
+            "clusters": [{"cluster_id": "H002", "recommended_levers": [3, 5]}],
+        }],
+    }
+    violations = check_i2_lever_coherence(evidence)
+    assert any(v["invariant_id"] == "I2" and "ag_levers_missing_recommended" in v["title"]
+               for v in violations), violations
+
+
+def test_i2_green_when_levers_coherent() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i2_lever_coherence
+
+    evidence = {
+        "iterations": [{
+            "iteration": 1,
+            "ags": [{
+                "id": "AG1",
+                "levers": [3, 5, 6],
+                "source_cluster_ids": ["H002"],
+            }],
+            "applied_patches": [
+                {"ag_id": "AG1", "lever": 5, "proposal_id": "P1"},
+                {"ag_id": "AG1", "lever": 6, "proposal_id": "P2"},
+            ],
+            "clusters": [{"cluster_id": "H002", "recommended_levers": [3, 5]}],
+        }],
+    }
+    assert check_i2_lever_coherence(evidence) == []

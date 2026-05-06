@@ -75,7 +75,81 @@ def check_i1_phase_b_records_present(evidence: Mapping[str, Any]) -> list[dict]:
     return []
 
 
-# Stubs for I2..I8 — populated in subsequent tasks. The aggregator
+def _ag_levers(ag: Mapping[str, Any]) -> set[int]:
+    """Best-effort: read AG levers from the standard fields used by
+    the strategist + decomposer. Falls back to keys of
+    ``lever_directives``."""
+    levers = ag.get("levers") or ag.get("Levers")
+    if levers:
+        return {int(x) for x in levers if str(x).strip()}
+    directives = ag.get("lever_directives") or {}
+    return {int(k) for k in directives.keys() if str(k).strip().isdigit()}
+
+
+def check_i2_lever_coherence(evidence: Mapping[str, Any]) -> list[dict]:
+    """I2 — for each iteration, every applied patch's lever must be
+    within its AG's declared lever set, and the AG's lever set must
+    be a superset of every source cluster's ``recommended_levers``.
+    """
+    violations: list[dict] = []
+    for it in evidence.get("iterations") or []:
+        clusters_by_id = {
+            str(c.get("cluster_id") or ""): c
+            for c in (it.get("clusters") or [])
+        }
+        for ag in it.get("ags") or []:
+            ag_id = str(ag.get("id") or "")
+            ag_levers = _ag_levers(ag)
+            for cid in ag.get("source_cluster_ids") or []:
+                cluster = clusters_by_id.get(str(cid)) or {}
+                rec = {
+                    int(x) for x in (cluster.get("recommended_levers") or [])
+                    if str(x).strip()
+                }
+                missing = rec - ag_levers
+                if missing:
+                    violations.append(_violation(
+                        invariant_id="I2",
+                        title="ag_levers_missing_recommended",
+                        detail=(
+                            f"AG {ag_id} levers={sorted(ag_levers)} missing "
+                            f"recommended {sorted(missing)} from cluster {cid}"
+                        ),
+                        iteration=int(it.get("iteration") or 0),
+                        ag_id=ag_id,
+                        cluster_id=str(cid),
+                        ag_levers=sorted(ag_levers),
+                        missing_levers=sorted(missing),
+                    ))
+        applied_by_ag: dict[str, set[int]] = {}
+        for patch in it.get("applied_patches") or []:
+            ag_id = str(patch.get("ag_id") or "")
+            try:
+                lever = int(patch.get("lever"))
+            except (TypeError, ValueError):
+                continue
+            applied_by_ag.setdefault(ag_id, set()).add(lever)
+        ag_index = {str(a.get("id") or ""): a for a in it.get("ags") or []}
+        for ag_id, levers_used in applied_by_ag.items():
+            ag_levers = _ag_levers(ag_index.get(ag_id) or {})
+            outside = levers_used - ag_levers
+            if outside:
+                violations.append(_violation(
+                    invariant_id="I2",
+                    title="patch_lever_outside_ag",
+                    detail=(
+                        f"AG {ag_id} applied lever(s) {sorted(outside)} "
+                        f"not in declared {sorted(ag_levers)}"
+                    ),
+                    iteration=int(it.get("iteration") or 0),
+                    ag_id=ag_id,
+                    outside_levers=sorted(outside),
+                    ag_levers=sorted(ag_levers),
+                ))
+    return violations
+
+
+# Stubs for I3..I8 — populated in subsequent tasks. The aggregator
 # tolerates missing checks so each can land in its own commit.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
@@ -84,6 +158,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
     violations: list[dict] = []
     for check in (
         check_i1_phase_b_records_present,
+        check_i2_lever_coherence,
     ):
         try:
             violations.extend(check(evidence))
