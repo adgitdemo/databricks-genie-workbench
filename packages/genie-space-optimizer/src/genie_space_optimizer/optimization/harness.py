@@ -22084,6 +22084,66 @@ def _run_lever_loop(
         # before continuing.
         _render_current_journey()
 
+        # Cycle 11 Task 12 — run the invariant suite at end-of-iteration.
+        # Violations land as typed INVARIANT_VIOLATION records (warn-
+        # and-degrade in production); strict mode raises AssertionError
+        # for CI/replay. The per-iteration evidence dict is intentionally
+        # minimal in this commit — fixture-based pilot evaluation is
+        # the load-bearing path; richer live evidence is a Cycle 12
+        # follow-up.
+        try:
+            from genie_space_optimizer.common.config import (
+                loop_invariants_enabled as _inv_enabled,
+                loop_invariants_strict as _inv_strict,
+            )
+            if _inv_enabled():
+                from genie_space_optimizer.optimization.invariants import (
+                    run_invariants as _run_invariants,
+                )
+                from genie_space_optimizer.optimization.decision_emitters import (
+                    invariant_violation_record as _invariant_violation_record,
+                )
+
+                _iter_evidence = {
+                    "phase_b": {
+                        "total_records": len(
+                            _current_iter_inputs.get("decision_records") or []
+                        ),
+                        "producer_exceptions": dict(_iter_producer_exceptions or {}),
+                    },
+                    "replay_fixture_records": 0,
+                    "iterations": [],
+                    "manifest": {"declared_paths": [], "materialized_paths": []},
+                    "convergence": {},
+                }
+                _violations = _run_invariants(_iter_evidence)
+                if _violations and _inv_strict():
+                    raise AssertionError(
+                        f"INVARIANT_VIOLATION (strict): {_violations}"
+                    )
+                for _v in _violations:
+                    try:
+                        _rec = _invariant_violation_record(
+                            run_id=run_id,
+                            iteration=iteration_counter,
+                            violation=_v,
+                        )
+                        _current_iter_inputs.setdefault(
+                            "decision_records", []
+                        ).append(_rec.to_dict())
+                    except Exception:
+                        logger.debug(
+                            "Cycle 11 Task 12: invariant_violation_record emission failed",
+                            exc_info=True,
+                        )
+        except AssertionError:
+            raise
+        except Exception:
+            logger.debug(
+                "Cycle 11 Task 12: invariant suite execution failed (non-fatal)",
+                exc_info=True,
+            )
+
     write_stage(
         spark, run_id, "LEVER_LOOP_STARTED", "COMPLETE",
         task_key="lever_loop",
