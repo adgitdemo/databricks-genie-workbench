@@ -320,6 +320,12 @@ _warehouse_id = ctx["warehouse_id"].value or ""
 if _warehouse_id:
     _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = _warehouse_id
 
+# Cycle 11 — production defaults to warn-and-degrade for the loop
+# invariant suite (typed INVARIANT_VIOLATION records, no AssertionError
+# raise). CI / replay can override by setting
+# GSO_LOOP_INVARIANTS_STRICT=1 explicitly.
+_os.environ.setdefault("GSO_LOOP_INVARIANTS_STRICT", "0")
+
 baseline = get_baseline_eval_state(
     spark, run_id=run_id, catalog=catalog, schema=schema, dbutils=dbutils,
 )
