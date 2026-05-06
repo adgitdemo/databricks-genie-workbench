@@ -91,7 +91,9 @@ def test_diagnostic_action_group_flag_off_byte_stable(monkeypatch):
         "rca_id": "rca_abc",
     }
     ag = diagnostic_action_group_for_cluster(cluster)
-    assert set(ag["lever_directives"].keys()) == {"5"}
+    # Cycle 11: missing_filter re-routed from L5 (sql_shape) to L6
+    # (sql_snippet_filter) — update assertion from {"5"} to {"6"}.
+    assert set(ag["lever_directives"].keys()) == {"6"}
 
 
 def test_union_records_levers_before():

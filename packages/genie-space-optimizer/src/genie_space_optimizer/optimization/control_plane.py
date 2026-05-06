@@ -242,7 +242,7 @@ _DIAGNOSTIC_AG_DIRECTIVES: dict[str, dict[str, str]] = {
     "plural_top_n_collapse":     {"lever": "5", "kind": "sql_shape"},
     "missing_temporal_filter":   {"lever": "5", "kind": "sql_shape"},
     "time_window_pivot":         {"lever": "5", "kind": "sql_shape"},
-    "missing_filter":            {"lever": "5", "kind": "sql_shape"},
+    "missing_filter":            {"lever": "6", "kind": "sql_snippet_filter"},
     "wrong_filter_condition":    {"lever": "6", "kind": "sql_snippet_filter"},
     "missing_scd_filter":        {"lever": "6", "kind": "sql_snippet_filter"},
     "wrong_aggregation":         {"lever": "5", "kind": "sql_shape"},
