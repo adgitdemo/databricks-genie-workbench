@@ -22360,6 +22360,71 @@ def _run_lever_loop(
             }
             for _f in _capture_failures
         ]
+        # Cycle 11 Task 8 — extend missing_pieces with declared-paths
+        # that are absent from the live MLflow artifact listing. Closes
+        # the 7NOW missing_pieces=[] while 130/163 paths absent
+        # inconsistency. Gated by GSO_PHASE_H_MANIFEST_STRICT_VALIDATION.
+        try:
+            from genie_space_optimizer.common.config import (
+                phase_h_manifest_strict_validation_enabled as _phase_h_strict,
+            )
+            from genie_space_optimizer.optimization.run_output_contract import (
+                validate_phase_h_manifest_paths as _validate_phase_h_paths,
+            )
+
+            if _phase_h_strict():
+                # Flatten the nested bundle path dict into a flat list of strings.
+                _decl_paths_dict = _bundle_artifact_paths(
+                    iterations=_phase_h_iterations_completed,
+                )
+                _declared_paths: list[str] = []
+                for _k, _v in _decl_paths_dict.items():
+                    if _k == "iterations":
+                        for _iter_paths in (_v or {}).values():
+                            for _path in (_iter_paths or {}).values():
+                                if isinstance(_path, str):
+                                    _declared_paths.append(_path)
+                    elif isinstance(_v, str):
+                        _declared_paths.append(_v)
+
+                _materialized_paths: list[str] = []
+                try:
+                    if _phase_h_anchor_run_id:
+                        import mlflow as _mlflow
+                        _client = _mlflow.tracking.MlflowClient()
+                        # list_artifacts is non-recursive — walk recursively.
+                        def _walk_artifacts(prefix: str) -> None:
+                            try:
+                                for _art in _client.list_artifacts(
+                                    _phase_h_anchor_run_id, prefix
+                                ):
+                                    if _art.is_dir:
+                                        _walk_artifacts(_art.path)
+                                    else:
+                                        _materialized_paths.append(_art.path)
+                            except Exception:
+                                logger.debug(
+                                    "Phase H: list_artifacts walk failed at prefix=%s",
+                                    prefix, exc_info=True,
+                                )
+                        _walk_artifacts("gso_postmortem_bundle")
+                except Exception:
+                    logger.debug(
+                        "Phase H: MLflow listing for manifest validation failed",
+                        exc_info=True,
+                    )
+
+                _missing_pieces.extend(
+                    _validate_phase_h_paths(
+                        declared_paths=_declared_paths,
+                        materialized_paths=_materialized_paths,
+                    )
+                )
+        except Exception:
+            logger.debug(
+                "Phase H: manifest path validation failed (non-fatal)",
+                exc_info=True,
+            )
         _manifest = _build_manifest(
             optimization_run_id=run_id,
             databricks_job_id=_db_job_id,

@@ -5642,3 +5642,13 @@ def phase_b_producer_typed_exceptions_enabled() -> bool:
     ``GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS=0``.
     """
     return _flag_default_on("GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS")
+
+
+def phase_h_manifest_strict_validation_enabled() -> bool:
+    """Cycle 11 — after building the Phase H manifest, walk every
+    declared artifact-index path and stamp ``manifest_path_missing``
+    entries for those absent from MLflow. Closes the 7NOW
+    ``missing_pieces=[]`` while 130/163 paths missing inconsistency.
+    Default-on; rollback via ``GSO_PHASE_H_MANIFEST_STRICT_VALIDATION=0``.
+    """
+    return _flag_default_on("GSO_PHASE_H_MANIFEST_STRICT_VALIDATION")

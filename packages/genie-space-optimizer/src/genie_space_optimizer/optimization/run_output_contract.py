@@ -207,3 +207,26 @@ def bundle_artifact_paths(*, iterations: list[int]) -> dict[str, Any]:
             "stages":              f"{prefix}/stages",
         }
     return paths
+
+
+def validate_phase_h_manifest_paths(
+    *,
+    declared_paths,
+    materialized_paths,
+) -> list[dict]:
+    """Cycle 11 — return one ``manifest_path_missing`` entry per declared
+    Phase H artifact path that is absent from the materialized set.
+
+    Pure: no I/O. The harness performs the MLflow listing and feeds
+    the result here.
+    """
+    materialized_set = {str(p) for p in (materialized_paths or [])}
+    missing: list[dict] = []
+    for path in declared_paths or []:
+        path_str = str(path)
+        if path_str not in materialized_set:
+            missing.append({
+                "kind": "manifest_path_missing",
+                "artifact_path": path_str,
+            })
+    return missing
