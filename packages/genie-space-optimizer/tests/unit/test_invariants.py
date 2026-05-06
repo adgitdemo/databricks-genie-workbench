@@ -170,3 +170,48 @@ def test_i3_red_when_qid_in_two_buckets() -> None:
         v["invariant_id"] == "I3" and "double_counted" in v["title"]
         for v in check_i3_acceptance_buckets(evidence)
     )
+
+
+def test_i4_red_on_consecutive_empty_proposals_same_ag() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i4_no_silent_retry
+
+    evidence = {"iterations": [
+        {"iteration": 1, "selected_ag_id": "AG1", "proposal_count": 0},
+        {"iteration": 2, "selected_ag_id": "AG1", "proposal_count": 0},
+    ]}
+    violations = check_i4_no_silent_retry(evidence)
+    assert any(v["invariant_id"] == "I4" for v in violations)
+
+
+def test_i4_red_on_same_body_fingerprint_set_after_rollback() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i4_no_silent_retry
+
+    evidence = {"iterations": [
+        {
+            "iteration": 1, "selected_ag_id": "AG_H004",
+            "proposal_count": 4,
+            "applied_patch_body_fingerprints": ["fp_a", "fp_b"],
+            "acceptance_decision": {"reason_code": "target_still_hard_qids"},
+        },
+        {
+            "iteration": 2, "selected_ag_id": "AG_H004",
+            "proposal_count": 4,
+            "applied_patch_body_fingerprints": ["fp_a", "fp_b"],
+            "acceptance_decision": {},
+        },
+    ]}
+    violations = check_i4_no_silent_retry(evidence)
+    assert any(
+        v["invariant_id"] == "I4" and "same_body_fingerprints" in v["title"]
+        for v in violations
+    )
+
+
+def test_i4_green_when_ag_rotates() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i4_no_silent_retry
+
+    evidence = {"iterations": [
+        {"iteration": 1, "selected_ag_id": "AG_H004", "proposal_count": 0},
+        {"iteration": 2, "selected_ag_id": "AG_H001", "proposal_count": 3},
+    ]}
+    assert check_i4_no_silent_retry(evidence) == []

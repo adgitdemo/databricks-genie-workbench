@@ -211,7 +211,63 @@ def check_i3_acceptance_buckets(evidence: Mapping[str, Any]) -> list[dict]:
     return violations
 
 
-# Stubs for I4..I8 — populated in subsequent tasks. The aggregator
+def check_i4_no_silent_retry(evidence: Mapping[str, Any]) -> list[dict]:
+    """I4 — no two consecutive iterations may select the same AG with
+    the same applied-patch body-fingerprint set OR with empty proposals.
+    Closes airline iter-1/iter-2 H004 retread and 7NOW iter-2..5 spin."""
+    violations: list[dict] = []
+    iters = list(evidence.get("iterations") or [])
+    for i in range(1, len(iters)):
+        prev = iters[i - 1]
+        curr = iters[i]
+        prev_ag = str(prev.get("selected_ag_id") or "")
+        curr_ag = str(curr.get("selected_ag_id") or "")
+        if not prev_ag or prev_ag != curr_ag:
+            continue
+        prev_count = int(prev.get("proposal_count") or 0)
+        curr_count = int(curr.get("proposal_count") or 0)
+        if prev_count == 0 and curr_count == 0:
+            violations.append(_violation(
+                invariant_id="I4",
+                title="consecutive_empty_proposals_same_ag",
+                detail=(
+                    f"AG {curr_ag} produced 0 proposals in iterations "
+                    f"{prev.get('iteration')} and {curr.get('iteration')}"
+                ),
+                iteration=int(curr.get("iteration") or 0),
+                ag_id=curr_ag,
+            ))
+            continue
+        prev_acc = dict(prev.get("acceptance_decision") or {})
+        prev_was_rollback = (
+            str(prev_acc.get("reason_code") or "")
+            != "target_fixed_qids"  # any non-fixed reason ⇒ rollback
+            and prev_acc != {}
+        )
+        if not prev_was_rollback:
+            continue
+        prev_fp = sorted(
+            str(f) for f in (prev.get("applied_patch_body_fingerprints") or [])
+        )
+        curr_fp = sorted(
+            str(f) for f in (curr.get("applied_patch_body_fingerprints") or [])
+        )
+        if prev_fp and prev_fp == curr_fp:
+            violations.append(_violation(
+                invariant_id="I4",
+                title="same_body_fingerprints_after_rollback",
+                detail=(
+                    f"AG {curr_ag} re-applied identical patch bodies "
+                    f"{prev_fp} after a rollback"
+                ),
+                iteration=int(curr.get("iteration") or 0),
+                ag_id=curr_ag,
+                fingerprints=prev_fp,
+            ))
+    return violations
+
+
+# Stubs for I5..I8 — populated in subsequent tasks. The aggregator
 # tolerates missing checks so each can land in its own commit.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
@@ -222,6 +278,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
         check_i1_phase_b_records_present,
         check_i2_lever_coherence,
         check_i3_acceptance_buckets,
+        check_i4_no_silent_retry,
     ):
         try:
             violations.extend(check(evidence))
