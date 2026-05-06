@@ -5668,3 +5668,13 @@ def loop_invariants_strict() -> bool:
     production rollback via ``GSO_LOOP_INVARIANTS_STRICT=0``.
     """
     return _flag_default_on("GSO_LOOP_INVARIANTS_STRICT")
+
+
+def ag_levers_union_strategist_path_enabled() -> bool:
+    """Cycle 11 — apply union_ag_levers_with_recommended to
+    strategist-emit AGs (primary AG_DECOMPOSED_* / AG1 path), not
+    just to coverage AGs as in Cycle 10 W2. Closes 7NOW H002 lever
+    drift. Default-on; rollback via
+    ``GSO_AG_LEVERS_UNION_STRATEGIST_PATH=0``.
+    """
+    return _flag_default_on("GSO_AG_LEVERS_UNION_STRATEGIST_PATH")

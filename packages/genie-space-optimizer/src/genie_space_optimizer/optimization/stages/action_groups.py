@@ -190,6 +190,51 @@ def _apply_bucket_policy(
     return out
 
 
+def normalize_strategist_ags_with_recommended_levers(
+    *,
+    ags,
+    clusters,
+):
+    """Cycle 11 — union ``cluster.recommended_levers`` into every
+    strategist-emit AG's ``lever_directives``. Mirrors the union the
+    coverage path performs (control_plane.union_ag_levers_with_recommended)
+    so the strategist path stops drifting from cluster RCA.
+
+    Pure. No-op when ``GSO_AG_LEVERS_UNION_STRATEGIST_PATH=0`` or
+    ``GSO_AG_LEVERS_UNION_RECOMMENDED=0``.
+    """
+    from genie_space_optimizer.common.config import (
+        ag_levers_union_recommended_enabled,
+        ag_levers_union_strategist_path_enabled,
+    )
+    if not (
+        ag_levers_union_recommended_enabled()
+        and ag_levers_union_strategist_path_enabled()
+    ):
+        return list(ags or [])
+
+    from genie_space_optimizer.optimization.control_plane import (
+        union_ag_levers_with_recommended,
+    )
+
+    cluster_by_id = {
+        str(c.get("cluster_id") or ""): c for c in (clusters or [])
+        if c.get("cluster_id")
+    }
+    out = []
+    for ag in ags or []:
+        src_ids = [
+            str(cid) for cid in (ag.get("source_cluster_ids") or [])
+            if str(cid)
+        ]
+        if not src_ids:
+            out.append(ag)
+            continue
+        primary = cluster_by_id.get(src_ids[0]) or {}
+        out.append(union_ag_levers_with_recommended(ag=ag, cluster=primary))
+    return out
+
+
 def select(ctx, inp: ActionGroupsInput) -> ActionGroupSlate:
     """Stage 4 entry. Emits STRATEGIST_AG_EMITTED records and returns a
     typed slate. F4 is observability-only — does NOT invoke the
@@ -218,6 +263,17 @@ def select(ctx, inp: ActionGroupsInput) -> ActionGroupSlate:
         )
     else:
         filtered_ags = tuple(inp.action_groups)
+
+    # Cycle 11 Task 13 — union cluster.recommended_levers into
+    # strategist-emit AG lever_directives so the strategist path
+    # honours cluster RCA. Closes 7NOW H002 drift.
+    filtered_ags = tuple(
+        normalize_strategist_ags_with_recommended_levers(
+            ags=list(filtered_ags),
+            clusters=list(inp.source_clusters_by_id.values())
+                if inp.source_clusters_by_id else [],
+        )
+    )
 
     records = strategist_ag_records(
         run_id=ctx.run_id,
