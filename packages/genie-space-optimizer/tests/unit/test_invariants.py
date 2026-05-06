@@ -307,3 +307,45 @@ def test_i7_green_when_rca_card_present() -> None:
         "decision_records": [],
     }]}
     assert check_i7_rca_grounding(evidence) == []
+
+
+def test_i8_red_when_plateau_currently_failing_diverges_from_journey() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i8_plateau_input
+
+    evidence = {
+        "convergence": {"reason": "plateau_no_open_failures"},
+        "plateau_input": {
+            "source": "candidate_eval",
+            "currently_failing_qids": [],
+        },
+        "final_iteration_journey_hard_qids": [
+            "q_007", "q_009", "q_013", "q_024",
+        ],
+    }
+    violations = check_i8_plateau_input(evidence)
+    assert any(v["invariant_id"] == "I8" for v in violations)
+
+
+def test_i8_green_when_inputs_align() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i8_plateau_input
+
+    evidence = {
+        "convergence": {"reason": "plateau_no_open_failures"},
+        "plateau_input": {
+            "source": "journey_ledger",
+            "currently_failing_qids": [],
+        },
+        "final_iteration_journey_hard_qids": [],
+    }
+    assert check_i8_plateau_input(evidence) == []
+
+
+def test_i8_no_op_when_terminal_reason_is_not_plateau() -> None:
+    from genie_space_optimizer.optimization.invariants import check_i8_plateau_input
+
+    evidence = {
+        "convergence": {"reason": "lever_loop_completed"},
+        "plateau_input": {},
+        "final_iteration_journey_hard_qids": ["q_007"],
+    }
+    assert check_i8_plateau_input(evidence) == []

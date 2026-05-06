@@ -344,8 +344,40 @@ def check_i7_rca_grounding(evidence: Mapping[str, Any]) -> list[dict]:
     return violations
 
 
-# Stub for I8 — populated in the next task. The aggregator tolerates
-# missing checks so each can land in its own commit.
+def check_i8_plateau_input(evidence: Mapping[str, Any]) -> list[dict]:
+    """I8 — when the run terminated via plateau, the plateau decision's
+    currently_failing input must equal the union of journey-ledger
+    hard-cluster qids in the final iteration. Closes airline
+    `plateau_no_open_failures` with 4 open hard clusters."""
+    reason = str((evidence.get("convergence") or {}).get("reason") or "")
+    if not reason.startswith("plateau_"):
+        return []
+    plateau_input = dict(evidence.get("plateau_input") or {})
+    currently_failing = {
+        str(q) for q in (plateau_input.get("currently_failing_qids") or [])
+        if str(q)
+    }
+    journey_hard = {
+        str(q) for q in (evidence.get("final_iteration_journey_hard_qids") or [])
+        if str(q)
+    }
+    if currently_failing == journey_hard:
+        return []
+    return [_violation(
+        invariant_id="I8",
+        title="plateau_input_diverges_from_journey_ledger",
+        detail=(
+            f"plateau currently_failing={sorted(currently_failing)} "
+            f"!= journey hard={sorted(journey_hard)}; "
+            f"source={plateau_input.get('source')!r}"
+        ),
+        plateau_currently_failing=sorted(currently_failing),
+        journey_hard=sorted(journey_hard),
+        plateau_source=str(plateau_input.get("source") or ""),
+    )]
+
+
+# All 8 invariants (I1–I8) are now implemented and wired in run_invariants.
 
 def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
     """Aggregate every implemented invariant check; return all
@@ -359,6 +391,7 @@ def run_invariants(evidence: Mapping[str, Any]) -> list[dict]:
         check_i5_replay_validity,
         check_i6_manifest_paths,
         check_i7_rca_grounding,
+        check_i8_plateau_input,
     ):
         try:
             violations.extend(check(evidence))
