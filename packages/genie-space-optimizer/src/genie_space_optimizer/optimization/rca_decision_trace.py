@@ -576,10 +576,13 @@ TYPE_TO_SECTION: Mapping[DecisionType, str] = {
     # Cycle 5 T1: budget decisions answer "what did the loop do next?"
     # — they belong in the Next Suggested Action section.
     DecisionType.ITERATION_BUDGET_DECISION: SECTION_NEXT_ACTION,
-    # Cycle 11 — producer exceptions surface in Next Suggested Action so
-    # the operator sees them alongside budget accounting (both are
-    # harness-level signals that require follow-up action).
-    DecisionType.PRODUCER_EXCEPTION: SECTION_NEXT_ACTION,
+    # Cycle 11 — PRODUCER_EXCEPTION is an infrastructure hard failure (a
+    # producer try/except site fired).  It belongs in SECTION_HARD_FAILURES
+    # alongside QID-level hard failures so it renders via _format_record_line
+    # and surfaces reason_detail (exception class + repr) and ag_id to the
+    # operator.  SECTION_NEXT_ACTION only renders next_actions[0] and the
+    # helper sets no next_action, so the exception details would be invisible.
+    DecisionType.PRODUCER_EXCEPTION: SECTION_HARD_FAILURES,
 }
 
 

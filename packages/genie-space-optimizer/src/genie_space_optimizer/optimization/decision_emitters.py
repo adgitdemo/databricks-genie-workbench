@@ -35,6 +35,7 @@ Plan: ``docs/2026-05-02-unified-trace-and-operator-transcript-plan.md``
 from __future__ import annotations
 
 import os
+import traceback
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
@@ -1250,11 +1251,9 @@ def producer_exception_record(
 
     Pure: no I/O, no clock, no logger.
     """
-    import traceback as _traceback
-
     repr_text = repr(exception)[:512]
     try:
-        tb_lines = _traceback.format_exception(
+        tb_lines = traceback.format_exception(
             type(exception), exception, exception.__traceback__,
         )
         tb_head = ("".join(tb_lines))[:2048]
