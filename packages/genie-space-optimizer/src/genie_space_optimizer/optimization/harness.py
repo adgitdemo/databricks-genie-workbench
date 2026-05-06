@@ -302,6 +302,43 @@ def _build_iteration_summary_dict(
     return out
 
 
+def _stamp_iteration_stub(
+    *,
+    iter_traces: dict[int, Any],
+    iter_summaries: dict[int, dict[str, Any]],
+    iteration: int,
+) -> None:
+    """Pre-stamp ``iter_traces[iteration]`` and ``iter_summaries[iteration]``
+    with empty placeholders.
+
+    Called immediately after ``iteration_counter += 1`` so every iteration
+    that started — including those that exit via ``continue`` / ``break``
+    before the end-of-body finalise — has a renderable entry in the
+    operator transcript. ``_finalize_iteration_summary`` overwrites this
+    stub with rich data at every known exit path; if a future exit path
+    is added without the finalise call, the iteration still renders with
+    ``exit_path=in_progress`` instead of disappearing.
+    """
+    from genie_space_optimizer.optimization.rca_decision_trace import (
+        OptimizationTrace as _PhaseH_OptimizationTrace,
+    )
+    iter_traces[iteration] = _PhaseH_OptimizationTrace(
+        journey_events=tuple(),
+        decision_records=tuple(),
+    )
+    iter_summaries[iteration] = _build_iteration_summary_dict(
+        iteration=iteration,
+        accepted_count=0,
+        rolled_back_count=0,
+        skipped_count=0,
+        gate_drop_count=0,
+        decision_record_count=0,
+        journey_violation_count=0,
+        iteration_accuracy_percent=None,
+        exit_path="in_progress",
+    )
+
+
 def _build_loop_out_with_pretty_print(
     *,
     loop_out_base: dict,
