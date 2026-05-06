@@ -25,11 +25,14 @@ FIXTURES = {
 }
 
 
-@pytest.fixture(params=sorted(FIXTURES.keys()), scope="module")
+@pytest.fixture(params=sorted(FIXTURES.keys()))
 def fixture(request) -> dict:
     path = FIXTURES[request.param]
     if not path.exists():
-        pytest.skip(f"fixture missing at {path}")
+        pytest.fail(
+            f"Committed regression fixture missing at {path}. "
+            "This file must always be present — do not delete it."
+        )
     return json.loads(path.read_text())
 
 
