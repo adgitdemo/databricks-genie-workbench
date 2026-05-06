@@ -5678,3 +5678,14 @@ def ag_levers_union_strategist_path_enabled() -> bool:
     ``GSO_AG_LEVERS_UNION_STRATEGIST_PATH=0``.
     """
     return _flag_default_on("GSO_AG_LEVERS_UNION_STRATEGIST_PATH")
+
+
+def plateau_input_uses_journey_after_rollback_enabled() -> bool:
+    """Cycle 11 — after a rollback, the plateau decision's
+    ``currently_failing`` input is sourced from the journey ledger's
+    current-baseline hard-cluster qid set, not from the candidate's
+    eval. Closes airline `plateau_no_open_failures` with 4 open
+    clusters. Default-on; rollback via
+    ``GSO_PLATEAU_INPUT_USES_JOURNEY_AFTER_ROLLBACK=0``.
+    """
+    return _flag_default_on("GSO_PLATEAU_INPUT_USES_JOURNEY_AFTER_ROLLBACK")

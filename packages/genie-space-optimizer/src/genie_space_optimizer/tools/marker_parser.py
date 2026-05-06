@@ -28,6 +28,7 @@ class MarkerLog:
     convergence: Mapping[str, Any] | None
     artifact_index: Mapping[str, Any] | None = None
     bundle_assembly_failed: tuple[Mapping[str, Any], ...] = ()
+    plateau_input_source: tuple[Mapping[str, Any], ...] = ()
     unknown: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
     parse_errors: tuple[str, ...] = field(default_factory=tuple)
 
@@ -54,6 +55,7 @@ def parse_markers(stdout: str) -> MarkerLog:
     convergence: Mapping[str, Any] | None = None
     artifact_index: Mapping[str, Any] | None = None
     bundle_assembly_failed: list[Mapping[str, Any]] = []
+    plateau_input_source: list[Mapping[str, Any]] = []
     unknown: dict[str, list[Mapping[str, Any]]] = {}
     errors: list[str] = []
 
@@ -88,6 +90,8 @@ def parse_markers(stdout: str) -> MarkerLog:
             artifact_index = payload
         elif name == "GSO_BUNDLE_ASSEMBLY_FAILED_V1":
             bundle_assembly_failed.append(payload)
+        elif name == "GSO_PLATEAU_INPUT_SOURCE_V1":
+            plateau_input_source.append(payload)
         else:
             unknown.setdefault(name, []).append(payload)
 
@@ -101,6 +105,7 @@ def parse_markers(stdout: str) -> MarkerLog:
         convergence=convergence,
         artifact_index=artifact_index,
         bundle_assembly_failed=tuple(bundle_assembly_failed),
+        plateau_input_source=tuple(plateau_input_source),
         unknown={k: tuple(v) for k, v in unknown.items()},
         parse_errors=tuple(errors),
     )
@@ -295,4 +300,22 @@ def parse_ag_levers_unioned_marker(line: str) -> dict:
         "cluster_id": str(payload.get("cluster_id") or ""),
         "levers_before": [str(l) for l in (payload.get("levers_before") or [])],
         "levers_after": [str(l) for l in (payload.get("levers_after") or [])],
+    }
+
+
+def parse_plateau_input_source_marker(line: str) -> dict:
+    """Parse ``GSO_PLATEAU_INPUT_SOURCE_V1 {json}`` (Cycle 11 Task 15).
+
+    Returns ``{"optimization_run_id", "iteration", "source",
+    "qids_count", "last_acceptance_was_rollback"}``.
+    """
+    payload = _parse_named_marker(line, "GSO_PLATEAU_INPUT_SOURCE_V1")
+    return {
+        "optimization_run_id": str(payload.get("optimization_run_id") or ""),
+        "iteration": int(payload.get("iteration") or 0),
+        "source": str(payload.get("source") or ""),
+        "qids_count": int(payload.get("qids_count") or 0),
+        "last_acceptance_was_rollback": bool(
+            payload.get("last_acceptance_was_rollback")
+        ),
     }

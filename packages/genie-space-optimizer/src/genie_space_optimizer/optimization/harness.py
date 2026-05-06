@@ -2067,6 +2067,37 @@ def compute_current_hard_qids(
     return base | quarantined_active
 
 
+def select_plateau_currently_failing(
+    *,
+    candidate_eval_failing,
+    journey_ledger_hard_qids,
+    last_acceptance_was_rollback: bool,
+) -> frozenset:
+    """Cycle 11 — pick the right ``currently_failing`` input for the
+    plateau decision.
+
+    When the most recent acceptance was a rollback, the candidate
+    eval represents the *rejected* candidate's failure set, not the
+    accepted baseline's. The plateau guard must instead consult the
+    journey ledger's current-baseline hard-cluster qid set so a
+    rolled-back AG can never be projected as ``no_open_failures``.
+
+    No-op fallback (returns ``candidate_eval_failing``) when
+    ``GSO_PLATEAU_INPUT_USES_JOURNEY_AFTER_ROLLBACK=0``.
+
+    Pure: no I/O.
+    """
+    from genie_space_optimizer.common.config import (
+        plateau_input_uses_journey_after_rollback_enabled,
+    )
+    if (
+        last_acceptance_was_rollback
+        and plateau_input_uses_journey_after_rollback_enabled()
+    ):
+        return frozenset(journey_ledger_hard_qids or ())
+    return frozenset(candidate_eval_failing or ())
+
+
 def compute_proposal_consumed_flag(
     *,
     proposal: dict,
@@ -13535,14 +13566,47 @@ def _run_lever_loop(
             # soft-skipped gs_009 / gs_024 into the quarantine bucket,
             # which made ``_current_hard_qids`` empty at the plateau
             # decision and bypassed the Cycle 9 W2 open-hard guard.
+            # Cycle 11 Task 15 — pick the right currently_failing source
+            # for the plateau decision. After a rollback, candidate-eval
+            # state may not reflect what the journey ledger considers
+            # still-hard. _state_iter (loaded above via
+            # load_latest_state_iteration) already gives us the COMMITTED
+            # baseline — i.e., the rollback-aware view — so on this
+            # codepath candidate_eval_failing is effectively the journey-
+            # ledger view today. We pass last_acceptance_was_rollback=False
+            # as the safe default; the helper is a no-op in that case
+            # but is now a stable contract for future cycles. A richer
+            # rollback-flag accumulator is a Cycle 12 follow-up.
             _current_hard_qids = set(
                 compute_current_hard_qids(
-                    currently_failing=frozenset(_current_hard_qids_raw),
+                    currently_failing=select_plateau_currently_failing(
+                        candidate_eval_failing=frozenset(_current_hard_qids_raw),
+                        journey_ledger_hard_qids=frozenset(_current_hard_qids_raw),
+                        last_acceptance_was_rollback=False,
+                    ),
                     convergence_quarantined=frozenset(_quarantined_qids),
                     retired_by_sql_delta=frozenset(),
                     debt=frozenset(_regression_debt_qids),
                 )
             )
+            # Cycle 11 Task 15 — emit the plateau-input source marker.
+            try:
+                from genie_space_optimizer.common.mlflow_markers import (
+                    plateau_input_source_marker as _plateau_marker,
+                )
+                _msg = _plateau_marker(
+                    optimization_run_id=run_id,
+                    iteration=_iter_num,
+                    source="candidate_eval",  # safe default; richer wiring is Cycle 12
+                    qids_count=len(_current_hard_qids_raw),
+                    last_acceptance_was_rollback=False,
+                )
+                logger.info(_msg)
+            except Exception:
+                logger.debug(
+                    "Cycle 11 Task 15: plateau_input_source_marker emission failed (non-fatal)",
+                    exc_info=True,
+                )
             # Task 20 — collect target qids for which any rejected AG
             # produced an SQL-shape delta. The resolver routes these to
             # UNRESOLVED_HARD_FAILURE_WITH_UNTRIED_SQL_DELTA so the loop

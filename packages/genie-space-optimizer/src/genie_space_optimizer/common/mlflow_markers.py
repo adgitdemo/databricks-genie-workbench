@@ -187,3 +187,23 @@ def ag_levers_unioned_marker(
         "levers_after": [str(l) for l in (levers_after or ())],
     }
     return "GSO_AG_LEVERS_UNIONED_V1 " + json.dumps(payload, sort_keys=True)
+
+
+def plateau_input_source_marker(
+    *,
+    optimization_run_id: str,
+    iteration: int,
+    source: str,
+    qids_count: int,
+    last_acceptance_was_rollback: bool,
+) -> str:
+    """Cycle 11 — emit at every plateau decision the source of the
+    currently_failing input ('candidate_eval' or 'journey_ledger')."""
+    payload = {
+        "optimization_run_id": str(optimization_run_id),
+        "iteration": int(iteration),
+        "source": str(source),
+        "qids_count": int(qids_count),
+        "last_acceptance_was_rollback": bool(last_acceptance_was_rollback),
+    }
+    return "GSO_PLATEAU_INPUT_SOURCE_V1 " + json.dumps(payload, sort_keys=True)
