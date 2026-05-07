@@ -8,10 +8,22 @@ import sys
 from datetime import datetime
 
 
+def path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        # Databricks workspace-backed paths can raise PermissionError when
+        # probing a missing sibling inside a Git folder.
+        return False
+
+
 def find_repo_root(start: Path) -> Path:
-    current = start.resolve()
+    try:
+        current = start.resolve()
+    except OSError:
+        current = start.absolute()
     for candidate in [current, *current.parents]:
-        if (candidate / "app.yaml").exists() and (candidate / "pyproject.toml").exists():
+        if path_exists(candidate / "app.yaml") and path_exists(candidate / "pyproject.toml"):
             return candidate
     raise RuntimeError("Could not locate repo root containing app.yaml and pyproject.toml")
 

@@ -583,7 +583,7 @@ import json
 
 scopes = ['sql', 'dashboards.genie', 'serving.serving-endpoints',
           'catalog.catalogs:read', 'catalog.schemas:read',
-          'catalog.tables:read', 'files.files']
+          'catalog.tables:read', 'files.files', 'iam.access-control:read']
 
 # Start with existing resources. The PATCH API replaces all resources,
 # so we must include everything. Preserve all resources that either have

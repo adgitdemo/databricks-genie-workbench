@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 from pathlib import Path
 import shutil
 from typing import Iterable
@@ -107,13 +108,18 @@ def should_copy(path: Path, repo_root: Path) -> bool:
 
 def iter_runtime_files(repo_root: Path) -> Iterable[Path]:
     for path in repo_root.rglob("*"):
-        if path.is_file() and should_copy(path, repo_root):
+        try:
+            is_file = path.is_file()
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTSUP, errno.EPERM):
+                raise
+            continue
+        if is_file and should_copy(path, repo_root):
             yield path
 
 
 def _can_use_local_path(path: str) -> bool:
-    p = Path(path)
-    return path.startswith("/Workspace/") and (Path("/Workspace").exists() or p.parent.exists())
+    return False
 
 
 def _api_do(w, method: str, path: str, body: dict | None = None) -> dict:
@@ -209,6 +215,12 @@ def prepare_workspace_source(w, cfg: InstallConfig, deployer_user: str) -> str:
 
     for src in iter_runtime_files(repo_root):
         rel = src.relative_to(repo_root).as_posix()
-        write_workspace_file(w, f"{source_path}/{rel}", src.read_bytes())
+        try:
+            content = src.read_bytes()
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTSUP, errno.EPERM):
+                raise
+            continue
+        write_workspace_file(w, f"{source_path}/{rel}", content)
 
     return source_path
