@@ -562,6 +562,30 @@ def test_wait_for_deployment_accepts_changed_active_when_submitted_token_differs
     assert app["pending_deployment"]["status"]["state"] == "SUCCEEDED"
 
 
+def test_wait_for_deployment_accepts_changed_active_without_deployment_token(monkeypatch):
+    monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): [
+                {"active_deployment": {"status": {"state": "SUCCEEDED"}, "create_time": "old"}},
+                {"active_deployment": {"status": {"state": "SUCCEEDED"}, "create_time": "new"}},
+            ]
+        }
+    )
+
+    app = wait_for_deployment(
+        w,
+        "genie-workbench",
+        submitted_deployment={"deployment_id": "post-response-token"},
+        baseline_active_fingerprint='{"create_time": "old", "status": {"state": "SUCCEEDED"}}',
+        timeout_seconds=1,
+        poll_seconds=0,
+    )
+
+    assert app["pending_deployment"]["create_time"] == "new"
+    assert app["pending_deployment"]["status"]["state"] == "SUCCEEDED"
+
+
 def test_wait_for_deployment_selects_failed_submitted_deployment(monkeypatch):
     monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
     w = FakeWorkspaceClient(

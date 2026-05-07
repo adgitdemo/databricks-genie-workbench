@@ -8,6 +8,7 @@ from typing import Any
 from .app_yaml import render_app_yaml
 from .apps import (
     deploy_app_from_workspace,
+    deployment_fingerprint,
     deployment_token,
     ensure_app,
     get_app,
@@ -98,7 +99,9 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     resources_payload = patch_app_resources(w, cfg, lakebase)
     status("Triggering Databricks App deployment...")
     deployment_baseline = get_app(w, cfg.app_name) or {}
-    baseline_active_token = deployment_token(deployment_baseline.get("active_deployment"))
+    baseline_active = deployment_baseline.get("active_deployment")
+    baseline_active_token = deployment_token(baseline_active)
+    baseline_active_fingerprint = deployment_fingerprint(baseline_active)
     submitted_deployment = deploy_app_from_workspace(w, cfg.app_name, source_path)
     status("Waiting for app deployment status...")
     deployed_app = wait_for_deployment(
@@ -106,6 +109,7 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
         cfg.app_name,
         submitted_deployment=submitted_deployment,
         baseline_active_token=baseline_active_token,
+        baseline_active_fingerprint=baseline_active_fingerprint,
         timeout_seconds=180,
         poll_seconds=10,
     )

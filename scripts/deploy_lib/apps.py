@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -212,6 +213,28 @@ def deployment_state(deployment: dict[str, Any] | None) -> str:
     return str(((deployment.get("status") or {}).get("state") or "UNKNOWN")).upper()
 
 
+def deployment_fingerprint(deployment: dict[str, Any] | None) -> str:
+    if not isinstance(deployment, dict) or not deployment:
+        return ""
+    token = deployment_token(deployment)
+    if token:
+        return f"id:{token}"
+    return json.dumps(deployment, sort_keys=True, default=str)
+
+
+def deployment_changed(
+    deployment: dict[str, Any] | None,
+    *,
+    baseline_token: str | None = None,
+    baseline_fingerprint: str | None = None,
+) -> bool:
+    token = deployment_token(deployment)
+    if token:
+        return token != (baseline_token or "")
+    fingerprint = deployment_fingerprint(deployment)
+    return bool(fingerprint and fingerprint != (baseline_fingerprint or ""))
+
+
 def _selected_app(app: dict[str, Any], deployment: dict[str, Any]) -> dict[str, Any]:
     selected = dict(app)
     selected["pending_deployment"] = deployment
@@ -241,6 +264,7 @@ def wait_for_deployment(
     *,
     submitted_deployment: dict[str, Any] | None = None,
     baseline_active_token: str | None = None,
+    baseline_active_fingerprint: str | None = None,
     timeout_seconds: int = 180,
     poll_seconds: int = 10,
 ) -> dict[str, Any]:
@@ -249,13 +273,14 @@ def wait_for_deployment(
     deadline = time.time() + timeout_seconds
     last_app: dict[str, Any] = {}
     observed_pending = False
-    baseline_captured = baseline_active_token is not None
+    baseline_captured = baseline_active_token is not None or baseline_active_fingerprint is not None
     while time.time() < deadline:
         last_app = get_app(w, app_name) or {}
         pending = last_app.get("pending_deployment") or {}
         active = last_app.get("active_deployment") or {}
         if wait_for_submitted and not baseline_captured:
             baseline_active_token = deployment_token(active)
+            baseline_active_fingerprint = deployment_fingerprint(active)
             baseline_captured = True
 
         if submitted_token:
@@ -270,10 +295,12 @@ def wait_for_deployment(
                 if deployment_state(pending) not in DEPLOYMENT_PENDING_STATES:
                     return _selected_app(last_app, pending)
             elif active:
-                active_token = deployment_token(active)
                 if (
-                    active_token
-                    and active_token != (baseline_active_token or "")
+                    deployment_changed(
+                        active,
+                        baseline_token=baseline_active_token,
+                        baseline_fingerprint=baseline_active_fingerprint,
+                    )
                     and deployment_state(active) not in DEPLOYMENT_PENDING_STATES
                 ):
                     return _selected_app(last_app, active)
@@ -283,10 +310,12 @@ def wait_for_deployment(
                 if deployment_state(pending) not in DEPLOYMENT_PENDING_STATES:
                     return _selected_app(last_app, pending)
             elif observed_pending and active:
-                active_token = deployment_token(active)
                 if (
-                    active_token
-                    and active_token != baseline_active_token
+                    deployment_changed(
+                        active,
+                        baseline_token=baseline_active_token,
+                        baseline_fingerprint=baseline_active_fingerprint,
+                    )
                     and deployment_state(active) not in DEPLOYMENT_PENDING_STATES
                 ):
                     return _selected_app(last_app, active)
