@@ -222,7 +222,7 @@ def test_patch_app_resources_preserves_existing_and_adds_postgres():
     assert resources["sql-warehouse"]["sql_warehouse"]["id"] == "warehouse-1"
     assert resources["postgres"]["postgres"]["permission"] == "CAN_CONNECT_AND_CREATE"
     assert "keep-me" in resources
-    assert "iam.access-control:read" in payload["user_api_scopes"]
+    assert "iam.access-control:read" not in payload["user_api_scopes"]
     assert any(call[0] == "PATCH" and call[1] == "/api/2.0/apps/genie-workbench" for call in w.api_client.calls)
 
 
