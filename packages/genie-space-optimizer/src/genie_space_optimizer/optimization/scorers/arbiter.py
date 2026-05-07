@@ -26,11 +26,66 @@ from genie_space_optimizer.optimization.evaluation import (
     format_asi_markdown,
     get_registered_prompt_name,
 )
+from genie_space_optimizer.optimization.genie_eval_taxonomy import (
+    with_genie_equivalent_eval,
+)
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
 logger = logging.getLogger(__name__)
+
+
+ARBITER_VERDICTS = {
+    "genie_correct",
+    "ground_truth_correct",
+    "both_correct",
+    "neither_correct",
+    "skipped",
+}
+ARBITER_PASS_VERDICTS = {"genie_correct", "both_correct"}
+ARBITER_FAIL_VERDICTS = {"ground_truth_correct", "neither_correct"}
+
+
+def is_arbiter_pass_verdict(verdict: str) -> bool:
+    """Return True when the arbiter verdict counts as a Genie pass.
+
+    The other valid verdicts (`ground_truth_correct`, `neither_correct`,
+    `skipped`) are not treated as passes by any scoring path.
+    """
+    return str(verdict or "").strip().lower() in ARBITER_PASS_VERDICTS
+
+
+def build_arbiter_quorum_shadow(
+    *,
+    arbiter_verdict: str,
+    judge_values: dict[str, str],
+) -> dict[str, object]:
+    """Telemetry-only quorum signal alongside the arbiter verdict.
+
+    Records what the SQL-shape and result-correctness judges would have
+    said about Genie's answer. ``decision_effect`` is hardcoded to
+    ``"none_shadow_only"`` — see ``docs/scoring_v2_rollout.md`` for the
+    promotion contract.
+    """
+    yes_values = {"yes", "true", "1", "both_correct", "genie_correct"}
+    no_values = {"no", "false", "0", "ground_truth_correct", "neither_correct"}
+    yes_count = sum(1 for value in judge_values.values() if str(value).lower() in yes_values)
+    no_count = sum(1 for value in judge_values.values() if str(value).lower() in no_values)
+    if yes_count > no_count:
+        suggested = "genie_shape_supported"
+    elif no_count > yes_count:
+        suggested = "ground_truth_supported"
+    else:
+        suggested = "tie"
+    return {
+        "enabled": True,
+        "decision_effect": "none_shadow_only",
+        "arbiter_verdict": str(arbiter_verdict or ""),
+        "supporting_yes_count": yes_count,
+        "supporting_no_count": no_count,
+        "suggested_tiebreaker": suggested,
+    }
 
 
 def _parse_arbiter_verdict(rationale: str) -> str:
@@ -58,7 +113,9 @@ def _make_arbiter_scorer(
             "\nGENIE SPACE INSTRUCTIONS (SOURCE OF TRUTH for this space's business rules):\n"
             f"{_trimmed}\n\n"
             "CRITICAL RULE FOR DEFAULT FILTERS: If the instructions above define a DEFAULT "
-            "FILTER (e.g. 'Default filter: same_store_7now = Y for all PSD queries'), then:\n"
+            "FILTER (e.g. 'Default filter: <flag_column> = <value> for all "
+            "<metric>-related queries' — such as a default region, default active-only, "
+            "or default time-window filter), then:\n"
             "- Genie is CORRECT to include that filter even if the question does not "
             "explicitly mention it — the filter is mandated by the space's business rules.\n"
             "- Ground Truth is WRONG if it omits a mandated default filter.\n"
@@ -245,8 +302,13 @@ def _make_arbiter_scorer(
             f"Ground Truth Result (first 5 rows):\n{gt_sample}\n\n"
             f"Genie Result (first 5 rows):\n{genie_sample}\n\n"
             'Respond with JSON only: {"verdict": "<genie_correct|ground_truth_correct|both_correct|neither_correct>", '
-            '"failure_type": "<wrong_aggregation|wrong_filter|wrong_table|other>", '
+            '"failure_type": "<wrong_aggregation|wrong_filter|wrong_table|wrong_column|wrong_join|wrong_measure|missing_instruction|misinterpreted_request|formatting_error|incorrect_function_usage|other>", '
             '"blame_set": ["<blamed_object>"], '
+            '"rca_kind": "<metric_view_routing_confusion|measure_swap|canonical_dimension_missed|missing_required_dimension|extra_defensive_filter|unknown>", '
+            '"expected_objects": ["<table_or_column_or_measure_expected>"], '
+            '"actual_objects": ["<table_or_column_or_measure_generated>"], '
+            '"patch_family": "<contrastive_metric_routing|contrastive_measure_disambiguation|canonical_dimension_guidance|required_dimension_guidance|avoid_unrequested_defensive_filters|unknown>", '
+            '"recommended_levers": [1, 5], '
             '"rationale": "<brief explanation>"}'
         )
 
@@ -272,12 +334,7 @@ def _make_arbiter_scorer(
         try:
             result = _call_llm_for_scoring(w, prompt, prompt_name=get_registered_prompt_name("arbiter"))
             verdict = result.get("verdict", "ground_truth_correct")
-            valid_verdicts = {
-                "genie_correct",
-                "ground_truth_correct",
-                "both_correct",
-                "neither_correct",
-            }
+            valid_verdicts = ARBITER_VERDICTS - {"skipped"}
             if verdict not in valid_verdicts:
                 verdict = _parse_arbiter_verdict(result.get("rationale", str(result)))
 
@@ -304,6 +361,36 @@ def _make_arbiter_scorer(
                     confidence=0.85,
                     blame_set=result.get("blame_set", []),
                     counterfactual_fix=result.get("rationale", ""),
+                    expected_objects=result.get("expected_objects") or [],
+                    actual_objects=result.get("actual_objects") or [],
+                    rca_kind=result.get("rca_kind") or "",
+                    patch_family=result.get("patch_family") or "",
+                    recommended_levers=result.get("recommended_levers") or [],
+                )
+                _meta = with_genie_equivalent_eval(
+                    _meta,
+                    judge_name="arbiter",
+                    value="no",
+                    failure_type=result.get("failure_type", "other"),
+                    comparison=cmp,
+                )
+            else:
+                _meta = with_genie_equivalent_eval(
+                    {},
+                    judge_name="arbiter",
+                    value="yes",
+                    failure_type="",
+                    confidence=1.0,
+                    comparison=cmp,
+                )
+            if isinstance(_meta, dict):
+                _meta["arbiter_quorum_shadow"] = build_arbiter_quorum_shadow(
+                    arbiter_verdict=verdict,
+                    judge_values={
+                        "result_correctness": str(cmp.get("result_correctness_value") or ""),
+                        "logical_accuracy": str(cmp.get("logical_accuracy_value") or ""),
+                        "semantic_equivalence": str(cmp.get("semantic_equivalence_value") or ""),
+                    },
                 )
             return Feedback(
                 name="arbiter",
@@ -336,6 +423,11 @@ def _make_arbiter_scorer(
                 confidence=0.0,
                 counterfactual_fix="LLM judge unavailable — retry or check endpoint",
             )
+            metadata = with_genie_equivalent_eval(
+                metadata,
+                judge_name="arbiter",
+                value="unknown",
+            )
             return Feedback(
                 name="arbiter",
                 value="ground_truth_correct",
@@ -352,3 +444,257 @@ def _make_arbiter_scorer(
             )
 
     return arbiter_scorer
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Pre-flight synthesis arbiter (Bug #4 P2)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The stock ``arbiter_scorer`` compares two SQLs against a ground-truth
+# benchmark. Pre-flight synthesis has no ground truth — it asks a
+# different question: "given this question + this SQL + the rows it
+# returned, does the result plausibly answer the question?"
+#
+# Exposed as both ``score_example_sql_correctness`` (the new name) and
+# ``score_synthesized_example_sql`` (the legacy name that
+# ``synthesis.py:342`` already imports defensively). Keeping both as
+# exports means the reactive-synthesis path gets a real arbiter check
+# on the next run; without this, that code was silently falling through
+# to ``skipped_no_arbiter``.
+
+
+def _truncate_rows_for_prompt(
+    rows: list[dict] | None, max_rows: int = 20, max_chars: int = 2000,
+) -> str:
+    """Render a compact table of rows for the arbiter prompt.
+
+    Budget-bounded: caps at ``max_rows`` rows, then trims the rendered
+    JSON string to ``max_chars``. Returns ``"(no rows)"`` for None/empty.
+    """
+    if not rows:
+        return "(no rows)"
+    try:
+        head = rows[:max_rows]
+        text = json.dumps(head, indent=2, default=str)
+    except Exception:
+        return "(rows not JSON-serialisable)"
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n... (truncated)"
+    return text
+
+
+_EXAMPLE_SQL_CORRECTNESS_PROMPT = (
+    "You are judging whether a generated SQL query correctly answers a "
+    "natural-language question, given a sample of the rows it returned.\n"
+    "You are NOT comparing against a benchmark or ground truth. Judge the "
+    "SQL + RESULT on its own merit against the question.\n\n"
+    "VERDICT OPTIONS:\n"
+    "- yes  — the SQL and its results plausibly answer the question.\n"
+    "  Minor cosmetic variations (column aliases, ORDER BY, LIMIT size, "
+    "number of columns beyond what was asked) are acceptable.\n"
+    "- no   — the SQL misinterprets the question, references the wrong "
+    "entity, returns an empty/unhelpful result set due to bad filters, "
+    "or materially fails to answer.\n"
+    "- uncertain — the evidence is insufficient to judge (e.g. empty "
+    "result with no clear reason, SQL is parseable but semantics are "
+    "ambiguous).\n\n"
+    "BE CONSERVATIVE: when in doubt, prefer ``uncertain`` over ``yes``.\n"
+    "Responses like ``no`` should cite a concrete, fixable mistake.\n\n"
+    "OUTPUT FORMAT (strict JSON, no prose):\n"
+    '{"value": "yes" | "no" | "uncertain", '
+    '"rationale": "<one sentence>"}'
+)
+
+
+def _render_schema_for_arbiter(
+    metadata_snapshot: dict | None,
+    max_tables: int = 12,
+    max_cols: int = 6,
+) -> str:
+    """Compact schema block for the example-SQL arbiter prompt.
+
+    Includes asset_type per FQN and up to ``max_cols`` representative
+    columns / measures+dimensions so the judge can detect MV-vs-table
+    routing errors and obviously-wrong column references without
+    blowing up the context window.
+    """
+    if not isinstance(metadata_snapshot, dict):
+        return ""
+    semantics = metadata_snapshot.get("_asset_semantics") or {}
+    if not isinstance(semantics, dict) or not semantics:
+        return ""
+    lines: list[str] = ["Asset semantics (FQN | asset_type | sample fields):"]
+    for fqn, info in list(semantics.items())[:max_tables]:
+        if not isinstance(info, dict):
+            continue
+        asset_type = str(info.get("asset_type") or "unknown")
+        if asset_type == "metric_view":
+            measures = [
+                m.get("name") for m in (info.get("measures") or [])
+                if isinstance(m, dict) and m.get("name")
+            ][:max_cols]
+            dims = [
+                d.get("name") for d in (info.get("dimensions") or [])
+                if isinstance(d, dict) and d.get("name")
+            ][:max_cols]
+            fields = (
+                f"measures=[{', '.join(measures)}] "
+                f"dimensions=[{', '.join(dims)}]"
+            )
+        else:
+            cols = [
+                c.get("name") for c in (info.get("columns") or [])
+                if isinstance(c, dict) and c.get("name")
+            ][:max_cols]
+            fields = f"cols=[{', '.join(cols)}]"
+        lines.append(f"- {fqn} | {asset_type} | {fields}")
+    lines.append("")
+    lines.append(
+        "RULES: metric_view rows MUST be queried via MEASURE(measure_name) "
+        "and only allow declared dimensions in GROUP BY. Tables MUST NOT "
+        "use MEASURE(). If the SQL violates either rule, answer ``no``."
+    )
+    return "\n".join(lines)
+
+
+def score_example_sql_correctness(
+    question: str,
+    sql: str,
+    result_rows: list[dict] | None,
+    *,
+    w: "WorkspaceClient",
+    metadata_snapshot: dict | None = None,
+) -> dict:
+    """Arbiter verdict on whether an example SQL answers its question.
+
+    Used by the pre-flight synthesis Genie-vs-synthesized gate
+    (``_gate_genie_agreement``) and, when wired, by the reactive
+    ``synthesis._gate_arbiter`` path. Never compares against benchmarks
+    — pre-flight synthesis runs in a firewall-enforced leak-free context
+    and this prompt must not be the weak link.
+
+    Parameters
+    ----------
+    question : str
+        The natural-language question the SQL purports to answer.
+    sql : str
+        The SQL statement under review.
+    result_rows : list[dict] | None
+        First ~20 rows of the SQL's result set. Empty / None is allowed
+        and surfaces as "no rows" in the prompt; the arbiter judges
+        whether that's plausible for the question.
+    w : WorkspaceClient
+        Used by ``_call_llm_for_scoring`` to reach the judge endpoint.
+    metadata_snapshot : dict | None
+        Currently unused but plumbed so future iterations can quote
+        schema context (column descriptions etc.) for the arbiter.
+
+    Returns
+    -------
+    dict
+        ``{"value": "yes"|"no"|"uncertain", "rationale": "..."}``.
+        Defaults to ``"uncertain"`` on any LLM or parse failure — never
+        silently promotes a doubtful candidate.
+    """
+    rows_block = _truncate_rows_for_prompt(result_rows)
+    schema_block = _render_schema_for_arbiter(metadata_snapshot)
+    prompt_parts = [_EXAMPLE_SQL_CORRECTNESS_PROMPT]
+    if schema_block:
+        prompt_parts.append(schema_block)
+    prompt_parts.extend([
+        f"Question: {question}",
+        f"SQL:\n{sql}",
+        f"Result sample (first rows):\n{rows_block}",
+    ])
+    prompt = "\n\n".join(prompt_parts)
+    try:
+        result = _call_llm_for_scoring(
+            w, prompt,
+            prompt_name=get_registered_prompt_name("example_sql_correctness"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "score_example_sql_correctness LLM call failed: %s", exc,
+        )
+        return {
+            "value": "uncertain",
+            "rationale": f"arbiter LLM unavailable: {exc}",
+        }
+    if not isinstance(result, dict):
+        return {"value": "uncertain", "rationale": "non-dict arbiter response"}
+    raw_value = str(result.get("value") or result.get("verdict") or "").strip().lower()
+    if raw_value in ("yes", "pass", "correct", "true"):
+        value = "yes"
+    elif raw_value in ("no", "fail", "incorrect", "false"):
+        value = "no"
+    else:
+        value = "uncertain"
+    return {
+        "value": value,
+        "rationale": str(result.get("rationale") or "")[:500],
+    }
+
+
+def score_example_sql_teaching_safety(
+    question: str,
+    sql: str,
+    *,
+    w: "WorkspaceClient",
+    metadata_snapshot: dict | None = None,
+) -> dict:
+    """LLM judge: would installing this example bias Genie harmfully?
+
+    Independent of the correctness arbiter. Prerequisite is that
+    ``score_example_sql_correctness`` already returned ``"yes"`` —
+    this judge then asks whether the *teaching* effect is canonical,
+    minimal, and schema-safe.
+
+    Returns ``{"value": "yes"|"no"|"uncertain", "rationale": "..."}``.
+    Defaults to ``"uncertain"`` on LLM failure.
+    """
+    from genie_space_optimizer.common.config import (
+        EXAMPLE_SQL_TEACHING_SAFETY_PROMPT,
+    )
+
+    schema_block = _render_schema_for_arbiter(metadata_snapshot)
+    parts = [EXAMPLE_SQL_TEACHING_SAFETY_PROMPT]
+    if schema_block:
+        parts.append(schema_block)
+    parts.extend([
+        f"Question: {question}",
+        f"SQL:\n{sql}",
+    ])
+    prompt = "\n\n".join(parts)
+    prompt_name = (
+        get_registered_prompt_name("example_sql_teaching_safety")
+        or "example_sql_teaching_safety"
+    )
+    try:
+        result = _call_llm_for_scoring(w, prompt, prompt_name=prompt_name)
+    except Exception as exc:
+        logger.warning(
+            "score_example_sql_teaching_safety LLM call failed: %s", exc,
+        )
+        return {
+            "value": "uncertain",
+            "rationale": f"teaching-safety LLM unavailable: {exc}",
+        }
+    if not isinstance(result, dict):
+        return {"value": "uncertain", "rationale": "non-dict judge response"}
+    raw = str(result.get("value") or result.get("verdict") or "").strip().lower()
+    if raw in ("yes", "pass", "safe", "true"):
+        value = "yes"
+    elif raw in ("no", "fail", "unsafe", "false"):
+        value = "no"
+    else:
+        value = "uncertain"
+    return {
+        "value": value,
+        "rationale": str(result.get("rationale") or "")[:500],
+    }
+
+
+# Legacy alias — ``synthesis.py:_gate_arbiter`` imports this name via a
+# try/except, so exporting it wires the reactive synthesis path's
+# arbiter gate as well. Signature-compatible with the new function.
+score_synthesized_example_sql = score_example_sql_correctness

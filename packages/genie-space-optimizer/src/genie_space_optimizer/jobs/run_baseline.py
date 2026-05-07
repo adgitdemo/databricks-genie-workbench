@@ -7,7 +7,7 @@
 # MAGIC | **Task** | 2 of 6 — Baseline Evaluation |
 # MAGIC | **Harness function** | `_run_baseline()` in `optimization/harness.py` |
 # MAGIC | **Reads from** | `preflight` (task values) |
-# MAGIC | **Publishes to** | `lever_loop` (scores, accuracy, thresholds_met, model_id) |
+# MAGIC | **Publishes to** | `lever_loop` (scores, overall_accuracy, thresholds_met, model_id, mlflow_run_id, max_benchmark_count) — also persists `both_correct_count` / `both_correct_rate` to `genie_opt_iterations` (Tier 1.7) |
 # MAGIC | **Typical duration** | 5–20 min |
 # MAGIC | **Log label** | `[TASK-2 BASELINE]` |
 # MAGIC
@@ -41,6 +41,14 @@
 # MAGIC | result_correctness | Query results match expected (hash/signature comparison) |
 # MAGIC | asset_routing | Correct asset type (TABLE/MV/TVF) selected |
 # MAGIC | arbiter | Tie-breaker when results disagree (LLM-based) |
+# MAGIC
+# MAGIC ### Result-Correctness Arbiter Override (Tier 1.8)
+# MAGIC
+# MAGIC > **📝 Note:** When the arbiter says `both_correct` or `genie_correct` for a row whose `result_correctness` hash mismatched (column reorder, alias rename, row reorder), `run_evaluation` stamps `result_correctness/arbiter_override_value="yes"` and `_is_semantic_correct=True` on the row. Downstream `detect_regressions` reads semantic correctness, not raw hash, so column-order churn no longer manufactures phantom per-judge regressions in the lever loop.
+# MAGIC
+# MAGIC ### `both_correct_rate` — The Stricter Anchor (Tier 1.7)
+# MAGIC
+# MAGIC > **📝 Note:** Alongside `overall_accuracy` (which counts arbiter overrides of `rc=yes` as correct), `_compute_arbiter_adjusted_accuracy` also returns `both_correct_count` / `both_correct_rate` — only rows where the arbiter explicitly agreed with both Genie and ground truth. `baseline_persist_state` writes both columns to `genie_opt_iterations` and stores `min(overall_accuracy, both_correct_rate)` as `best_accuracy` so the lever loop can't be rejected by an inflated `rc=yes` ceiling (the "ghost ceiling" regression).
 # MAGIC
 # MAGIC ## ⚠️ What Happens If This Task Fails
 # MAGIC
@@ -180,6 +188,7 @@ from pyspark.sql import SparkSession
 
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
+from genie_space_optimizer.optimization.benchmarks import assert_benchmark_handoff_visible
 from genie_space_optimizer.optimization.evaluation import load_benchmarks_from_dataset
 from genie_space_optimizer.optimization.harness import (
     baseline_setup_scorers,
@@ -224,6 +233,13 @@ if _warehouse_id:
 
 from genie_space_optimizer.common.config import MAX_BENCHMARK_COUNT
 max_benchmark_count = int(dbutils.jobs.taskValues.get(taskKey="preflight", key="max_benchmark_count", default=str(MAX_BENCHMARK_COUNT)))
+expected_benchmark_count = int(
+    dbutils.jobs.taskValues.get(
+        taskKey="preflight",
+        key="benchmark_count",
+        default="0",
+    )
+)
 
 import mlflow
 mlflow.set_experiment(exp_name)
@@ -252,10 +268,25 @@ _log(
 # COMMAND ----------
 
 uc_schema = f"{catalog}.{schema}"
-benchmarks = load_benchmarks_from_dataset(spark, uc_schema, domain)
-benchmarks = [b for b in benchmarks if b.get("split") != "held_out"]
+_all_benchmarks = load_benchmarks_from_dataset(spark, uc_schema, domain)
+assert_benchmark_handoff_visible(
+    expected_total=expected_benchmark_count,
+    actual_total=len(_all_benchmarks),
+    domain=domain,
+    table_name=f"{uc_schema}.genie_benchmarks_{domain}",
+)
+benchmarks = [b for b in _all_benchmarks if b.get("split") != "held_out"]
+_held_out_n = len(_all_benchmarks) - len(benchmarks)
 _banner("Loaded Benchmarks")
-_log("Benchmark dataset (train only)", uc_schema=uc_schema, domain=domain, benchmark_count=len(benchmarks))
+_log(
+    "Benchmark dataset (train/held-out split)",
+    uc_schema=uc_schema,
+    domain=domain,
+    total_loaded=len(_all_benchmarks),
+    train_count=len(benchmarks),
+    held_out_count=_held_out_n,
+    note="held-out reserved for Finalize generalization check",
+)
 if not benchmarks:
     raise RuntimeError(f"No benchmarks found in {uc_schema}.genie_benchmarks_{domain}")
 

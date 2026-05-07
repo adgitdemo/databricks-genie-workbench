@@ -17,10 +17,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime
 from typing import Any
 
 import mlflow
+
+from genie_space_optimizer.common.delta_helpers import execute_delta_write_with_retry
+from genie_space_optimizer.common.mlflow_names import labeling_run_name
 
 logger = logging.getLogger(__name__)
 
@@ -171,13 +173,7 @@ def create_review_session(
 
     mlflow.set_experiment(experiment_name)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{run_id[:8]}_{ts}"
-    prefix = f"opt_{domain}"
-    max_prefix = 64 - len(suffix)
-    if len(prefix) > max_prefix:
-        prefix = prefix[:max_prefix]
-    session_name = f"{prefix}{suffix}"
+    session_name = labeling_run_name(run_id)
 
     print(
         f"[Labeling] Creating session '{session_name}' in experiment '{experiment_name}' "
@@ -234,19 +230,25 @@ _MAX_SESSION_TRACES = 100
 
 
 def _extract_question_id(request_val: Any) -> str:
-    """Extract question_id from a trace's request field."""
-    if not request_val:
+    """Extract question_id from a trace's request field.
+
+    Phase C Task 1: routes through the canonical helper at
+    ``_qid_extraction.extract_question_id`` so this site cannot
+    diverge from the four other canonical-qid extractors. Cycle 8
+    Bug 2 closed two of the four; this closes the last two.
+
+    The canonical helper's ``request`` branch handles both dict and
+    JSON-string shapes, so we simply wrap ``request_val`` into a
+    minimal row.
+    """
+    if request_val is None:
         return ""
-    try:
-        req = json.loads(request_val) if isinstance(request_val, str) else request_val
-        if isinstance(req, dict):
-            return str(
-                req.get("question_id")
-                or req.get("kwargs", {}).get("question_id", "")
-            )
-    except Exception:
-        pass
-    return ""
+    from genie_space_optimizer.optimization._qid_extraction import (
+        extract_question_id,
+    )
+
+    qid, _source = extract_question_id({"request": request_val})
+    return qid
 
 
 def _populate_session_traces(
@@ -619,7 +621,7 @@ def flag_for_human_review(
             _q_text_esc = q_text.replace("'", "''")
             _reason_esc = reason.replace("'", "''")
             _patches_esc = patches.replace("'", "''")
-            spark.sql(f"""
+            merge_stmt = f"""
                 MERGE INTO {fqn} AS t
                 USING (SELECT '{run_id}' AS run_id, '{domain}' AS domain,
                               '{qid}' AS question_id) AS s
@@ -638,7 +640,13 @@ def flag_for_human_review(
                     s.run_id, s.domain, s.question_id, '{_q_text_esc}',
                     '{_reason_esc}', {iters}, '{_patches_esc}', 'pending', '{now}'
                 )
-            """)
+            """
+            execute_delta_write_with_retry(
+                spark,
+                merge_stmt,
+                operation_name="flag_for_human_review",
+                table_name=fqn,
+            )
             flagged += 1
         except Exception:
             logger.warning("Failed to flag question %s", qid, exc_info=True)

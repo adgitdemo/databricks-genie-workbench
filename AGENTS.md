@@ -149,19 +149,53 @@ Do NOT suggest running `uvicorn` or `npm run dev` locally. The app depends on Da
 
 ## Dependency Security Policy
 
-This project pins all dependencies to exact versions with integrity hashes following
-supply chain security hardening. Lock files are the source of truth — they prevent
-attacks like the litellm PyPI credential stealer (March 2026) and axios npm RAT
-(March 2026) by rejecting any package whose hash doesn't match the lockfile.
+This project pins all direct dependencies to exact versions and resolves
+transitive dependencies through lockfiles with integrity hashes.
+
+**Policy:**
+
+- `pyproject.toml` and `package.json` use only exact versions (`==1.2.3` for
+  Python, `1.2.3` for npm). No `^`, `~`, `>=`, `<=`, `<`, `>`, `~=`, or `*`.
+- All three lockfiles below must validate (`uv lock --check`,
+  `npm ci --dry-run --ignore-scripts`) before any deploy.
+- `mlflow` (and `mlflow-skinny` / `mlflow-tracing`) MUST resolve to the same
+  version across the workspace (today: `3.11.1`).
+- `npm` install paths must succeed without `--legacy-peer-deps`. If a peer
+  conflict appears, fix the manifest (bump the offending pin to a version
+  inside the peer-dep range) instead of reaching for the escape-hatch flag.
 
 **Lock files — always commit these:**
 
 | File | Covers | Verification |
 |---|---|---|
-| `uv.lock` | Root Python transitive deps | SHA256 hashes |
-| `packages/genie-space-optimizer/uv.lock` | GSO Python deps | SHA256 hashes |
+| `uv.lock` | Workspace-wide Python transitive deps | SHA256 hashes |
 | `frontend/package-lock.json` | Frontend npm deps | SHA-512 integrity |
 | `packages/genie-space-optimizer/package-lock.json` | GSO UI npm deps | SHA-512 integrity |
+
+The workspace uses a single root `uv.lock` for both root and
+`packages/genie-space-optimizer/` — uv writes there for any
+workspace-member invocation. There is intentionally no per-package `uv.lock`.
+
+**Updating a Python dep:**
+
+```bash
+# 1. Edit the exact version in pyproject.toml (root or GSO).
+# 2. Refresh the lock.
+uv lock --upgrade-package <package-name>
+# 3. Regenerate requirements.txt (pip-compatible reference).
+uv export --frozen --no-dev --no-hashes --format requirements-txt \
+  | grep -v "^-e " > requirements.txt
+echo "-e ./packages/genie-space-optimizer" >> requirements.txt
+git add pyproject.toml packages/genie-space-optimizer/pyproject.toml uv.lock requirements.txt
+```
+
+**Updating an npm dep:**
+
+```bash
+cd <frontend|packages/genie-space-optimizer>
+npm install <package>@<exact-version> --save-exact
+git add package.json package-lock.json
+```
 
 ## Gotchas
 

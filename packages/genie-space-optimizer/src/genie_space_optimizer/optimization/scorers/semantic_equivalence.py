@@ -22,6 +22,9 @@ from genie_space_optimizer.optimization.evaluation import (
     format_asi_markdown,
     get_registered_prompt_name,
 )
+from genie_space_optimizer.optimization.genie_eval_taxonomy import (
+    with_genie_equivalent_eval,
+)
 from genie_space_optimizer.optimization.scorers import build_scorer_context
 
 if TYPE_CHECKING:
@@ -61,7 +64,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
             "- A TVF and metric view covering the same domain are equivalent.\n"
             "- Focus on whether BOTH queries answer the SAME question.\n\n"
             f"{context}\n\n"
-            'Respond with JSON only: {"equivalent": true/false, "failure_type": "<different_metric|different_grain|different_scope>", '
+            'Respond with JSON only: {"equivalent": true/false, "failure_type": "<different_metric|different_grain|different_scope|misinterpreted_request>", '
             '"blame_set": ["<metric_or_dimension>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
             '"rationale": "<brief explanation>"}\n'
@@ -104,6 +107,11 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                 severity="info",
                 confidence=0.0,
                 counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
+            metadata = with_genie_equivalent_eval(
+                metadata,
+                judge_name="semantic_equivalence",
+                value="unknown",
             )
             return Feedback(
                 name="semantic_equivalence",
@@ -198,6 +206,13 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                 f"Fix {result.get('failure_type', 'semantic mismatch')} "
                 f"involving {', '.join(result.get('blame_set', ['unknown']))}"
             ),
+        )
+        metadata = with_genie_equivalent_eval(
+            metadata,
+            judge_name="semantic_equivalence",
+            value="no",
+            failure_type=result.get("failure_type", "different_metric"),
+            comparison=cmp,
         )
         return Feedback(
             name="semantic_equivalence",

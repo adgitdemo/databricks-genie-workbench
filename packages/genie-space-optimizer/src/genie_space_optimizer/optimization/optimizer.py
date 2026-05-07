@@ -14,7 +14,8 @@ import logging
 import os
 import re
 from collections import Counter, defaultdict
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable
 
 from databricks.sdk import WorkspaceClient
 from genie_space_optimizer._workspace_client import make_workspace_client
@@ -24,6 +25,9 @@ from genie_space_optimizer.optimization.llm_client import (
     call_llm as _call_llm_openai,
     get_openai_client as _get_openai_client,
 )
+from genie_space_optimizer.optimization.rca_execution import (
+    clusters_share_defect_identity,
+)
 
 from genie_space_optimizer.common.config import (
     ADAPTIVE_STRATEGIST_PROMPT,
@@ -31,6 +35,11 @@ from genie_space_optimizer.common.config import (
     CONFLICT_RULES,
     DEFAULT_THRESHOLDS,
     DESCRIPTION_ENRICHMENT_PROMPT,
+    ENABLE_RCA_EXAMPLE_SQL_SYNTHESIS,
+    ENABLE_RCA_JOIN_SPEC_BRIDGE,
+    ENABLE_RCA_LEVER1_BRIDGE,
+    ENABLE_RCA_SQL_SNIPPET_BRIDGE,
+    ENABLE_RCA_THEMES_STRATEGIST,
     FAILURE_TAXONOMY,
     GENERIC_FIX_PREFIXES,
     INSTRUCTION_SECTION_ORDER,
@@ -46,6 +55,7 @@ from genie_space_optimizer.common.config import (
     LLM_MAX_RETRIES,
     LLM_TEMPERATURE,
     LOW_RISK_PATCHES,
+    MAX_ACTION_GROUPS_PER_STRATEGY,
     MAX_HOLISTIC_INSTRUCTION_CHARS,
     MAX_PATCH_OBJECTS,
     MAX_VALUE_DICTIONARY_COLUMNS,
@@ -156,6 +166,26 @@ def _truncate_to_budget(
 # module for backward compatibility with tests and other consumers.
 
 
+def _attach_last_response(exc: BaseException, text: str) -> None:
+    """Stamp the last LLM body onto an exception for downstream logging.
+
+    When ``_traced_llm_call`` exhausts retries, callers need to know
+    *what the model actually returned* — not just that parsing failed.
+    Attaching via attribute (vs. wrapping the exception) preserves the
+    original type/traceback so existing ``except`` chains and MLflow
+    span events keep working unchanged.
+
+    The attributes are best-effort: if ``exc`` is a frozen / C-level
+    exception that rejects attribute assignment, we swallow the
+    AttributeError silently (the caller falls back to an empty preview).
+    """
+    try:
+        exc.last_response_text = text  # type: ignore[attr-defined]
+        exc.last_response_chars = len(text)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
+
 def _traced_llm_call(
     w: WorkspaceClient | None,
     system_msg: str,
@@ -165,6 +195,7 @@ def _traced_llm_call(
     max_retries: int = LLM_MAX_RETRIES,
     temperature: float = LLM_TEMPERATURE,
     max_tokens: int | None = None,
+    response_validator: Callable[[str], Any] | None = None,
 ) -> tuple[str, Any]:
     """Execute an LLM call via the OpenAI SDK with automatic MLflow tracing.
 
@@ -175,6 +206,18 @@ def _traced_llm_call(
 
     Returns ``(raw_text, response_object)`` for the caller to parse.
     Raises the last exception if all retries are exhausted.
+
+    ``response_validator`` (optional): a callable invoked with the
+    trimmed completion text after each successful HTTP round-trip. If
+    it raises, the exception is treated as a retryable failure (same
+    exponential backoff as RPC failures). This closes the gap where a
+    provider returns HTTP 200 with non-JSON / refusal content that
+    callers downstream cannot parse — most notably
+    ``_extract_json`` — and that previously surfaced as two identical
+    tracebacks with no retry attempt. Callers that expect JSON can
+    pass ``response_validator=_extract_json``. When ``None`` the
+    legacy behaviour (return first HTTP 200, no post-success
+    validation) is preserved for every existing call site.
     """
     import time
 
@@ -190,6 +233,12 @@ def _traced_llm_call(
 
         client = _get_openai_client(w)
         text = ""
+        # F6 — track the most recent HTTP 200 body across attempts so we
+        # can attach it to the raised exception if every retry ends in
+        # validator/RPC failure. Callers (description enrichment, etc.)
+        # read this off the exception to log a structured preview of
+        # *what the model actually returned* rather than an empty string.
+        last_response_text: str = ""
         last_err: Exception | None = None
 
         for attempt in range(max_retries):
@@ -214,6 +263,29 @@ def _traced_llm_call(
                 if not content:
                     raise ValueError("LLM response content is empty")
                 text = str(content).strip()
+                last_response_text = text
+
+                if response_validator is not None:
+                    try:
+                        response_validator(text)
+                    except Exception as exc:
+                        last_err = exc
+                        span.add_event(SpanEvent(
+                            name=f"validator_reject_attempt_{attempt + 1}",
+                            attributes={
+                                "error": str(exc)[:500],
+                                "response_preview": text[:200],
+                                "response_chars": len(text),
+                            },
+                        ))
+                        if attempt < max_retries - 1:
+                            time.sleep(2**attempt)
+                            continue
+                        # F6 — attach the last-seen body to the
+                        # exception so the caller's warning can log a
+                        # real preview instead of an empty string.
+                        _attach_last_response(exc, last_response_text)
+                        raise
 
                 _log_token_usage(span, response)
 
@@ -236,7 +308,36 @@ def _traced_llm_call(
             "error": str(last_err)[:500] if last_err else "unknown",
             "attempts": max_retries,
         })
+        # F6 — attach before re-raise on the non-validator exhaustion
+        # path too (HTTP failures, empty-choice responses, etc.).
+        if last_err is not None:
+            _attach_last_response(last_err, last_response_text)
         raise last_err  # type: ignore[misc]
+
+
+def _adaptive_strategist_response_validator(text: str) -> Any:
+    """Tolerant JSON validator for the adaptive strategist call.
+
+    Strategy:
+    1. Try strict parse via ``_extract_json``.
+    2. On ``json.JSONDecodeError`` fall back to
+       ``_repair_truncated_strategy_json`` — the same salvage path used at
+       the call site post-success. This stops truncated-but-recoverable
+       responses from being treated as non-JSON refusals and exhausting
+       retries inside ``_traced_llm_call``.
+    3. Re-raise the original ``JSONDecodeError`` only if BOTH parses fail.
+    """
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    try:
+        # ``strict=True`` preserves the legacy raise-on-error behavior so
+        # ``_traced_llm_call`` can retry true non-JSON refusals.
+        return _extract_json(text, strict=True)
+    except json.JSONDecodeError:
+        try:
+            return _repair_truncated_strategy_json(text)
+        except json.JSONDecodeError:
+            raise
 
 
 def _log_token_usage(span: Any, response: Any) -> None:
@@ -349,6 +450,142 @@ _JUDGE_TO_LEVER: dict[str, int] = {
 }
 
 
+# Module-level lever map. Extracted from ``_map_to_lever`` so tests and other
+# call sites can introspect the routing table without invoking the function.
+# ``format_difference`` routes to Lever 5: the arbiter saw two SQL shapes that
+# produced similar results but didn't match the expected canonical form.
+# Surfacing the expected_sql as an example_sql teaches the canonical shape.
+_ROOT_CAUSE_LEVER_MAP: dict[str, int] = {
+    "wrong_column": 1,
+    "wrong_table": 1,
+    "description_mismatch": 1,
+    "missing_synonym": 1,
+    # Phase A1: SQL-shape aggregation/filter causes now route to Lever 6
+    # (sql_snippet_* primitives). Lever 2 could only update MV descriptions,
+    # which cannot add a measure, filter, or dimension. Example routing
+    # lookup: missing_filter -> sql_snippet_filter, wrong_aggregation ->
+    # sql_snippet_measure.
+    "wrong_aggregation": 6,
+    "wrong_measure": 6,
+    "missing_filter": 6,
+    "missing_scd_filter": 6,
+    "wrong_filter_condition": 6,
+    "missing_temporal_filter": 6,
+    "wrong_join_type": 5,
+    "tvf_parameter_error": 3,
+    "wrong_join": 4,
+    "missing_join_spec": 4,
+    "wrong_join_spec": 4,
+    "asset_routing_error": 5,
+    "missing_instruction": 5,
+    "ambiguous_question": 5,
+    # v2 Task 7: format_difference now routes to Lever 5 with a templated
+    # example_sql body so the strategist has a concrete patch to emit.
+    # Was 0 (no lever) which left the strategist without any actionable
+    # routing for canonical-shape mismatches.
+    "format_difference": 5,
+    "extra_columns_only": 0,
+    "select_star": 0,
+    "missing_dimension": 6,
+    "wrong_grouping": 6,
+    # P1 pattern labels (Phase 2). Without explicit entries here these
+    # labels fall through to ``_JUDGE_TO_LEVER[judge]``, which routes
+    # plural_top_n_collapse / granularity_drop / time_window_pivot to
+    # Lever 2 (Metric Views) on logical_accuracy failures. Lever 2 can
+    # only update MV descriptions and cannot reshape SQL — exactly the
+    # pathology the Phase A1 reroute fixed for wrong_aggregation et al.
+    # Routing the SQL-shape patterns to Lever 5 lets the structural gate
+    # force example_sql synthesis. Filter literal mismatches go to
+    # Lever 6 (sql_snippet_filter); column ambiguity goes to Lever 1
+    # (column synonyms / descriptions).
+    "plural_top_n_collapse": 5,
+    "time_window_pivot": 5,
+    "granularity_drop": 5,
+    "value_format_mismatch": 6,
+    "column_disambiguation": 1,
+}
+
+
+def _format_difference_example_sql_template(
+    *,
+    question: str,
+    expected_sql: str,
+) -> str:
+    """Render a Lever-5 example_sql body for a format_difference cluster.
+
+    format_difference means the arbiter saw two SQL shapes that produced
+    similar results but didn't match the expected canonical form. Surfacing
+    the expected_sql as a teaching example lets the strategist learn the
+    canonical shape without rewriting the user's question.
+    """
+    return (
+        "EXAMPLE SQL — canonical shape for this question family:\n"
+        f"-- Question: {question.strip()}\n"
+        f"{expected_sql.strip()}\n"
+    )
+
+
+def _build_rca_forced_instruction_body(
+    *,
+    root_cause: str,
+    grounding_terms: list[str],
+    question: str,
+    expected_sql: str,
+) -> str | None:
+    """Render the RCA-forced instruction body keyed on structured root_cause.
+
+    Returns None for non-actionable root causes; the caller skips emission.
+    Replaces the legacy substring-keyed dispatch (``"rank" in joined`` etc.)
+    that produced incorrect bodies for column-disambiguation clusters.
+    """
+    if root_cause == "plural_top_n_collapse":
+        return (
+            "QUERY PATTERNS:\n"
+            "- For plural highest/lowest ranking questions, return one ranked row "
+            "per requested entity sorted by the metric. Do not collapse the result "
+            "to a single top-1 row unless the user explicitly asks for one entity."
+        )
+    if root_cause == "time_window_pivot":
+        return (
+            "QUERY PATTERNS:\n"
+            "- When comparing day vs MTD metrics, query each time window separately "
+            "and pivot the results into side-by-side columns at the requested grain. "
+            "Do not return one row per time window unless the user asks for that."
+        )
+    if root_cause == "missing_temporal_filter":
+        return (
+            "QUERY PATTERNS:\n"
+            "- For 'last N days/weeks/months' questions, restrict to rows whose "
+            "dated column falls within the last N days/weeks/months relative to "
+            "today. Do not rely on prose like 'recent' or 'last_30_days' as a "
+            "column value."
+        )
+    if root_cause == "column_disambiguation":
+        terms = ", ".join(t for t in grounding_terms if t)[:200]
+        return (
+            "COLUMN DISAMBIGUATION:\n"
+            f"- The terms [{terms}] map to specific columns. Use the canonical column "
+            "for each business term as documented in the column descriptions; do not "
+            "substitute a different column when the description disagrees."
+        )
+    if root_cause == "missing_filter":
+        return (
+            "QUERY PATTERNS:\n"
+            "- The expected answer requires a filter that is not in the user's prose. "
+            "Add the documented default filter (see column description) before "
+            "aggregating."
+        )
+    if root_cause == "format_difference":
+        if not expected_sql or not question:
+            return None
+        return (
+            "EXAMPLE SQL — canonical shape for this question family:\n"
+            f"-- Question: {question.strip()}\n"
+            f"{expected_sql.strip()}\n"
+        )
+    return None
+
+
 def _map_to_lever(
     root_cause: str,
     asi_failure_type: str | None = None,
@@ -368,31 +605,9 @@ def _map_to_lever(
         bs = str(blame_set).upper() if blame_set else ""
         return 5 if "TVF" in bs else 1
 
-    mapping = {
-        "wrong_column": 1,
-        "wrong_table": 1,
-        "description_mismatch": 1,
-        "missing_synonym": 1,
-        "wrong_aggregation": 2,
-        "wrong_measure": 2,
-        "missing_filter": 2,
-        "missing_scd_filter": 2,
-        "wrong_filter_condition": 2,
-        "missing_temporal_filter": 2,
-        "wrong_join_type": 5,
-        "tvf_parameter_error": 3,
-        "wrong_join": 4,
-        "missing_join_spec": 4,
-        "wrong_join_spec": 4,
-        "asset_routing_error": 5,
-        "missing_instruction": 5,
-        "ambiguous_question": 5,
-        "format_difference": 0,
-        "extra_columns_only": 0,
-        "select_star": 0,
-        "missing_dimension": 6,
-        "wrong_grouping": 6,
-    }
+    # RCA-themed planning may override this coarse map. This fallback is
+    # only for clusters that have no typed RCA findings.
+    mapping = _ROOT_CAUSE_LEVER_MAP
 
     if asi_failure_type and asi_failure_type in mapping:
         return mapping[asi_failure_type]
@@ -419,32 +634,182 @@ def _resolve_scope(lever: int, apply_mode: str = APPLY_MODE) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+_PATTERN_FILTER_MISSING = re.compile(
+    r"\b(missing|no|without|lack(?:ing|s)?|absent|should\s+(?:be|have)\s+(?:had\s+)?a?)\s+"
+    r"(?:\w+\s+){0,3}(filter|where|restriction|predicate|where\s+clause)\b",
+    re.I,
+)
+_PATTERN_FILTER_WRONG = re.compile(
+    r"\b(wrong|incorrect|bad|mistaken|flawed)\s+(?:\w+\s+){0,3}(filter|where|predicate)\b",
+    re.I,
+)
+_PATTERN_JOIN_WRONG = re.compile(
+    r"\b(wrong|incorrect|missing|bad|without)\s+(?:\w+\s+){0,3}join\b",
+    re.I,
+)
+_PATTERN_JOIN_APPEARS_WRONG = re.compile(
+    r"\bjoin\b[^.]{0,80}\b(is|are|appears|seem(?:s)?|looks?)\s+(?:to\s+be\s+)?"
+    r"(wrong|incorrect|bad|mistaken)\b",
+    re.I,
+)
+_PATTERN_JOIN_TYPE = re.compile(
+    r"\b(left|right|inner|cross|full)\s+(?:outer\s+)?join\b.*?"
+    r"(join\s+type|instead\s+of|wrong\s+join)",
+    re.I | re.S,
+)
+_PATTERN_TABLE = re.compile(
+    r"\b(wrong|missing|incorrect|bad)\s+(?:\w+\s+){0,3}table\b",
+    re.I,
+)
+_PATTERN_COLUMN = re.compile(
+    r"\b(wrong|missing|incorrect|bad)\s+(?:\w+\s+){0,3}column\b",
+    re.I,
+)
+_PATTERN_AGG = re.compile(
+    r"\b(wrong|missing|incorrect|bad)\s+(?:\w+\s+){0,3}(aggregation|measure|metric)\b",
+    re.I,
+)
+_PATTERN_ROUTING = re.compile(
+    r"\b(wrong|missing|incorrect)\s+(?:\w+\s+){0,3}(asset|routing|example)\b",
+    re.I,
+)
+_PATTERN_INSTRUCTION = re.compile(
+    r"\b(missing|unclear|incomplete|ambiguous)\s+(?:\w+\s+){0,3}(instruction|guidance)\b",
+    re.I,
+)
+
+
 def _extract_pattern(rationale: str) -> str:
-    """Extract a generalizable pattern from a judge rationale string."""
-    r = (rationale or "").lower()
+    """Extract a generalizable pattern from a judge rationale string.
+
+    S3 hardening: judge rationales routinely contain words like
+    ``"filter"`` or ``"where"`` in affirmative contexts
+    (e.g. ``"filter is applied correctly"``), which the old substring
+    matcher misclassified as ``missing_filter``. Each branch now
+    requires both a noun (``filter``, ``where``, ``join``, ...) AND a
+    failure adjective/verb (``missing``, ``wrong``, ``incorrect``, ...)
+    within a short window. Bare mentions fall through to ``"other"`` so
+    downstream SQL-diff classification runs instead of emitting noise.
+    """
+    r = (rationale or "").strip()
     if not r:
         return "other"
-    if "is_current" in r or ("scd" in r and ("filter" in r or "dimension" in r)):
+    rl = r.lower()
+
+    if "correctly" in rl or "correct" in rl and "incorrect" not in rl:
+        affirmative_only = re.search(
+            r"\b(filter|where|join|column|table|aggregation|measure)\b[^.]{0,40}\b"
+            r"(is|are|was|were)\s+(applied\s+)?(correct(ly)?|right)\b",
+            rl,
+        )
+        if affirmative_only and not re.search(
+            r"\b(missing|wrong|incorrect|no\s+where|no\s+filter|absent)\b", rl
+        ):
+            return "other"
+
+    if "is_current" in rl and re.search(
+        r"\b(missing|wrong|without|absent|no)\b", rl
+    ):
         return "missing_scd_filter"
-    if ("left join" in r or "inner join" in r) and ("join type" in r or "instead of" in r or "wrong join" in r):
+    if "scd" in rl and re.search(r"\b(filter|dimension)\b", rl) and re.search(
+        r"\b(missing|wrong|without|absent|no)\b", rl
+    ):
+        return "missing_scd_filter"
+
+    if _PATTERN_JOIN_TYPE.search(rl):
         return "wrong_join_type"
-    if "table" in r and ("wrong" in r or "missing" in r or "incorrect" in r):
+    if _PATTERN_TABLE.search(rl):
         return "wrong_table"
-    if "column" in r and ("wrong" in r or "missing" in r):
+    if _PATTERN_COLUMN.search(rl):
         return "wrong_column"
-    if "aggregation" in r or "measure" in r:
+    if _PATTERN_AGG.search(rl):
         return "wrong_aggregation"
-    if "join" in r:
+    if _PATTERN_JOIN_WRONG.search(rl) or _PATTERN_JOIN_APPEARS_WRONG.search(rl):
         return "wrong_join"
-    if "filter" in r or "where" in r:
+    if _PATTERN_FILTER_MISSING.search(rl):
         return "missing_filter"
-    if "limit" in r and ("missing" in r or "without" in r):
+    if _PATTERN_FILTER_WRONG.search(rl):
         return "wrong_filter_condition"
-    if "asset" in r or "routing" in r:
+    if re.search(r"\b(missing|without)\s+limit\b", rl):
+        return "wrong_filter_condition"
+    if _PATTERN_ROUTING.search(rl):
         return "asset_routing_error"
-    if "instruction" in r or "ambiguous" in r or "unclear" in r:
+    if _PATTERN_INSTRUCTION.search(rl) or "ambiguous" in rl or "unclear" in rl:
         return "missing_instruction"
     return "other"
+
+
+def _metadata_asset_tokens(metadata_snapshot: dict) -> set[str]:
+    """Return a lowercased token set of every known asset in the snapshot.
+
+    The set is used by the S3 blame-set rescue: when ASI reports
+    ``failure_type == "other"`` but produces a ``blame_set`` containing
+    a token that matches a known table, metric view, TVF/UC function, or
+    example-SQL identifier, the cascade re-labels the root cause as
+    ``missing_data_asset`` (routed to Lever 3) instead of leaving the
+    failure at ``other`` (which falls through to generic descriptions).
+
+    Each identifier is also split on ``.`` so bare table names (``orders``
+    extracted from ``cat.sch.orders``) can match a blame token.
+    """
+    tokens: set[str] = set()
+    if not isinstance(metadata_snapshot, dict):
+        return tokens
+    ds = metadata_snapshot.get("data_sources") or {}
+    if not isinstance(ds, dict):
+        ds = {}
+    for bucket_key in ("tables", "metric_views"):
+        for asset in metadata_snapshot.get(bucket_key) or ds.get(bucket_key) or []:
+            if not isinstance(asset, dict):
+                continue
+            ident = asset.get("identifier") or asset.get("name") or ""
+            if isinstance(ident, str) and ident:
+                tokens.add(ident.lower())
+                for part in ident.split("."):
+                    if part:
+                        tokens.add(part.lower())
+    instr = metadata_snapshot.get("instructions") or {}
+    if not isinstance(instr, dict):
+        instr = {}
+    for fn in instr.get("sql_functions") or []:
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name") or fn.get("identifier") or fn.get("id")
+        if isinstance(name, str) and name:
+            tokens.add(name.lower())
+    for eqs in instr.get("example_question_sqls") or []:
+        if not isinstance(eqs, dict):
+            continue
+        ident = eqs.get("id") or eqs.get("identifier")
+        if isinstance(ident, str) and ident:
+            tokens.add(ident.lower())
+    return tokens
+
+
+def _blame_set_matches_metadata(
+    blame_set: object, metadata_snapshot: dict
+) -> bool:
+    r"""True when at least one blame token resolves to a known asset.
+
+    Tokens are lowercased and stripped of backticks and trailing
+    punctuation so ``\`cat.sch.orders\`,`` matches ``cat.sch.orders``.
+    """
+    if not blame_set:
+        return False
+    tokens = _metadata_asset_tokens(metadata_snapshot)
+    if not tokens:
+        return False
+    items = blame_set if isinstance(blame_set, list) else [str(blame_set)]
+    for item in items:
+        raw = str(item).strip().lower().strip("`").strip(",;")
+        if not raw:
+            continue
+        if raw in tokens:
+            return True
+        for part in raw.split("."):
+            if part and part in tokens:
+                return True
+    return False
 
 
 _SQL_KW = re.compile(r"\b(FROM|JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|CROSS\s+JOIN|FULL\s+JOIN)\s+", re.I)
@@ -660,13 +1025,653 @@ def _classify_generated_sql_quality(generated_sql: str, question: str = "") -> s
     return "unverifiable_no_expected_sql"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# T1.2 — Pattern-aware root cause detectors
+#
+# The legacy heuristic taxonomy (wrong_table / missing_aggregation /
+# wrong_filter_condition / wrong_aggregation) fragments a single
+# underlying pattern into four clusters (e.g. time_window pivoting shows
+# up as wrong_filter_condition on one row, missing_aggregation on another,
+# wrong_table on a third). These pure-function matchers detect the actual
+# *pattern* from the (genie_sql, gt_sql) pair and return a specific
+# pattern_label. When a matcher fires with sufficient confidence, it
+# takes precedence over the legacy bucket; otherwise we fall through to
+# ``_classify_sql_diff``.
+# ──────────────────────────────────────────────────────────────────────
+
+
+_TIME_WINDOW_WHERE_RE = re.compile(
+    r"where[^;]*?\btime_window\s+in\s*\(",
+    re.IGNORECASE | re.DOTALL,
+)
+_TIME_WINDOW_GROUPBY_RE = re.compile(
+    r"group\s+by[^;]*?\btime_window\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_RANK_EQ_1_RE = re.compile(
+    r"\brank\s*\([^)]*\)\s*(?:over\s*\([^)]*\))?"
+    r"[^;]*?\s*=\s*1\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_LIMIT_1_RE = re.compile(r"\blimit\s+1\b(?!\d)", re.IGNORECASE)
+_LIMIT_N_RE = re.compile(r"\blimit\s+(\d+)\b", re.IGNORECASE)
+_PLURAL_TOP_N_QUESTION_RE = re.compile(
+    r"\b(which|what)\s+[a-z]+\s+(have|has)\s+(the\s+)?(highest|most|top|"
+    r"largest|smallest|lowest)\b",
+    re.IGNORECASE,
+)
+_STRING_LITERAL_RE = re.compile(r"'([^']{1,64})'")
+
+# P1 — column_disambiguation / granularity_drop helpers.
+# Identifier extractor for SELECT/WHERE/GROUP-BY tokens; deliberately
+# permissive so we catch ``schema.column``, ``alias.column``, and bare
+# names. Aliases (``AS something``) are stripped before matching.
+_IDENTIFIER_RE = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*)"
+)
+_GROUP_BY_BLOCK_RE = re.compile(
+    r"\bgroup\s+by\b(.+?)(?=\b(order\s+by|having|limit|window|qualify|"
+    r"union|except|intersect|;|$))",
+    re.IGNORECASE | re.DOTALL,
+)
+_SELECT_BLOCK_RE = re.compile(
+    r"\bselect\b(.+?)\bfrom\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_columns_from_block(block: str) -> set[str]:
+    """Return lowercase identifiers referenced in *block* (SELECT/GROUP BY).
+
+    Strips aliases (``AS x``), measure / function calls (we keep their
+    inner identifiers), and string literals before tokenising. Used by
+    the granularity_drop and column_disambiguation matchers.
+    """
+    if not block:
+        return set()
+    s = re.sub(r"'[^']*'", " ", block)
+    s = re.sub(r"\s+as\s+[A-Za-z_][A-Za-z0-9_]*", " ", s, flags=re.IGNORECASE)
+    out: set[str] = set()
+    for m in _IDENTIFIER_RE.finditer(s):
+        tok = m.group(1).lower()
+        if tok in {
+            "select", "from", "where", "and", "or", "not", "group",
+            "by", "order", "limit", "asc", "desc", "case", "when",
+            "then", "else", "end", "as", "on", "using", "join",
+            "inner", "left", "right", "outer", "full", "is", "null",
+            "in", "exists", "between", "like", "ilike", "true", "false",
+            "all", "any", "some", "distinct", "having", "with", "over",
+            "partition", "rows", "range", "preceding", "following",
+            "current", "row", "interval",
+        }:
+            continue
+        # Skip pure SQL functions / aggregate names. We still keep
+        # their argument identifiers (the regex returns the *last*
+        # capture per match, so ``MEASURE(foo)`` already yields ``foo``).
+        if tok in {"measure", "sum", "count", "avg", "min", "max",
+                   "rank", "dense_rank", "row_number", "coalesce",
+                   "nullif", "cast", "extract", "date_trunc", "date_add",
+                   "year", "month", "day", "to_date", "current_date"}:
+            continue
+        out.add(tok)
+    return out
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    """Return length of the shared lowercase prefix of *a* and *b*."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i].lower() == b[i].lower():
+        i += 1
+    return i
+
+
+# ── Column-confusion analyzer (regression-mining loop) ───────────────
+#
+# The legacy ``column_disambiguation`` detector inside
+# ``_detect_failure_pattern`` keys off a >=5-char shared prefix and
+# only inspects projected columns. That misses real-world abbreviation
+# pairs (``is_month_to_date`` vs ``use_mtdate_flag`` — tokens
+# ``[month, to, date]`` collapse into a single subtoken ``mtdate``)
+# and swaps inside ``WHERE`` / ``GROUP BY`` / ``MEASURE(...)``.
+#
+# ``detect_column_confusion`` is a pure helper used by the regression-
+# mining lane: it returns structured ``ColumnConfusion`` evidence
+# without classifying the failure or routing it to a lever. Acceptance
+# semantics are unchanged; mining consumes these insights only after
+# the candidate has already been rolled back.
+
+_WHERE_BLOCK_RE = re.compile(
+    r"\bwhere\b(.+?)(?=\bgroup\s+by\b|\border\s+by\b|\bhaving\b|"
+    r"\blimit\b|\bwindow\b|\bqualify\b|\bunion\b|\bexcept\b|"
+    r"\bintersect\b|;|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_MEASURE_CALL_RE = re.compile(
+    r"measure\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)",
+    re.IGNORECASE,
+)
+_FROM_TABLE_RE = re.compile(
+    r"\bfrom\s+([A-Za-z_][A-Za-z0-9_\.]*)",
+    re.IGNORECASE,
+)
+_BACKTICK_IDENT_RE = re.compile(r"`([^`]+)`")
+
+
+@dataclass(frozen=True)
+class ColumnConfusion:
+    """Evidence that a generated SQL substituted a similar-looking column.
+
+    ``intended_column`` is the column referenced by the expected SQL
+    that does not appear in the generated SQL. ``confused_column`` is
+    the column the generated SQL used in its place. ``sql_clause`` is
+    one of ``select`` / ``where`` / ``group_by`` / ``measure``.
+    ``confidence`` is a coarse 0-1 score (0.85 for shared-prefix +
+    metadata corroboration, 0.7 for prefix-only or token overlap).
+    ``rationale`` is a short human-readable explanation.
+    """
+
+    intended_column: str
+    confused_column: str
+    table: str | None
+    sql_clause: str
+    confidence: float
+    rationale: str
+
+
+_MIN_ABBREV_LEN = 3
+
+
+def _abbrev_candidates(name: str) -> set[str]:
+    """Generate normalized abbreviation forms for a column name.
+
+    For each contiguous subsequence of underscore tokens, emits:
+
+    * the full concatenation (``month_to_date`` -> ``monthtodate``);
+    * the pure initials (``month_to_date`` -> ``mtd``);
+    * the "abbreviate prefix, keep suffix whole" forms — e.g. with
+      one whole tail token, ``month_to_date`` -> ``mtdate``;
+    * the "keep prefix whole, abbreviate suffix" forms — e.g.
+      ``month_to_date`` -> ``monthtd``.
+
+    All candidates shorter than :data:`_MIN_ABBREV_LEN` are dropped so
+    common prepositional tokens (``is``, ``to``, ``in``) cannot
+    spuriously match across unrelated columns. Used by
+    :func:`_columns_overlap_by_token` to find pairs like
+    ``is_month_to_date`` vs ``use_mtdate_flag`` where the legacy
+    shared-prefix detector returns no match.
+    """
+    if not name:
+        return set()
+    parts = [p for p in re.split(r"[_\W]+", str(name).lower()) if p]
+    if not parts:
+        return set()
+    out: set[str] = set()
+    # Full standalone tokens (>= min length) so single-token columns
+    # match against any subsequence containing them.
+    for p in parts:
+        if len(p) >= _MIN_ABBREV_LEN:
+            out.add(p)
+    n = len(parts)
+    for i in range(n):
+        for j in range(i + 2, n + 1):
+            sub = parts[i:j]
+            full = "".join(sub)
+            if len(full) >= _MIN_ABBREV_LEN:
+                out.add(full)
+            initials = "".join(p[0] for p in sub if p)
+            if len(initials) >= _MIN_ABBREV_LEN:
+                out.add(initials)
+            for k in range(1, len(sub)):
+                # Abbreviate prefix to initials, keep last k tokens whole.
+                cand = (
+                    "".join(p[0] for p in sub[:-k] if p)
+                    + "".join(sub[-k:])
+                )
+                if len(cand) >= _MIN_ABBREV_LEN:
+                    out.add(cand)
+                # Keep first k tokens whole, abbreviate suffix.
+                cand = (
+                    "".join(sub[:k])
+                    + "".join(p[0] for p in sub[k:] if p)
+                )
+                if len(cand) >= _MIN_ABBREV_LEN:
+                    out.add(cand)
+    return out
+
+
+def _columns_overlap_by_token(a: str, b: str) -> tuple[bool, str]:
+    """Return ``(matches, rationale)`` for token/abbrev overlap of two
+    column names.
+
+    The match is symmetric and uses :func:`_abbrev_candidates` on both
+    sides, so e.g. ``mtdate`` (B's token) can match against the
+    abbreviation ``mtdate`` derived from A's ``[month, to, date]``
+    subsequence. The rationale is a short string explaining why the
+    columns matched so callers can persist it without re-deriving.
+    """
+    if not a or not b or a == b:
+        return False, ""
+    cand_a = _abbrev_candidates(a)
+    cand_b = _abbrev_candidates(b)
+    if not cand_a or not cand_b:
+        return False, ""
+    shared = cand_a & cand_b
+    if shared:
+        return True, f"shared/abbreviated subtokens: {sorted(shared)[:5]}"
+    return False, ""
+
+
+def _columns_for_clause(sql: str, clause: str) -> set[str]:
+    """Return columns referenced under *clause* in *sql*.
+
+    *clause* is one of ``select`` / ``where`` / ``group_by`` /
+    ``measure``. Returns lowercase identifiers; deliberately permissive
+    on syntax to keep parity with the existing ``_detect_failure_pattern``
+    helpers (regex over sqlglot for unparseable SQL).
+    """
+    if not sql:
+        return set()
+    if clause == "select":
+        m = _SELECT_BLOCK_RE.search(sql)
+        return _extract_columns_from_block(m.group(1)) if m else set()
+    if clause == "where":
+        m = _WHERE_BLOCK_RE.search(sql)
+        return _extract_columns_from_block(m.group(1)) if m else set()
+    if clause == "group_by":
+        m = _GROUP_BY_BLOCK_RE.search(sql)
+        return _extract_columns_from_block(m.group(1)) if m else set()
+    if clause == "measure":
+        return {m.group(1).lower() for m in _MEASURE_CALL_RE.finditer(sql)}
+    return set()
+
+
+def _extract_table_hint(sql: str) -> str | None:
+    """Best-effort table extraction from the first FROM clause."""
+    if not sql:
+        return None
+    m = _FROM_TABLE_RE.search(sql)
+    if not m:
+        return None
+    raw = m.group(1).strip().rstrip(";").rstrip(",")
+    return raw or None
+
+
+def detect_column_confusion(
+    expected_sql: str,
+    generated_sql: str,
+    *,
+    metadata_snapshot: dict | None = None,
+    min_prefix_len: int = 5,
+) -> list[ColumnConfusion]:
+    """Return structured column-confusion evidence between two SQLs.
+
+    Compares expected vs generated SQL across the SELECT, WHERE,
+    GROUP BY, and MEASURE(...) surfaces. For each clause, finds
+    expected-only columns and generated-only columns, then pairs them
+    when one of the following matches:
+
+    * shared lowercase prefix >= ``min_prefix_len`` (legacy disambig
+      pattern), OR
+    * shared subtokens of length >= 3, OR
+    * initial-letter abbreviation of one side appears as a substring
+      of the other side.
+
+    *metadata_snapshot* is consulted only to bump confidence when both
+    columns belong to the same table with the same data type. The
+    function does not require it; absent metadata the result is still
+    valid (lower confidence).
+
+    Pure: no I/O, no LLM, no Genie SDK. Safe to call from anywhere in
+    the optimizer.
+    """
+    if not (expected_sql or "").strip() or not (generated_sql or "").strip():
+        return []
+
+    table_hint = (
+        _extract_table_hint(expected_sql)
+        or _extract_table_hint(generated_sql)
+    )
+
+    insights: list[ColumnConfusion] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for clause in ("select", "where", "group_by", "measure"):
+        exp_cols = _columns_for_clause(expected_sql, clause)
+        gen_cols = _columns_for_clause(generated_sql, clause)
+        exp_only = exp_cols - gen_cols
+        gen_only = gen_cols - exp_cols
+        if not exp_only or not gen_only:
+            continue
+        for exp_c in sorted(exp_only):
+            best: tuple[ColumnConfusion, float] | None = None
+            for gen_c in sorted(gen_only):
+                if exp_c == gen_c:
+                    continue
+                prefix = _common_prefix_len(exp_c, gen_c)
+                token_match, token_reason = _columns_overlap_by_token(
+                    exp_c, gen_c,
+                )
+                if prefix < min_prefix_len and not token_match:
+                    continue
+                # Confidence: prefix dominates (cheaper, well-tested).
+                # Token-only matches start lower and bump on metadata.
+                if prefix >= min_prefix_len:
+                    conf = 0.7
+                    rationale = (
+                        f"columns share {prefix}-char prefix"
+                    )
+                else:
+                    conf = 0.6
+                    rationale = token_reason or "subtoken overlap"
+                same_type = _same_data_type(
+                    metadata_snapshot, exp_c, gen_c,
+                )
+                if same_type:
+                    conf = min(0.9, conf + 0.15)
+                    rationale = f"{rationale}; metadata confirms same data type"
+                key = (exp_c, gen_c, clause)
+                if key in seen:
+                    continue
+                seen.add(key)
+                cand = ColumnConfusion(
+                    intended_column=exp_c,
+                    confused_column=gen_c,
+                    table=table_hint,
+                    sql_clause=clause,
+                    confidence=conf,
+                    rationale=(
+                        f"GT {clause} uses {exp_c!r}; "
+                        f"Genie {clause} uses {gen_c!r}; {rationale}."
+                    ),
+                )
+                if best is None or cand.confidence > best[1]:
+                    best = (cand, cand.confidence)
+            if best is not None:
+                insights.append(best[0])
+
+    return insights
+
+
+def _same_data_type(
+    metadata_snapshot: dict | None,
+    col_a: str,
+    col_b: str,
+) -> bool:
+    """Return True iff *col_a* and *col_b* live on the same table with
+    the same data type, per *metadata_snapshot*. Defensive: any shape
+    mismatch returns False."""
+    if not isinstance(metadata_snapshot, dict):
+        return False
+    tables = metadata_snapshot.get("tables")
+    if not isinstance(tables, dict):
+        return False
+    a = (col_a or "").lower()
+    b = (col_b or "").lower()
+    for _t_meta in tables.values():
+        cols = _t_meta.get("columns") if isinstance(_t_meta, dict) else None
+        if not isinstance(cols, dict):
+            continue
+        if a not in cols or b not in cols:
+            continue
+        ta = cols.get(a) or {}
+        tb = cols.get(b) or {}
+        if not isinstance(ta, dict) or not isinstance(tb, dict):
+            continue
+        ta_t = str(ta.get("data_type", "")).lower()
+        tb_t = str(tb.get("data_type", "")).lower()
+        if ta_t and tb_t and ta_t == tb_t:
+            return True
+    return False
+
+
+def _detect_failure_pattern(ctx: dict) -> tuple[str | None, float, str]:
+    """T1.2: Return (pattern_label, confidence, evidence) for a failure.
+
+    Runs a small library of structural pattern matchers on
+    ``(expected_sql, generated_sql, question)``. Returns ``(None, 0.0,
+    "")`` when no pattern fires — callers then fall back to the legacy
+    ``_classify_sql_diff`` heuristic.
+
+    Pattern labels (stable, used downstream for cluster keying):
+
+    - ``time_window_pivot``:  Genie pivots ``time_window`` as a row
+      dimension via ``WHERE time_window IN (...)`` + GROUP BY, while GT
+      uses measure-suffix-on-same-row. Drives Q1 / Q10 / Q11 / Q17 in
+      the retail corpus.
+    - ``plural_top_n_collapse``:  the question asks "which stores have
+      the highest ..." (plural) but Genie returns top-1 via ``RANK()=1``
+      or ``LIMIT 1`` while GT returns an ordered list (or LIMIT N > 1).
+      Drives Q2 / Q6.
+    - ``value_format_mismatch``:  Genie's WHERE-clause literal doesn't
+      match any literal format GT used on the same column (e.g.
+      ``state_name = 'Virginia'`` vs GT ``state_name = 'VA'``). Drives
+      Q19.
+    - ``column_disambiguation``:  the chosen column shares a prefix with
+      at least one other column that has the same data type — a
+      disambiguation pair. Drives Q3 (is_one_day_prior_year_same_day
+      vs is_month_to_date_prior_year_same_day).
+    - ``granularity_drop``:  GT groups by ``{K1, K2, ...}``; Genie's
+      GROUP BY is a strict subset; the missing keys appear in GT's
+      SELECT projection (i.e. they're carried as output dimensions,
+      not just join keys). Drives Q11 (GT groups by time_window and
+      returns per-time-window rows; Genie drops time_window).
+
+    Each detector is independent and cheap; they run in declared order
+    and the first with confidence >= 0.7 wins. Confidence is a coarse
+    indicator (0.7 for structural patterns, 0.9 when the question text
+    independently corroborates).
+    """
+    expected_sql = (ctx.get("expected_sql") or "").strip()
+    generated_sql = (ctx.get("generated_sql") or "").strip()
+    question = (ctx.get("question") or "").strip()
+
+    if not expected_sql and not generated_sql:
+        return None, 0.0, ""
+
+    exp_lower = expected_sql.lower()
+    gen_lower = generated_sql.lower()
+
+    # 1. time_window_pivot — Genie adds a pivot dimension GT did not.
+    if (
+        generated_sql
+        and _TIME_WINDOW_WHERE_RE.search(gen_lower)
+        and _TIME_WINDOW_GROUPBY_RE.search(gen_lower)
+        and not _TIME_WINDOW_GROUPBY_RE.search(exp_lower)
+    ):
+        return (
+            "time_window_pivot",
+            0.9,
+            "Genie has WHERE time_window IN (...) + GROUP BY time_window; "
+            "GT does not group by time_window.",
+        )
+
+    # 2. plural_top_n_collapse — Genie collapses plural question to top-1.
+    _question_is_plural = bool(_PLURAL_TOP_N_QUESTION_RE.search(question))
+    _gen_is_top1 = bool(
+        _RANK_EQ_1_RE.search(gen_lower) or _LIMIT_1_RE.search(gen_lower)
+    )
+    _exp_is_top1 = bool(
+        _RANK_EQ_1_RE.search(exp_lower) or _LIMIT_1_RE.search(exp_lower)
+    )
+    _exp_limit_match = _LIMIT_N_RE.search(exp_lower)
+    _exp_limit_n = int(_exp_limit_match.group(1)) if _exp_limit_match else None
+    _exp_is_ordered_list = (
+        not _exp_is_top1
+        and (
+            (_exp_limit_n is not None and _exp_limit_n > 1)
+            or "order by" in exp_lower
+        )
+    )
+    if _gen_is_top1 and _exp_is_ordered_list:
+        _conf = 0.9 if _question_is_plural else 0.7
+        return (
+            "plural_top_n_collapse",
+            _conf,
+            (
+                f"Genie returns top-1 via RANK=1/LIMIT 1; "
+                f"GT returns ordered list"
+                + (f" (LIMIT {_exp_limit_n})" if _exp_limit_n else "")
+                + (
+                    "; question phrased as plural ('which ... have the "
+                    "highest')"
+                    if _question_is_plural
+                    else ""
+                )
+            ),
+        )
+
+    # 3. value_format_mismatch — WHERE literal on same column differs in
+    #    format. We compare the set of single-quoted literals in each
+    #    SQL; a mismatch where GT literal is a SHORT form (<=5 chars)
+    #    and Genie literal is a LONG form (>=6 chars) starting with the
+    #    same letter is the canonical "full-name vs code" pattern.
+    _exp_lits = set(_STRING_LITERAL_RE.findall(expected_sql))
+    _gen_lits = set(_STRING_LITERAL_RE.findall(generated_sql))
+    if _exp_lits and _gen_lits and _exp_lits != _gen_lits:
+        for _gl in _gen_lits:
+            if _gl in _exp_lits:
+                continue
+            for _el in _exp_lits:
+                if _el in _gen_lits:
+                    continue
+                if (
+                    len(_el) <= 5 and len(_gl) >= 6
+                    and _el[:1].lower() == _gl[:1].lower()
+                ):
+                    return (
+                        "value_format_mismatch",
+                        0.85,
+                        (
+                            f"Genie literal {_gl!r} differs from GT "
+                            f"literal {_el!r}; GT uses short form "
+                            f"({len(_el)} chars), Genie uses long form "
+                            f"({len(_gl)} chars)."
+                        ),
+                    )
+
+    # P1 — column_disambiguation. The chosen column shares a common
+    # prefix (>= 5 chars) with at least one other column on the same
+    # table, and the table metadata (when available) confirms both
+    # share a data type. We compare GT's projected/filtered columns
+    # vs Genie's; when the unique GT-only column shares a long prefix
+    # with the unique Genie-only column on the same table, the pattern
+    # fires. Confidence 0.85 if metadata corroborates same-type, else
+    # 0.7 (prefix-only).
+    _gt_select_match = _SELECT_BLOCK_RE.search(expected_sql)
+    _gn_select_match = _SELECT_BLOCK_RE.search(generated_sql)
+    _gt_select_cols = (
+        _extract_columns_from_block(_gt_select_match.group(1))
+        if _gt_select_match else set()
+    )
+    _gn_select_cols = (
+        _extract_columns_from_block(_gn_select_match.group(1))
+        if _gn_select_match else set()
+    )
+    _gt_only = _gt_select_cols - _gn_select_cols
+    _gn_only = _gn_select_cols - _gt_select_cols
+    _metadata_snapshot = ctx.get("metadata_snapshot") or {}
+    if _gt_only and _gn_only:
+        for _gtc in _gt_only:
+            for _gnc in _gn_only:
+                if _gtc == _gnc:
+                    continue
+                _prefix = _common_prefix_len(_gtc, _gnc)
+                if _prefix < 5:
+                    continue
+                # Try to corroborate via metadata: are both columns
+                # present in any one table with the same data type?
+                _same_type = False
+                _tables = (
+                    _metadata_snapshot.get("tables")
+                    if isinstance(_metadata_snapshot, dict) else None
+                )
+                if isinstance(_tables, dict):
+                    for _t_name, _t_meta in _tables.items():
+                        _cols = (
+                            _t_meta.get("columns")
+                            if isinstance(_t_meta, dict) else None
+                        )
+                        if not isinstance(_cols, dict):
+                            continue
+                        if _gtc not in _cols or _gnc not in _cols:
+                            continue
+                        _t1 = (
+                            (_cols.get(_gtc) or {}).get("data_type", "")
+                            if isinstance(_cols.get(_gtc), dict) else ""
+                        )
+                        _t2 = (
+                            (_cols.get(_gnc) or {}).get("data_type", "")
+                            if isinstance(_cols.get(_gnc), dict) else ""
+                        )
+                        if _t1 and _t2 and str(_t1).lower() == str(_t2).lower():
+                            _same_type = True
+                            break
+                _conf = 0.85 if _same_type else 0.7
+                return (
+                    "column_disambiguation",
+                    _conf,
+                    (
+                        f"GT projects {_gtc!r}; Genie projects "
+                        f"{_gnc!r}; columns share {_prefix}-char prefix"
+                        + (
+                            "; metadata confirms same data type."
+                            if _same_type else "."
+                        )
+                    ),
+                )
+
+    # P1 — granularity_drop. GT groups by ``{K1, K2, ...}``; Genie's
+    # GROUP BY is a strict subset; the missing keys appear in GT's
+    # SELECT projection (carried as output dimensions). Confidence
+    # 0.85.
+    _gt_group_match = _GROUP_BY_BLOCK_RE.search(expected_sql)
+    _gn_group_match = _GROUP_BY_BLOCK_RE.search(generated_sql)
+    if _gt_group_match and _gn_group_match:
+        _gt_keys = _extract_columns_from_block(_gt_group_match.group(1))
+        _gn_keys = _extract_columns_from_block(_gn_group_match.group(1))
+        _missing = _gt_keys - _gn_keys
+        if _gt_keys and _gn_keys and _missing and _gn_keys < _gt_keys:
+            _carried = _missing & _gt_select_cols
+            if _carried:
+                return (
+                    "granularity_drop",
+                    0.85,
+                    (
+                        f"GT GROUP BY includes {sorted(_gt_keys)}; "
+                        f"Genie GROUP BY drops {sorted(_missing)}; "
+                        f"dropped keys appear in GT projection: "
+                        f"{sorted(_carried)}."
+                    ),
+                )
+
+    # No pattern matched with sufficient confidence.
+    return None, 0.0, ""
+
+
 def _classify_sql_diff(ctx: dict) -> str:
     """Classify a failure's root cause by comparing expected vs generated SQL.
 
     Accepts either a ``sql_context`` dict (with ``expected_sql`` / ``generated_sql``
     keys) or a full row dict (with ``request`` / ``response`` keys).
     Falls back to ``"other"`` when the SQL pair is missing or no pattern matches.
+
+    T1.2: delegates to ``_detect_failure_pattern`` first; when a pattern
+    matcher fires with confidence >= 0.7, its label is returned instead
+    of the legacy bucket. This keeps the existing callers unchanged
+    while opportunistically surfacing more specific pattern labels when
+    they're available.
     """
+    _pattern_label, _pattern_conf, _pattern_evidence = _detect_failure_pattern(ctx)
+    if _pattern_label and _pattern_conf >= 0.7:
+        # Stash the evidence on the ctx so downstream cluster keying /
+        # logs can reference it. The return value stays a bare string
+        # for back-compat with legacy callers.
+        if isinstance(ctx, dict):
+            ctx.setdefault("_pattern_label", _pattern_label)
+            ctx.setdefault("_pattern_confidence", _pattern_conf)
+            ctx.setdefault("_pattern_evidence", _pattern_evidence)
+        return _pattern_label
     expected_sql = (ctx.get("expected_sql") or "").strip()
     generated_sql = (ctx.get("generated_sql") or "").strip()
 
@@ -803,6 +1808,60 @@ def _classify_sql_diff(ctx: dict) -> str:
     return "missing_instruction"
 
 
+def _normalize_ast_diff_sql_pairs(raw: Any) -> list[dict[str, str]]:
+    """Normalize row-level SQL pairs into the dict shape AFS expects.
+
+    ``harness.py`` writes ``(generated_sql, expected_sql)``;
+    ``afs._structural_diff`` expects ``{"expected_sql": ..., "generated_sql": ...}``.
+    Accept both shapes so future callers can use the clearer dict form.
+    """
+    if not raw:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    out: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            expected_sql = str(item.get("expected_sql") or "")
+            generated_sql = str(item.get("generated_sql") or "")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            generated_sql = str(item[0] or "")
+            expected_sql = str(item[1] or "")
+        else:
+            continue
+        if expected_sql and generated_sql:
+            pair = {"expected_sql": expected_sql, "generated_sql": generated_sql}
+            if pair not in out:
+                out.append(pair)
+    return out[:5]
+
+
+def _summarize_feature_diffs(raw: list[Any]) -> dict[str, Any]:
+    """Summarize feature_mining.SqlDiff objects without carrying raw SQL.
+
+    Prompt-facing output is intentionally a closed set of enum-like tokens and
+    integer lever IDs. Keep table names, column names, and SQL text out of this
+    block; AFS carries structural diffs separately through its leak-safe
+    projection path.
+    """
+    kinds: list[str] = []
+    levers: list[int] = []
+    for diff in raw:
+        primary = getattr(diff, "primary_kind", None)
+        kind = getattr(primary, "value", None) or str(primary or "")
+        if kind and kind != "None" and kind not in kinds:
+            kinds.append(kind)
+        for lever in getattr(diff, "candidate_levers", ()) or ():
+            if int(lever) not in levers:
+                levers.append(int(lever))
+    if not kinds:
+        return {}
+    return {
+        "primary_kind": kinds[0],
+        "kinds": kinds,
+        "candidate_levers": levers,
+    }
+
+
 def cluster_failures(
     eval_results: dict,
     metadata_snapshot: dict,
@@ -812,6 +1871,10 @@ def cluster_failures(
     catalog: str = "",
     schema: str = "",
     verbose: bool = True,
+    held_out_qids: set[str] | None = None,
+    qid_state: dict | None = None,
+    signal_type: str = "hard",
+    namespace: str | None = None,
 ) -> list[dict]:
     """Group evaluation failures into actionable clusters.
 
@@ -819,8 +1882,32 @@ def cluster_failures(
     ``(judge, _extract_pattern(rationale), "")`` when ASI is absent.
     Returns clusters with >= 1 question so even single failures are actionable.
 
+    Tier 2.11: the caller can supply a shared ``qid_state`` dict so hard
+    and soft clustering passes see the same ``:vN`` dedup state. Without
+    this, the same physical row shows up as ``Q001`` in the hard cluster
+    and ``Q001`` in the soft cluster with two different root causes —
+    the DO-NOT-RETRY bookkeeping then gets confused. ``signal_type`` is
+    stamped on each cluster for downstream consumers.
+
+    T1.9: ``namespace`` controls the cluster_id prefix. Hard passes should
+    pass ``namespace="H"`` to mint ``H001, H002, ...``; soft passes should
+    pass ``namespace="S"`` to mint ``S001, S002, ...``. Without this, both
+    passes collide on the ``C001, C002, ...`` namespace and downstream
+    consumers that key off ``source_cluster_ids`` cannot tell whether a
+    cluster is hard or soft. Defaults to ``"H"`` when ``signal_type="hard"``
+    and ``"S"`` otherwise, so callers that don't specify get sensible
+    behaviour. Legacy ``C###`` IDs are still accepted by downstream
+    parsers for replay compatibility with old iterations.
+
     When ``spark/run_id/catalog/schema`` are provided, enriches with stored
     ASI data from ``genie_eval_asi_results`` Delta table.
+
+    Bug #4 (P4.2) — ``held_out_qids`` (optional) is a set of benchmark ids
+    reserved for baseline/finalize evaluation. Any row whose question_id is
+    in this set is dropped before clustering; downstream LLM prompts
+    (which consume the clusters) therefore NEVER see held-out content.
+    Callers that pass ``held_out_qids=None`` get the legacy "train+held-
+    out mixed" behaviour but SHOULD be updated.
     """
     uc_asi_map: dict[tuple[str, str], dict] = {}
     if spark and run_id and catalog and schema:
@@ -865,8 +1952,41 @@ def cluster_failures(
     except ImportError:
         rows_iter = table if isinstance(table, list) else []
 
+    _held_out: set[str] = set(held_out_qids or set())
+
+    # S2 (duplicate-qid dedup) — a benchmark table can legally contain two
+    # rows with the same ``id`` (the C1 dedupe script is a one-shot cleanup,
+    # not a runtime constraint). Before S2, ``question_profiles[qid]``
+    # silently merged their failures, so the blame/counterfactual/root-cause
+    # aggregation double-counted and the weighted dominant cause was biased
+    # toward whichever row ran second. We now auto-suffix reappearing qids
+    # with ``:v2`` / ``:v3`` when the request signature differs, and drop
+    # pure duplicates (same qid, same question/expected_sql) with a log
+    # entry. The rewrite log is surfaced in the CLUSTER FORMATION block.
+    #
+    # Tier 2.11: when the caller supplies ``qid_state``, the dedup caches
+    # persist across calls. Hard+soft clustering share one state dict so
+    # the same physical row gets one stable qid (possibly with :vN suffix)
+    # and therefore one cluster, not two.
+    if qid_state is not None:
+        _qid_seen = qid_state.setdefault("seen", {})
+        _qid_version = qid_state.setdefault("version", {})
+        _qid_rewrites = qid_state.setdefault("rewrites", [])
+        _qid_pure_duplicates = qid_state.setdefault("pure_duplicates", [])
+    else:
+        _qid_seen = {}
+        _qid_version = {}
+        _qid_rewrites = []
+        _qid_pure_duplicates = []
+
     for row in rows_iter:
         if not isinstance(row, dict):
+            continue
+
+        # Bug #4 (P4.2) — held-out benchmarks must never enter the LLM-
+        # bound clustering path. Drop them before any signal extraction.
+        qid = str(row.get("question_id") or row.get("qid") or "")
+        if qid and qid in _held_out:
             continue
 
         _req = row.get("request") or {}
@@ -884,6 +2004,34 @@ def cluster_failures(
                 _resp = {}
 
         question_id = _row_qid(row)
+
+        # S2: disambiguate duplicate qids by request signature. Signature is
+        # (question_text, expected_sql) — stable across the benchmark row
+        # identity but unique across distinct rows that share an id.
+        _row_question = _req.get("question", "") if isinstance(_req, dict) else ""
+        _row_expected = _req.get("expected_sql", "") if isinstance(_req, dict) else ""
+        _row_signature = (str(_row_question).strip(), str(_row_expected).strip())
+        # Tier 2.12: capture the base question_id (the real benchmark id)
+        # separately so ``:vN`` tokens never propagate into outward-facing
+        # fields. Downstream consumers that need to map back to a benchmark
+        # row (slice sampler, benchmark lookup, UI drill-down, human-review
+        # flagging) must use base_question_id — not question_id.
+        _base_qid = question_id
+        _trial_index = 1
+        if question_id in _qid_seen:
+            if _qid_seen[question_id] == _row_signature:
+                _qid_pure_duplicates.append(question_id)
+                continue
+            version = _qid_version.get(question_id, 1) + 1
+            _qid_version[question_id] = version
+            _rewritten = f"{question_id}:v{version}"
+            _qid_rewrites.append(f"{question_id} -> {_rewritten}")
+            _trial_index = version
+            question_id = _rewritten
+            _qid_seen[question_id] = _row_signature
+        else:
+            _qid_seen[question_id] = _row_signature
+            _qid_version[question_id] = 1
 
         sql_ctx = {
             "question": _req.get("question", "") if isinstance(_req, dict) else "",
@@ -913,18 +2061,54 @@ def cluster_failures(
                     or row.get(f"rationale/{judge}")
                     or row.get("rationale", "")
                 )
-                judge_meta = (
-                    row.get(f"feedback/{judge}/metadata")
-                    or row.get(f"{judge}/metadata")
-                    or {}
-                )
+                # T0.1: instrument ASI extraction paths so operators can
+                # see *why* ASI metadata is or is not found per judge.
+                # In iteration-3 of the retail corpus, 100% of failures
+                # logged ``ASI metadata found: NO`` even though the
+                # scorers emit metadata. Log which source produced
+                # ``judge_meta`` so we can tell "scorer didn't emit it"
+                # apart from "MLflow didn't propagate it" apart from
+                # "rationale parse fallback worked".
+                _asi_source = "none"
+                # Phase 2.3: respect the row-level ``_asi_source``
+                # breadcrumb stamped by ``_merge_row_sources`` so the
+                # histogram correctly reports ``trace`` /
+                # ``recovered_trace`` / ``cache`` instead of always
+                # collapsing to ``row_metadata``.
+                _row_level_source = row.get("_asi_source") or ""
+                judge_meta = row.get(f"feedback/{judge}/metadata")
+                if judge_meta:
+                    _asi_source = "feedback_metadata"
+                else:
+                    judge_meta = row.get(f"{judge}/metadata")
+                    if judge_meta:
+                        _asi_source = (
+                            f"row_metadata:{_row_level_source}"
+                            if _row_level_source else "row_metadata"
+                        )
+                    else:
+                        judge_meta = {}
                 if not isinstance(judge_meta, dict):
                     try:
                         judge_meta = json.loads(judge_meta) if isinstance(judge_meta, str) else {}
+                        if judge_meta:
+                            _asi_source = f"{_asi_source}_json_parsed"
                     except (json.JSONDecodeError, TypeError):
                         judge_meta = {}
+                        _asi_source = f"{_asi_source}_json_parse_failed"
                 if not judge_meta:
-                    judge_meta = _parse_asi_from_rationale(rationale)
+                    _parsed = _parse_asi_from_rationale(rationale)
+                    if _parsed:
+                        judge_meta = _parsed
+                        _asi_source = "rationale_parse"
+                # Stash source on the row so downstream cluster-
+                # formation debug logs can surface "n/m failures had
+                # asi via feedback_metadata" vs "... via rationale_parse".
+                row.setdefault("_asi_extraction_log", []).append({
+                    "judge": judge,
+                    "source": _asi_source,
+                    "found": bool(judge_meta),
+                })
                 asi_failure_type = (
                     judge_meta.get("failure_type")
                     or row.get(f"metadata/{judge}/failure_type")
@@ -957,8 +2141,49 @@ def cluster_failures(
                         if not asi_join_assessment:
                             asi_join_assessment = uc_asi_entry.get("join_assessment")
 
+                # Tier 2.13 / 2.14 (narrowed by Task 7): fall back to the
+                # Genie-behaviour-pattern classifier ONLY when ASI carries
+                # no specific failure_type. ``wrong_filter_condition`` and
+                # ``wrong_aggregation`` are themselves specific labels —
+                # the typed ``SqlDiff`` produced by Task 6 supplies the
+                # finer routing signal, so the override is reserved for
+                # ``other`` / missing labels. This stops the override
+                # from flattening five generic ``other`` verdicts onto
+                # the same pattern label and inflating dominance, the
+                # G1 failure mode the retail run exhibited.
+                if not asi_failure_type or asi_failure_type == "other":
+                    try:
+                        from genie_space_optimizer.optimization.evaluation import (
+                            classify_genie_shape_patterns,
+                        )
+                        _pattern = classify_genie_shape_patterns(row)
+                        if _pattern:
+                            asi_failure_type = _pattern["failure_type"]
+                            if not asi_blame_set:
+                                asi_blame_set = _pattern.get("blame_set")
+                            if not asi_wrong_clause:
+                                asi_wrong_clause = _pattern.get("wrong_clause")
+                    except Exception:
+                        logger.debug("classify_genie_shape_patterns raised", exc_info=True)
+
+                # T1.3: signal-quality metadata. Each failure carries
+                # booleans describing *how* its attribution was derived
+                # so cluster impact and the strategist can discount
+                # low-quality signals. Ratio of trusted signals is used
+                # by ``cluster_impact`` to scale the dampen multiplier.
+                _asi_present = bool(
+                    asi_failure_type and asi_failure_type not in ("other", "")
+                )
+                _result_fetched = True
+                _cmp = (sql_ctx or {}).get("comparison") or {}
+                _err_type = str(_cmp.get("error_type") or "").lower()
+                if _err_type in ("genie_result_unavailable",):
+                    _result_fetched = False
+
                 failure_entry: dict = {
                     "question_id": question_id,
+                    "base_question_id": _base_qid,
+                    "trial_index": _trial_index,
                     "judge": judge,
                     "rationale": rationale,
                     "asi_failure_type": asi_failure_type,
@@ -966,9 +2191,21 @@ def cluster_failures(
                     "asi_counterfactual_fix": asi_counterfactual,
                     "asi_wrong_clause": asi_wrong_clause,
                     "sql_context": sql_ctx,
+                    # T1.3: signal-quality metadata.
+                    "_signal_quality": {
+                        "asi_present": _asi_present,
+                        "result_fetched": _result_fetched,
+                    },
                 }
                 if isinstance(asi_join_assessment, dict) and asi_join_assessment.get("left_table"):
                     failure_entry["asi_join_assessment"] = asi_join_assessment
+                _ast_pairs = _normalize_ast_diff_sql_pairs(
+                    row.get("_sql_pairs_for_ast_diff")
+                )
+                if _ast_pairs:
+                    failure_entry["_sql_pairs_for_ast_diff"] = _ast_pairs
+                if row.get("_feature_diff") is not None:
+                    failure_entry["_feature_diff"] = row["_feature_diff"]
                 failures.append(failure_entry)
 
     question_profiles: dict[str, dict] = {}
@@ -982,35 +2219,166 @@ def cluster_failures(
                 "counterfactual_fixes": [],
                 "wrong_clauses": [],
                 "sql_context": f.get("sql_context", {}),
+                "sql_pairs_for_ast_diff": [],
+                "feature_diffs": [],
                 "failures": [],
+                # Tier 2.12: preserve the benchmark's real id so downstream
+                # outward-facing fields (ag.affected_questions, provenance,
+                # slice samplers, UI) never have to strip ``:vN`` tokens.
+                "base_question_id": f.get("base_question_id", qid),
+                "trial_index": f.get("trial_index", 1),
             }
         profile = question_profiles[qid]
         profile["judges"].add(f["judge"])
         profile["failures"].append(f)
+        for _pair in f.get("_sql_pairs_for_ast_diff") or []:
+            if _pair not in profile["sql_pairs_for_ast_diff"]:
+                profile["sql_pairs_for_ast_diff"].append(_pair)
+        if f.get("_feature_diff") is not None:
+            profile["feature_diffs"].append(f["_feature_diff"])
 
+        # S3 — Root-cause cascade, ordered so each level overrides later
+        # ones. The historical bug was that empty ``generated_sql`` fell
+        # through to ``_classify_sql_diff`` which then emitted nonsense
+        # ``missing_filter`` / ``wrong_join`` labels based on the absence
+        # of a WHERE clause, and that ASI ``failure_type="other"`` with
+        # a non-empty ``blame_set`` was discarded instead of rescued into
+        # ``missing_data_asset`` (Lever 3).
+        sql_context = f.get("sql_context", {}) or {}
+        generated_sql = str(sql_context.get("generated_sql", "") or "").strip()
         asi_ft = f.get("asi_failure_type")
-        if asi_ft and asi_ft != "other":
+
+        # P1.3 — pass metadata snapshot through so the
+        # ``column_disambiguation`` matcher can corroborate same-type
+        # candidates without re-reading the snapshot from disk.
+        if metadata_snapshot and "metadata_snapshot" not in sql_context:
+            sql_context["metadata_snapshot"] = metadata_snapshot
+
+        if not generated_sql:
+            root = "missing_sql_generation"
+            resolution_method = "empty_sql_shortcut"
+        elif asi_ft and asi_ft != "other":
             root = asi_ft
             resolution_method = "asi_metadata"
         else:
-            pattern = _extract_pattern(f["rationale"])
-            if pattern != "other":
-                root = pattern
-                resolution_method = "rationale_pattern"
+            # P1.3 — promote structural pattern detection above the
+            # blame_set / rationale branches so a high-confidence
+            # pattern (>= 0.7) wins over the generic
+            # ``missing_data_asset`` / rationale-derived bucket. The
+            # ASI-metadata branch above still wins when present;
+            # patterns only run when ASI is absent or generic.
+            _pattern_label, _pattern_conf, _pattern_evidence = (
+                _detect_failure_pattern(sql_context)
+            )
+            if _pattern_label and _pattern_conf >= 0.7:
+                root = _pattern_label
+                resolution_method = "structural_pattern"
+                sql_context.setdefault("_pattern_label", _pattern_label)
+                sql_context.setdefault("_pattern_confidence", _pattern_conf)
+                sql_context.setdefault("_pattern_evidence", _pattern_evidence)
+            elif (
+                (asi_ft == "other" or not asi_ft)
+                and _blame_set_matches_metadata(f.get("asi_blame_set"), metadata_snapshot)
+            ):
+                root = "missing_data_asset"
+                resolution_method = "asi_blame_set"
             else:
-                root = _classify_sql_diff(f.get("sql_context", {}))
-                resolution_method = "sql_diff"
+                pattern = _extract_pattern(f["rationale"])
+                if pattern != "other":
+                    root = pattern
+                    resolution_method = "rationale_pattern"
+                else:
+                    root = _classify_sql_diff(sql_context)
+                    resolution_method = "sql_diff"
         f["_resolved_root_cause"] = root
         f["_resolution_method"] = resolution_method
+
+        # T1.1: build a structured FailureAttribution record alongside
+        # the legacy ``_resolved_root_cause`` string so downstream can
+        # reason about attribution source, confidence, and competing
+        # hypotheses without re-deriving them. This is the foundation
+        # for pattern-aware clustering (T1.2) and signal-quality
+        # weighting (T1.3) — both now have a single canonical place
+        # to read from and stamp into.
+        _attrib_confidence: float
+        if resolution_method == "asi_metadata":
+            _attribution_source = "trace_evidence"
+            _attrib_confidence = 0.9
+        elif resolution_method == "asi_blame_set":
+            _attribution_source = "trace_evidence"
+            _attrib_confidence = 0.8
+        elif resolution_method == "structural_pattern":
+            # P1.3 — promoted above blame_set / rationale; the pattern
+            # detector returned its own confidence which is already
+            # stamped on sql_context. Read it back here so the
+            # attribution record carries the matcher's confidence
+            # rather than a flat default.
+            _attribution_source = "sql_diff"
+            _attrib_confidence = float(
+                sql_context.get("_pattern_confidence", 0.75)
+            )
+        elif resolution_method == "rationale_pattern":
+            _attribution_source = "judge_text"
+            _attrib_confidence = 0.65
+        elif resolution_method == "sql_diff":
+            _attribution_source = "sql_diff"
+            # When the T1.2 pattern detector fires, the ctx was stamped
+            # with ``_pattern_confidence`` — use it so richer patterns
+            # read as higher-confidence attribution than the legacy
+            # bucket labels.
+            _attrib_confidence = float(
+                sql_context.get("_pattern_confidence", 0.5)
+            )
+        elif resolution_method == "empty_sql_shortcut":
+            _attribution_source = "heuristic"
+            _attrib_confidence = 1.0
+        else:
+            _attribution_source = "heuristic"
+            _attrib_confidence = 0.4
+
+        # Pull target asset from ASI blame_set (preferred — it names the
+        # exact metadata object) or pattern evidence (fallback — names
+        # the general bucket). Target kind is inferred from the asset
+        # shape: ``table.column`` → column; ``db.schema.table`` →
+        # table; etc.
+        _target_asset_id: str | None = None
+        _target_asset_kind: str | None = None
+        _blame_for_target = f.get("asi_blame_set")
+        if _blame_for_target:
+            if isinstance(_blame_for_target, list) and _blame_for_target:
+                _target_asset_id = str(_blame_for_target[0]).strip()
+            elif isinstance(_blame_for_target, str):
+                _target_asset_id = _blame_for_target.strip()
+            if _target_asset_id:
+                _n_dots = _target_asset_id.count(".")
+                if _n_dots >= 3:
+                    _target_asset_kind = "column"
+                elif _n_dots == 2:
+                    _target_asset_kind = "table"
+                else:
+                    _target_asset_kind = "pattern"
+
+        f["_attribution"] = {
+            "target_asset_kind": _target_asset_kind,
+            "target_asset_id": _target_asset_id,
+            "pattern_label": sql_context.get("_pattern_label") or None,
+            "attribution_source": _attribution_source,
+            "confidence": round(_attrib_confidence, 3),
+            "evidence_snippet": str(
+                sql_context.get("_pattern_evidence") or f.get("rationale", "")
+            )[:300],
+        }
+
         profile["root_causes"].append(root)
 
         if f.get("asi_blame_set"):
-            raw_blame = f["asi_blame_set"]
-            items = raw_blame if isinstance(raw_blame, list) else [str(raw_blame)]
-            for item in items:
-                item_str = str(item).strip()
-                if item_str and item_str not in profile["blame_sets"]:
-                    profile["blame_sets"].append(item_str)
+            from genie_space_optimizer.optimization.blame_normalization import (
+                normalize_blame_set,
+            )
+
+            for token in normalize_blame_set(f["asi_blame_set"]):
+                if token and token not in profile["blame_sets"]:
+                    profile["blame_sets"].append(token)
         if f.get("asi_counterfactual_fix"):
             profile["counterfactual_fixes"].append(f["asi_counterfactual_fix"])
         if f.get("asi_wrong_clause"):
@@ -1034,14 +2402,74 @@ def cluster_failures(
             if len(_adjusted) != len(profile["blame_sets"]):
                 profile["blame_sets"] = _adjusted
 
+    # Phase B2: weighted dominant-root-cause selection.
+    # Each judge gets a weight reflecting its signal class (SQL_SHAPE = 1.0,
+    # ROUTING = 0.5, NL_TEXT = 0.1, META/INFRA = 0.0). We sum those weights
+    # per root cause and take the heaviest, breaking ties in favor of
+    # SQL-shape causes so a single NL-text vote can't override multiple
+    # SQL-judge votes (the Q004 regression pattern).
+    from genie_space_optimizer.optimization.judge_classes import (
+        judge_weight_for_root_cause,
+    )
+
     for qid, profile in question_profiles.items():
-        cause_counts = Counter(profile["root_causes"])
-        profile["dominant_root_cause"] = cause_counts.most_common(1)[0][0] if cause_counts else "other"
+        weighted: dict[str, float] = defaultdict(float)
+        for f in profile["failures"]:
+            cause = f.get("_resolved_root_cause", "other")
+            weighted[cause] += judge_weight_for_root_cause(f.get("judge", ""))
+        if weighted:
+            profile["dominant_root_cause"] = _select_dominant_root_cause(weighted)
+            profile["dominant_root_cause_weight"] = round(
+                weighted[profile["dominant_root_cause"]], 3,
+            )
+        else:
+            profile["dominant_root_cause"] = "other"
+            profile["dominant_root_cause_weight"] = 0.0
 
     # ── 8a. Per-Question ASI Extraction Trace ───────────────────────────
     _cluster_debug = os.environ.get("CLUSTER_DEBUG", "1").lower() not in ("0", "false", "no")
+    # T3.15: disambiguate duplicate headers — the hard and soft passes
+    # both call cluster_failures with identical banner text, making log
+    # navigation ambiguous. Tag each banner with the signal_type.
+    _pass_tag = "HARD FAILURES" if signal_type == "hard" else "SOFT SIGNALS"
     if _cluster_debug and question_profiles:
-        lines = ["\n== ASI EXTRACTION TRACE ======================================================"]
+        # T0.1: aggregate source histogram so operators immediately see
+        # why ASI metadata is or isn't being found.
+        _asi_source_counts: dict[str, int] = {}
+        _total_judge_failures = 0
+        for _p in question_profiles.values():
+            for _f in _p.get("failures", []) or []:
+                _sctx = _f.get("sql_context") or {}
+                # _asi_extraction_log was stamped on the ROW not the
+                # failure; best-effort lookup via the failure payload.
+                # When absent (older paths), we still categorise as
+                # "unknown" so the histogram denominator is consistent
+                # with the judge-failure count.
+                _total_judge_failures += 1
+        # The log lives on the source row. Walk rows_df again if we
+        # still have them — otherwise aggregate is skipped (pattern is
+        # still visible per-row in verbose mode).
+        lines = [f"\n== ASI EXTRACTION TRACE ({_pass_tag}) =========================================="]
+        # Emit the aggregate source histogram — collected from
+        # ``_asi_extraction_log`` stamps on each source row (if the
+        # row dicts survived to here). When callers provide ``rows``
+        # in the eval_results we re-walk them.
+        _src_hist: dict[str, int] = {}
+        for _row in (eval_results.get("rows") or []):
+            for _log in _row.get("_asi_extraction_log") or []:
+                _src = str(_log.get("source", "unknown"))
+                _src_hist[_src] = _src_hist.get(_src, 0) + 1
+        if _src_hist:
+            _total = sum(_src_hist.values())
+            _hist_parts = [
+                f"{k}={v} ({100*v/_total:.0f}%)"
+                for k, v in sorted(_src_hist.items(), key=lambda kv: -kv[1])
+            ]
+            lines.append(
+                "|  ASI source histogram:     "
+                + ", ".join(_hist_parts)
+                + f"  (total judge failures: {_total})"
+            )
         if verbose:
             for qid, profile in question_profiles.items():
                 lines.append(f"\n--- Q: {qid} " + "-" * max(1, 60 - len(qid)))
@@ -1066,9 +2494,11 @@ def cluster_failures(
                         if wclause:
                             lines.append(f"|      wrong_clause:          {wclause}")
                     lines.append(f"|    Final root cause:        {resolved}  (via {method})")
-                lines.append(f"|  Dominant root cause:       {profile['dominant_root_cause']}")
+                _dom = profile['dominant_root_cause']
+                _dom_w = profile.get('dominant_root_cause_weight', 0.0)
+                lines.append(f"|  Dominant root cause:       {_dom} (weight={_dom_w})")
                 blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else "(none)"
-                lines.append(f"|  Cluster group key:         ({profile['dominant_root_cause']}, \"{blame_key}\")")
+                lines.append(f"|  Cluster group key:         ({_dom}, \"{blame_key}\")")
         else:
             lines.append(f"|  (compact mode — {len(question_profiles)} questions)")
             for qid, profile in question_profiles.items():
@@ -1097,23 +2527,75 @@ def cluster_failures(
         group_key = (root, blame_key)
         cluster_groups[group_key].append(qid)
 
+    # Phase B3: when the cluster's dominant root cause is SQL-shape, we
+    # suppress counterfactuals whose source judge is NL_TEXT or META from
+    # the strategist-facing summary. Per-judge rows are unchanged — they
+    # still land in ``question_traces`` and in the ASI Delta table so
+    # forensics tools see the full picture. The Q004 motivating case:
+    # response_quality's "don't fabricate numbers" counterfactual was
+    # outvoting four SQL-shape judges pointing at missing_filter.
+    from genie_space_optimizer.optimization.judge_classes import (
+        SignalClass,
+        judge_signal_class,
+    )
+
     clusters: list[dict] = []
     for (root_cause, blame_str), qids in cluster_groups.items():
         all_judges: set[str] = set()
-        all_counterfactuals: list[str] = []
+        _judge_fail_counts: dict[str, int] = {}
+        # Tier 2.15: all_counterfactuals is now a list of dicts tagged
+        # with judge + signal_class so we can apply SQL-shape suppression
+        # _after_ merging across signal types. The pre-aggregation
+        # suppression historically caused clusters to show "(none)" even
+        # when a counterfactual existed on a sibling pathway.
+        all_counterfactuals: list[dict] = []
         all_wrong_clauses: list[str] = []
         sql_contexts: list[dict] = []
         sample_asi_type: str | None = None
         join_assessments: list[dict] = []
+        sql_pairs_for_ast_diff: list[dict[str, str]] = []
+        feature_diffs: list[Any] = []
+
+        _cluster_is_sql_shape = root_cause in _SQL_SHAPE_ROOT_CAUSES
+        _suppress_classes = {SignalClass.NL_TEXT, SignalClass.META}
 
         question_traces: list[dict] = []
         for qid in qids:
             profile = question_profiles[qid]
             all_judges.update(profile["judges"])
-            all_counterfactuals.extend(profile["counterfactual_fixes"])
+            # Tier 2.2: dominance counting. Track each judge's failure frequency
+            # across this cluster's profiles so ``affected_judge`` reflects the
+            # judge that actually drove the cluster, not the alphabetically
+            # first one.
+            for _f in profile["failures"]:
+                _jn = _f.get("judge", "")
+                if _jn:
+                    _judge_fail_counts[_jn] = _judge_fail_counts.get(_jn, 0) + 1
             all_wrong_clauses.extend(profile["wrong_clauses"])
+            # Tier 2.15: merge counterfactual fixes across all signal
+            # classes first, then apply the SQL-shape suppression ONLY if
+            # the merge still has preferred (non-NL-text) entries. This
+            # prevents the "(none)" display bug where a cluster shows no
+            # counterfactual even though a sibling signal type on the same
+            # base_question_id had one populated. The suppression block
+            # below runs once we've seen all failures, not per-failure.
+            for f in profile["failures"]:
+                cf = f.get("asi_counterfactual_fix")
+                if not cf:
+                    continue
+                _signal_class = judge_signal_class(f.get("judge", ""))
+                all_counterfactuals.append({
+                    "fix": cf,
+                    "judge": f.get("judge", ""),
+                    "signal_class": _signal_class,
+                    "base_question_id": f.get("base_question_id") or profile.get("base_question_id"),
+                })
             if profile["sql_context"]:
                 sql_contexts.append(profile["sql_context"])
+            for _pair in profile.get("sql_pairs_for_ast_diff", []) or []:
+                if _pair not in sql_pairs_for_ast_diff:
+                    sql_pairs_for_ast_diff.append(_pair)
+            feature_diffs.extend(profile.get("feature_diffs", []) or [])
             if not sample_asi_type:
                 for f in profile["failures"]:
                     if f.get("asi_failure_type"):
@@ -1139,27 +2621,219 @@ def cluster_failures(
                 })
             question_traces.append({
                 "question_id": qid,
+                "base_question_id": profile.get("base_question_id", qid),
+                "trial_index": profile.get("trial_index", 1),
                 "question_text": q_text[:200],
                 "failed_judges": judge_traces,
             })
 
         unique_qids = sorted(set(qids))
+        # Tier 2.12: compute base_question_ids — the real benchmark ids,
+        # with :vN tokens stripped. Downstream consumers that map back to
+        # benchmark rows (slice sampler, UI drill-down, human-review
+        # flagging) use this list.
+        _base_qids: set[str] = set()
+        for _pid in unique_qids:
+            _prof = question_profiles.get(_pid)
+            if _prof:
+                _base_qids.add(str(_prof.get("base_question_id") or _pid))
+            else:
+                _base_qids.add(_pid.split(":v")[0])
+
+        # Tier 2.2: pick affected_judge by dominance (most failures),
+        # breaking ties by CAUSAL_WEIGHT and then alphabetical (stable).
+        # The previous alphabetical pick produced mislabelled clusters
+        # (e.g. soft cluster with 12 response_quality failures labelled
+        # ``completeness`` because ``c`` sorts before ``r``). That label
+        # then feeds ``cluster_impact`` via ``CAUSAL_WEIGHT``, so the
+        # mislabel propagates into prioritisation errors.
+        if all_judges:
+            from genie_space_optimizer.common.config import CAUSAL_WEIGHT
+            _dominant = max(
+                all_judges,
+                key=lambda j: (
+                    _judge_fail_counts.get(j, 0),
+                    CAUSAL_WEIGHT.get(j, 1.0),
+                    -ord(j[0]) if j else 0,
+                ),
+            )
+        else:
+            _dominant = "unknown"
+
+        # Tier 2.15: merge counterfactuals across all signal classes, then
+        # apply the SQL-shape suppression only if there's still a useful
+        # non-NL-text entry left. If every counterfactual came from an
+        # NL_TEXT / META judge, keep them — better to show the
+        # strategist something (even if weak) than "(none)".
+        _preferred_cfs = [
+            c for c in all_counterfactuals
+            if not _cluster_is_sql_shape or c.get("signal_class") not in _suppress_classes
+        ]
+        _merged_cf_source = _preferred_cfs if _preferred_cfs else all_counterfactuals
+        _merged_cfs = list(dict.fromkeys(
+            str(c.get("fix", "")).strip()
+            for c in _merged_cf_source
+            if c.get("fix") and str(c.get("fix")).strip()
+        ))
+        _cf_sources = sorted({
+            c.get("signal_class").name if hasattr(c.get("signal_class"), "name") else str(c.get("signal_class"))
+            for c in _merged_cf_source
+            if c.get("signal_class")
+        })
+
+        _ns = namespace if namespace else ("H" if signal_type == "hard" else "S")
+        # T1.12: precompute judge_failure_ratio per question, where the
+        # denominator is the count of NON-info judges (CAUSAL_WEIGHT keys
+        # minus INFO_ONLY_JUDGES) and the numerator is the number of
+        # non-info judges that failed for that question. The cluster-level
+        # mean drives the ``rank_clusters`` soft re-elevation decision.
+        from genie_space_optimizer.common.config import (
+            CAUSAL_WEIGHT as _CAUSAL_W,
+            INFO_ONLY_JUDGES as _INFO_ONLY,
+        )
+        _non_info_judges = {j for j in _CAUSAL_W.keys() if j not in _INFO_ONLY}
+        _non_info_total = max(len(_non_info_judges), 1)
+        _ratios: list[float] = []
+        for _qid in unique_qids:
+            _pj = question_profiles.get(_qid, {}).get("judges", set()) or set()
+            _failing_non_info = {j for j in _pj if j in _non_info_judges}
+            _ratios.append(len(_failing_non_info) / _non_info_total)
+        _mean_jfr = sum(_ratios) / len(_ratios) if _ratios else 0.0
+
+        # T1.3: compute cluster-level signal quality from the per-failure
+        # ``_signal_quality`` fields stamped in the failures list.
+        # ``asi_ratio`` is the fraction of failures backed by real ASI
+        # metadata (vs heuristic sql_diff); ``result_fetched_ratio``
+        # tracks whether Genie actually returned results. A cluster with
+        # low signal quality is less trusted by the strategist and
+        # cluster_impact.
+        _asi_flags: list[bool] = []
+        _result_flags: list[bool] = []
+        _attrib_sources: list[str] = []
+        _attrib_confidences: list[float] = []
+        _pattern_labels: list[str] = []
+        for _qid in unique_qids:
+            _prof_failures = question_profiles.get(_qid, {}).get("failures", []) or []
+            for _f in _prof_failures:
+                _sq = _f.get("_signal_quality") or {}
+                _asi_flags.append(bool(_sq.get("asi_present")))
+                _result_flags.append(bool(_sq.get("result_fetched", True)))
+                _attr = _f.get("_attribution") or {}
+                _src = _attr.get("attribution_source")
+                if _src:
+                    _attrib_sources.append(str(_src))
+                _attrib_confidences.append(float(_attr.get("confidence", 0.0)))
+                _pl = _attr.get("pattern_label")
+                if _pl:
+                    _pattern_labels.append(str(_pl))
+        _asi_ratio = (
+            sum(_asi_flags) / len(_asi_flags) if _asi_flags else 0.0
+        )
+        _result_fetched_ratio = (
+            sum(_result_flags) / len(_result_flags) if _result_flags else 1.0
+        )
+        # T1.1: aggregate attribution summary for the cluster — which
+        # sources did the failures come from, what's the mean
+        # confidence, which pattern labels fired? Exposed on
+        # cluster["attribution"] so the strategist prompt can show
+        # "this cluster is backed by 3 trace-evidence, 2 sql_diff"
+        # instead of a generic root_cause label.
+        _source_counts: dict[str, int] = {}
+        for _s in _attrib_sources:
+            _source_counts[_s] = _source_counts.get(_s, 0) + 1
+        _dominant_pattern: str | None = None
+        if _pattern_labels:
+            _pat_counts: dict[str, int] = {}
+            for _pl in _pattern_labels:
+                _pat_counts[_pl] = _pat_counts.get(_pl, 0) + 1
+            _dominant_pattern = max(
+                _pat_counts.items(), key=lambda kv: kv[1]
+            )[0]
+
+        # T2.1: cluster_signature is an iteration-independent identity
+        # hash that joins the cluster to its own history across runs.
+        # It's keyed on the base_question_ids + root_cause + asi blame
+        # so "the same cluster" (same failing questions, same blame)
+        # keeps the same signature even as cluster_id churns by
+        # iteration. Downstream readers (strategist, persistence
+        # summary) can use this to load prior-attempt outcomes for
+        # this same cluster without pattern-matching on the pretty ID.
+        import hashlib as _hashlib
+        _blame_sig = "|".join(
+            sorted(b.strip() for b in blame_str.split("|") if b.strip())
+        ) if blame_str else ""
+        _sig_parts = (
+            "|".join(sorted(_base_qids)),
+            root_cause or "",
+            _blame_sig,
+        )
+        _sig_bytes = "||".join(_sig_parts).encode("utf-8")
+        _cluster_signature = _hashlib.sha1(_sig_bytes).hexdigest()[:16]
+
         entry = {
-            "cluster_id": f"C{len(clusters) + 1:03d}",
+            "cluster_id": f"{_ns}{len(clusters) + 1:03d}",
+            "cluster_signature": _cluster_signature,
             "root_cause": root_cause,
             "question_ids": unique_qids,
+            "base_question_ids": sorted(_base_qids),
             "affected_judges": sorted(all_judges),
-            "affected_judge": sorted(all_judges)[0] if all_judges else "unknown",
+            "affected_judge": _dominant,
+            "affected_judge_fail_counts": dict(_judge_fail_counts),
             "confidence": min(0.9, 0.5 + 0.1 * len(unique_qids)),
+            "signal_type": signal_type,
             "asi_failure_type": sample_asi_type,
-            "asi_blame_set": [b.strip() for b in blame_str.split("|") if b.strip()] if blame_str else None,
+            "asi_blame_set": (
+                list(
+                    __import__(
+                        "genie_space_optimizer.optimization.blame_normalization",
+                        fromlist=["normalize_blame_set"],
+                    ).normalize_blame_set(
+                        [b.strip() for b in blame_str.split("|") if b.strip()]
+                    )
+                ) if blame_str else None
+            ),
             "asi_wrong_clause": next((wc for wc in all_wrong_clauses if wc), None),
-            "asi_counterfactual_fixes": list(dict.fromkeys(cf for cf in all_counterfactuals if cf)),
+            "asi_counterfactual_fixes": _merged_cfs,
+            "asi_counterfactual_sources": _cf_sources,
             "sql_contexts": sql_contexts[:5],
             "question_traces": question_traces,
+            "mean_judge_failure_ratio": round(_mean_jfr, 4),
+            # T1.3: cluster signal-quality summary. Low values mean the
+            # cluster was assembled mostly from heuristic sql_diff
+            # attribution rather than real trace ASI, and/or from
+            # questions whose Genie results couldn't be fetched. Used
+            # by ``cluster_impact`` to dampen low-confidence clusters
+            # and surfaced in the strategist prompt so the LLM can
+            # prefer evidence-backed clusters.
+            "signal_quality": {
+                "asi_ratio": round(_asi_ratio, 3),
+                "result_fetched_ratio": round(_result_fetched_ratio, 3),
+                "combined": round(
+                    0.6 * _asi_ratio + 0.4 * _result_fetched_ratio, 3,
+                ),
+            },
+            # T1.1: aggregate attribution provenance for the cluster.
+            # ``source_counts`` tells the strategist what flavour of
+            # evidence backs this cluster ("mostly trace_evidence" vs
+            # "mostly heuristic"); ``mean_confidence`` summarises how
+            # sure we are; ``dominant_pattern_label`` names the
+            # specific pattern (e.g. ``time_window_pivot``) when one
+            # has a clear plurality.
+            "attribution": {
+                "source_counts": dict(_source_counts),
+                "mean_confidence": round(
+                    sum(_attrib_confidences) / len(_attrib_confidences), 3,
+                ) if _attrib_confidences else 0.0,
+                "dominant_pattern_label": _dominant_pattern,
+            },
         }
         if join_assessments:
             entry["join_assessments"] = join_assessments
+        if sql_pairs_for_ast_diff:
+            entry["_sql_pairs_for_ast_diff"] = sql_pairs_for_ast_diff[:5]
+        _failure_features = _summarize_feature_diffs(feature_diffs)
+        if _failure_features:
+            entry["failure_features"] = _failure_features
         clusters.append(entry)
 
     clusters.sort(key=lambda c: len(c["question_ids"]), reverse=True)
@@ -1168,10 +2842,32 @@ def cluster_failures(
     if _cluster_debug and clusters:
         total_failures = sum(len(p["failures"]) for p in question_profiles.values())
         total_judges = len({f["judge"] for p in question_profiles.values() for f in p["failures"]})
-        lines = ["\n== CLUSTER FORMATION ========================================================="]
+        lines = [f"\n== CLUSTER FORMATION ({_pass_tag}) ============================================="]
         lines.append(f"|  Total failure entries:     {total_failures} (across {len(question_profiles)} questions, {total_judges} judges)")
         lines.append(f"|  Question profiles:         {len(question_profiles)}")
         lines.append(f"|  Cluster groups formed:     {len(clusters)}")
+        if _qid_rewrites or _qid_pure_duplicates:
+            lines.append(
+                f"|  Duplicate qids detected:   "
+                f"rewrote {len(_qid_rewrites)}, dropped {len(_qid_pure_duplicates)}"
+            )
+            if _qid_rewrites:
+                _preview = ", ".join(_qid_rewrites[:5])
+                _suffix = "" if len(_qid_rewrites) <= 5 else f" (+{len(_qid_rewrites) - 5} more)"
+                lines.append(f"|    rewrites: {_preview}{_suffix}")
+            if _qid_pure_duplicates:
+                _dup_counts: dict[str, int] = {}
+                for _q in _qid_pure_duplicates:
+                    _dup_counts[_q] = _dup_counts.get(_q, 0) + 1
+                _preview = ", ".join(
+                    f"{q} (x{c})" for q, c in list(_dup_counts.items())[:5]
+                )
+                _suffix = (
+                    ""
+                    if len(_dup_counts) <= 5
+                    else f" (+{len(_dup_counts) - 5} more)"
+                )
+                lines.append(f"|    pure duplicates: {_preview}{_suffix}")
         for c in clusters:
             cid = c["cluster_id"]
             rc = c["root_cause"]
@@ -1189,13 +2885,116 @@ def cluster_failures(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# Task 7: NL_TEXT judges that fail on natural-language quality alone.
+# A cluster whose ``dominant_failed_judges`` is a subset of this set
+# cannot be fixed by any SQL-shape lever — routing it through the
+# default strategist track wastes the SQL-shape patch budget on
+# narrative-only failures. ``route_nl_text_only_cluster`` returns
+# ``"narrative_only"`` for these clusters; the harness then restricts
+# them to instruction-section patches (lever 3) and excludes them
+# from the ``MAX_AG_PATCHES`` SQL-shape budget.
+NL_TEXT_ONLY_JUDGES: frozenset[str] = frozenset({
+    "response_quality",
+    "table_routing_quality_text",
+})
+
+
+def is_nl_text_only_cluster(cluster: dict) -> bool:
+    """True when every failing judge in the cluster is NL_TEXT-only.
+
+    Checks both ``dominant_failed_judges`` (set during cluster build)
+    and ``affected_judges`` (legacy field) so old call sites continue
+    to work.
+    """
+    failed_judges: set[str] = set()
+    for key in ("dominant_failed_judges", "affected_judges", "failed_judges"):
+        val = cluster.get(key)
+        if isinstance(val, (list, tuple, set, frozenset)):
+            for j in val:
+                if isinstance(j, str) and j:
+                    failed_judges.add(j)
+    if not failed_judges:
+        return False
+    return failed_judges.issubset(NL_TEXT_ONLY_JUDGES)
+
+
+def route_nl_text_only_cluster(cluster: dict) -> str:
+    """Return the proposal track this cluster should follow.
+
+    ``"narrative_only"`` clusters are restricted to ``add_instruction``
+    / ``rewrite_instruction`` proposals (lever 3); ``"default"`` is
+    the standard SQL-shape track.
+    """
+    if not is_nl_text_only_cluster(cluster):
+        return "default"
+    return "narrative_only"
+
+
+# Task 7: deterministic ranking tiebreakers. Higher rank => earlier in
+# the strategist's priority list. SQL-shape beats ROUTING beats
+# NL_TEXT beats META so an SQL-shape cluster with the same impact
+# always wins.
+_SIGNAL_CLASS_RANK: dict[str, int] = {
+    "sql_shape": 3,
+    "routing": 2,
+    "nl_text": 1,
+    "meta": 0,
+    "infra": 0,
+    "mixed": 2,  # mixed treated mid-rank
+}
+
+
+def _signal_class_rank(cluster: dict) -> int:
+    """Map the cluster's aggregate signal class string to a numeric
+    tiebreaker value (higher beats lower)."""
+    sc = cluster.get("signal_class")
+    if sc is None:
+        # Fall back to deriving from failing judges if signal_class
+        # was not pre-stamped.
+        from genie_space_optimizer.optimization.judge_classes import (
+            aggregate_cluster_signal_class,
+        )
+        judges = []
+        for key in ("affected_judges", "dominant_failed_judges", "failed_judges"):
+            val = cluster.get(key)
+            if isinstance(val, (list, tuple, set, frozenset)):
+                judges.extend(j for j in val if isinstance(j, str))
+        sc = aggregate_cluster_signal_class(judges)
+    if hasattr(sc, "value"):
+        sc = sc.value
+    sc_str = str(sc).lower()
+    return _SIGNAL_CLASS_RANK.get(sc_str, 0)
+
+
 def cluster_impact(cluster: dict) -> float:
     """Score a failure cluster by estimated optimisation impact.
 
-    ``impact = question_count × causal_weight × severity × fixability``
+    ``impact = question_count × causal_weight × severity × fixability × signal_quality_dampen``
 
     Higher is more impactful.  Used to rank clusters before the adaptive
     strategist call so the LLM receives a suggested priority order.
+
+    Task 11 (lever-loop improvement plan): the 0.5× soft-cluster
+    damping multiplier was retired. With Task 6 stamping typed
+    ``SqlDiff`` on every confirmed failure and Task 7's ranking
+    tiebreaker preferring SQL_SHAPE > NL_TEXT and ``hard > soft`` at
+    equal impact, damping no longer earns its keep — it just
+    creates a class of clusters that can never win the rank without
+    external help. Soft-cluster precedence over hard at equal raw
+    impact is now expressed in :func:`rank_clusters` tiebreakers,
+    not in the impact score itself, so impact scores are directly
+    comparable across signal classes.
+
+    The legacy ``reelevated`` field is kept as a no-op pass-through
+    so reflection-buffer entries from older runs still deserialize
+    cleanly; it has no behavioral effect after Task 11.
+
+    T1.3 signal-quality dampen is retained: clusters built mostly
+    from heuristic sql_diff attribution (no trace ASI, no fetched
+    results) are still less trusted, and a 0.6–1.0× linear interp
+    over ``signal_quality.combined`` keeps low-confidence clusters
+    in the ranking without letting them dominate a trusted same-size
+    cluster.
     """
     from genie_space_optimizer.common.config import (
         CAUSAL_WEIGHT,
@@ -1214,21 +3013,150 @@ def cluster_impact(cluster: dict) -> float:
     has_cf = bool(cluster.get("asi_counterfactual_fixes"))
     fixability = FIXABILITY_WITH_COUNTERFACTUAL if has_cf else FIXABILITY_WITHOUT_COUNTERFACTUAL
 
-    return q_count * causal * severity * fixability
+    # T1.3: signal-quality dampen retained — see docstring.
+    _sq = cluster.get("signal_quality") or {}
+    _combined = float(_sq.get("combined", 1.0))
+    signal_quality_dampen = 0.6 + 0.4 * max(0.0, min(1.0, _combined))
+
+    return q_count * causal * severity * fixability * signal_quality_dampen
 
 
-def rank_clusters(clusters: list[dict]) -> list[dict]:
+_RANK_TIEBREAK_THRESHOLD = 1.0
+"""Impact-score delta under which the IQ-scan tiebreaker is allowed to kick in.
+
+When two clusters are within 1.0 of each other in ``impact_score`` we treat
+the primary ordering as a tie and consult ``recommended_levers`` to choose.
+Anything larger is a clear winner and the scan may not override."""
+
+
+def rank_clusters(
+    clusters: list[dict],
+    recommended_levers: set[int] | frozenset[int] | None = None,
+    reflection_buffer: list[dict] | None = None,
+) -> list[dict]:
     """Return *clusters* sorted by :func:`cluster_impact` (descending).
 
-    Each cluster dict gets ``impact_score`` and ``rank`` keys added.
-    The original list is **not** mutated.
+    Each cluster dict gets ``impact_score`` and ``rank`` keys added. The
+    original list is **not** mutated.
+
+    When ``recommended_levers`` is provided (typically from the IQ Scan
+    preflight) it acts as a tiebreaker: clusters within
+    :data:`_RANK_TIEBREAK_THRESHOLD` of each other in ``impact_score`` are
+    reordered so the one whose implied lever is in ``recommended_levers``
+    wins. Clusters separated by more than the threshold are never reordered,
+    so the scan strictly breaks ties and never overrides a clear impact
+    winner.
+
+    T2.1: when ``reflection_buffer`` is supplied, each cluster gains a
+    ``history`` dict with ``{first_seen_iter, last_seen_iter, attempts,
+    prior_outcomes}`` derived from reflection entries whose
+    ``source_cluster_signatures`` contains this cluster's
+    ``cluster_signature``. Strategist prompt builders downstream include
+    this so the LLM can reason about "this cluster has been tried N
+    times, rolled back N times with lever set X".
     """
-    scored = []
+    from genie_space_optimizer.common.config import (
+        SOFT_CLUSTER_REELEVATION_THRESHOLD,
+    )
+
+    # T2.1: index reflection buffer by cluster signature up-front so we
+    # don't re-scan it per cluster.
+    _history_by_signature: dict[str, list[dict]] = {}
+    if reflection_buffer:
+        for _entry in reflection_buffer:
+            for _sig in _entry.get("source_cluster_signatures") or []:
+                _history_by_signature.setdefault(_sig, []).append(_entry)
+
+    scored: list[dict] = []
     for c in clusters:
         enriched = dict(c)
-        enriched["impact_score"] = cluster_impact(c)
+        # T2.1: attach history derived from prior reflection entries.
+        _sig = enriched.get("cluster_signature")
+        if _sig and _sig in _history_by_signature:
+            _attempts = _history_by_signature[_sig]
+            _iters = sorted({a.get("iteration", -1) for a in _attempts if a.get("iteration") is not None})
+            enriched["history"] = {
+                "first_seen_iter": _iters[0] if _iters else None,
+                "last_seen_iter": _iters[-1] if _iters else None,
+                "attempts": len(_attempts),
+                "rolled_back_count": sum(1 for a in _attempts if not a.get("accepted")),
+                "prior_outcomes": [
+                    {
+                        "iteration": a.get("iteration"),
+                        "accepted": bool(a.get("accepted")),
+                        "lever_set": a.get("lever_set") or [],
+                        "accuracy_delta": a.get("accuracy_delta", 0.0),
+                        "rollback_reason": a.get("rollback_reason"),
+                    }
+                    for a in _attempts[-5:]  # cap the prompt footprint
+                ],
+            }
+        # T1.12: re-elevate soft clusters whose mean judge-failure ratio
+        # crosses the threshold BEFORE scoring so ``cluster_impact``
+        # skips the 0.5 dampen. Hard clusters are unaffected.
+        if enriched.get("signal_type") == "soft":
+            _jfr = float(enriched.get("mean_judge_failure_ratio", 0.0) or 0.0)
+            if _jfr >= SOFT_CLUSTER_REELEVATION_THRESHOLD:
+                enriched["reelevated"] = True
+                logger.info(
+                    "Soft cluster re-elevated [%s] root_cause=%s "
+                    "mean_judge_failure_ratio=%.3f >= threshold=%.3f "
+                    "(soft dampening skipped)",
+                    enriched.get("cluster_id", "?"),
+                    enriched.get("root_cause", "?"),
+                    _jfr,
+                    SOFT_CLUSTER_REELEVATION_THRESHOLD,
+                )
+        enriched["impact_score"] = cluster_impact(enriched)
+        if recommended_levers:
+            implied_lever = _map_to_lever(
+                enriched.get("root_cause", "other"),
+                asi_failure_type=enriched.get("asi_failure_type"),
+                blame_set=enriched.get("asi_blame_set"),
+                judge=enriched.get("affected_judge"),
+            )
+            enriched["_scan_lever_overlap"] = (
+                1.0 if implied_lever in recommended_levers else 0.0
+            )
         scored.append(enriched)
-    scored.sort(key=lambda c: c["impact_score"], reverse=True)
+
+    # Task 7: deterministic tiebreakers. Without these, two clusters
+    # with the same impact_score (the retail-run condition where the
+    # top 5 all came in at impact=1.7) sorted by Python's stable-sort
+    # default — i.e. by insertion order, which tracks lexicographic
+    # qid. The new key prefers (in order): impact, hard > soft, then
+    # SQL_SHAPE > ROUTING > NL_TEXT > META, then signal_quality.combined,
+    # then mean_judge_failure_ratio. All real signal-based; no qid
+    # ordering creeps in.
+    scored.sort(
+        key=lambda c: (
+            float(c.get("impact_score") or 0.0),
+            1 if c.get("signal_type") == "hard" else 0,
+            _signal_class_rank(c),
+            float((c.get("signal_quality") or {}).get("combined", 0.0)),
+            float(c.get("mean_judge_failure_ratio") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    if recommended_levers:
+        # Swap adjacent pairs that are within the tiebreak threshold when the
+        # lower-impact cluster matches a scan-recommended lever and the higher
+        # one doesn't. One left-to-right pass is sufficient: the scan never
+        # fires across non-adjacent boundaries, and a single pass preserves
+        # the stable impact-score ordering for all other pairs.
+        i = 0
+        while i < len(scored) - 1:
+            hi, lo = scored[i], scored[i + 1]
+            if (
+                abs(hi["impact_score"] - lo["impact_score"]) <= _RANK_TIEBREAK_THRESHOLD
+                and lo.get("_scan_lever_overlap", 0.0) > hi.get("_scan_lever_overlap", 0.0)
+            ):
+                scored[i], scored[i + 1] = lo, hi
+                i += 2
+            else:
+                i += 1
+
     for i, c in enumerate(scored, 1):
         c["rank"] = i
     return scored
@@ -1374,6 +3302,51 @@ def enrich_metadata_with_uc_types(
 
 _ENRICHMENT_BATCH_THRESHOLD = 30
 _MIN_DESCRIPTION_LENGTH = 10
+
+# F7 — LLM output-budget invariants. ``_ENRICHMENT_BATCH_THRESHOLD``
+# gates *whether* we batch-split (30 rows total → one call); once
+# splitting kicks in, rows are grouped by table. Without a further
+# cap a single very wide table can collapse into one oversized batch
+# — we saw 88 blank columns for one metric view blow the 4096 output
+# budget, producing an empty HTTP 200 body that downstream JSON
+# parsing couldn't recover from.
+#
+# These caps are LLM-budget-driven invariants, not operator tunables:
+# they keep the JSON output comfortably under 4096 completion tokens
+# with the current enrichment prompt. If the prompt or the
+# ``max_tokens`` budget changes, revisit both values together.
+_MAX_COLUMNS_PER_BATCH = 25
+_MAX_TABLES_PER_BATCH = 15
+
+
+def _chunk_enrichment_batches(
+    batches: list[list[dict]], max_size: int,
+) -> list[list[dict]]:
+    """Split each batch that exceeds ``max_size`` into fixed-size chunks.
+
+    Order-preserving; already-small batches pass through untouched so
+    existing test fixtures with tiny inputs see no behavioural change.
+    Used by both column-level (``_MAX_COLUMNS_PER_BATCH``) and
+    table-level (``_MAX_TABLES_PER_BATCH``) enrichment.
+
+    Invariants:
+    * Every output chunk has length in ``(0, max_size]``.
+    * Table affinity of the input is preserved — this function never
+      merges rows from different source batches, only sub-divides.
+    * ``max_size <= 0`` is a caller bug and the input is returned
+      unchanged (defensive; keeps enrichment running even if a future
+      refactor passes a bad constant).
+    """
+    if max_size <= 0:
+        return batches
+    out: list[list[dict]] = []
+    for batch in batches:
+        if len(batch) <= max_size:
+            out.append(batch)
+            continue
+        for i in range(0, len(batch), max_size):
+            out.append(batch[i : i + max_size])
+    return out
 
 
 def _is_description_insufficient(desc: Any) -> bool:
@@ -1540,6 +3513,41 @@ def _format_data_profile_for_prompt(data_profile: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _select_metric_view_columns(*sources: dict | None) -> list[dict]:
+    """Pick the first non-empty ``metric_view_columns`` payload from any
+    candidate dict. Used by every column proposal builder so the
+    metric-view-aware fallback in :func:`proposal_shape._normalise_one`
+    can resolve MV-backed columns. Each entry must be a dict with
+    ``column_name`` plus a metric-view target key (``metric_view_full_name``
+    or ``metric_view``); other shapes are filtered out so a malformed
+    upstream payload fails closed."""
+    # NOTE: this helper is dormant until ASI cluster enrichment populates
+    # ``metric_view_columns`` on the cluster / action_group / col_entry
+    # payload. The shape contract is stable so the upstream enrichment task
+    # can land independently without re-touching every builder.
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        raw = src.get("metric_view_columns")
+        if not raw:
+            continue
+        cleaned: list[dict] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            col = str(entry.get("column_name") or "").strip()
+            tgt = str(
+                entry.get("metric_view_full_name")
+                or entry.get("metric_view")
+                or ""
+            ).strip()
+            if col and tgt:
+                cleaned.append(entry)
+        if cleaned:
+            return cleaned
+    return []
+
+
 def _enrich_blank_descriptions(
     metadata_snapshot: dict,
     w: WorkspaceClient | None = None,
@@ -1576,6 +3584,11 @@ def _enrich_blank_descriptions(
             by_table.setdefault(b["table"], []).append(b)
         batches = list(by_table.values())
 
+    # F7 — sub-chunk any oversized per-table batch. Keeps table affinity
+    # (each chunk still contains rows from only one table) so the
+    # prompt's ``table_description`` / sibling context remains coherent.
+    batches = _chunk_enrichment_batches(batches, _MAX_COLUMNS_PER_BATCH)
+
     all_patches: list[dict] = []
     system_msg = "You generate structured column descriptions for a Databricks Genie Space."
 
@@ -1592,15 +3605,36 @@ def _enrich_blank_descriptions(
         )
         prompt = format_mlflow_template(DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
 
+        text = ""
         try:
             text, _response = _traced_llm_call(
                 w, system_msg, prompt,
                 span_name=f"enrich_column_descriptions_batch_{batch_idx}",
                 max_tokens=4096,
+                response_validator=_extract_json,
             )
             result = _extract_json(text)
-        except Exception:
-            logger.warning("Description enrichment: LLM call failed for batch", exc_info=True)
+            if isinstance(result, list):
+                result = {"changes": result}
+        except Exception as exc:
+            # F6 — prefer the last-seen HTTP 200 body stamped on the
+            # exception by ``_traced_llm_call``. Falls back to local
+            # ``text`` (still "" here because _traced_llm_call raised
+            # before returning) if the attribute is missing.
+            preview_text = getattr(exc, "last_response_text", "") or text
+            chars = getattr(exc, "last_response_chars", len(preview_text))
+            preview = preview_text[:300].replace("\n", "\\n")
+            logger.warning(
+                "Description enrichment: batch %d (table=%s, %d cols) — "
+                "LLM response not parseable as JSON after retries: %s | "
+                "response_chars=%d | preview=%r",
+                batch_idx,
+                batch[0]["table"] if batch else "?",
+                len(batch),
+                exc,
+                chars,
+                preview,
+            )
             continue
 
         batch_lookup = {(b["table"], b["column"]): b for b in batch}
@@ -1775,6 +3809,14 @@ def _enrich_table_descriptions(
     else:
         batches = [[t] for t in tables]
 
+    # F7 — cap per-batch table count. Table prompts are denser than
+    # column prompts (each table expands to a table-description block),
+    # so the ceiling is lower (15 vs 25). The above-threshold path
+    # already produces single-table batches, so the cap only bites
+    # when ``len(tables) <= _ENRICHMENT_BATCH_THRESHOLD`` but still
+    # large enough to overflow the output budget.
+    batches = _chunk_enrichment_batches(batches, _MAX_TABLES_PER_BATCH)
+
     all_patches: list[dict] = []
     system_msg = "You generate structured table descriptions for a Databricks Genie Space."
 
@@ -1791,15 +3833,34 @@ def _enrich_table_descriptions(
         )
         prompt = format_mlflow_template(TABLE_DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
 
+        text = ""
         try:
             text, _response = _traced_llm_call(
                 w, system_msg, prompt,
                 span_name=f"enrich_table_descriptions_batch_{batch_idx}",
                 max_tokens=4096,
+                response_validator=_extract_json,
             )
             result = _extract_json(text)
-        except Exception:
-            logger.warning("Table description enrichment: LLM call failed for batch", exc_info=True)
+            if isinstance(result, list):
+                result = {"changes": result}
+        except Exception as exc:
+            # F6 — same pattern as _enrich_blank_descriptions: pull the
+            # last-seen body off the exception so the warning can
+            # surface a real preview instead of "".
+            preview_text = getattr(exc, "last_response_text", "") or text
+            chars = getattr(exc, "last_response_chars", len(preview_text))
+            preview = preview_text[:300].replace("\n", "\\n")
+            logger.warning(
+                "Table description enrichment: batch %d (%d tables) — "
+                "LLM response not parseable as JSON after retries: %s | "
+                "response_chars=%d | preview=%r",
+                batch_idx,
+                len(batch),
+                exc,
+                chars,
+                preview,
+            )
             continue
 
         batch_lookup = {t["table"]: t for t in batch}
@@ -1945,12 +4006,29 @@ def _generate_space_description(
 def _generate_proactive_instructions(
     metadata_snapshot: dict,
     w: WorkspaceClient | None = None,
+    *,
+    _repair_attempt: int = 0,
+    _prior_errors: list[str] | None = None,
 ) -> str:
-    """Generate conservative routing instructions for an empty Genie Space.
+    """Generate canonical 5-section routing instructions for an empty space.
 
-    Returns the instruction text (500-4000 chars), or ``""`` on failure.
+    Returns the instruction text (validated against the 5-section schema)
+    or ``""`` on failure. The caller is responsible for persisting the
+    text via ``_set_general_instructions``.
+
+    Self-contained repair loop (Task C.1): on validation failure, the
+    function recurses ONCE with ``_repair_attempt=1`` and the specific
+    errors passed back to the LLM via the prompt prefix. The harness
+    doesn't need to know — ``_generate_proactive_instructions(metadata, w)``
+    still returns ``""`` on total failure.
+
+    Parameters ``_repair_attempt`` and ``_prior_errors`` are private —
+    external callers should leave them at defaults.
     """
-    from genie_space_optimizer.common.config import PROACTIVE_INSTRUCTION_PROMPT
+    from genie_space_optimizer.common.config import (
+        MAX_TEXT_INSTRUCTIONS_CHARS, PROACTIVE_INSTRUCTION_PROMPT,
+    )
+    from genie_space_optimizer.optimization.applier import validate_instruction_text
 
     ctx = _build_space_schema_context(metadata_snapshot)
 
@@ -1972,26 +4050,306 @@ def _generate_proactive_instructions(
         priority_keys=["tables_context"],
     )
     prompt = format_mlflow_template(PROACTIVE_INSTRUCTION_PROMPT, **format_kwargs)
+
+    # Repair preamble — prepended when the first attempt failed validation.
+    if _prior_errors:
+        prompt = (
+            "REPAIR CALL — your previous reply failed validation with these "
+            "specific errors:\n"
+            + "\n".join(f"  - {e}" for e in _prior_errors[:5])
+            + "\n\nFix ONLY those issues in your regenerated output. "
+            "Keep all other content. Return only the instruction text.\n\n"
+            + prompt
+        )
     system_msg = "You generate routing instructions for Databricks Genie Spaces."
 
+    span_name = (
+        "generate_proactive_instructions_repair"
+        if _repair_attempt > 0
+        else "generate_proactive_instructions"
+    )
     try:
         text, _response = _traced_llm_call(
             w, system_msg, prompt,
-            span_name="generate_proactive_instructions",
+            span_name=span_name,
             max_tokens=2048,
         )
         text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
         if len(text) < 50:
-            logger.warning("Proactive instruction generation: result too short (%d chars)", len(text))
+            logger.warning(
+                "Proactive instruction generation: result too short (%d chars)",
+                len(text),
+            )
             return ""
-        if len(text) > 4000:
-            text = text[:4000].rsplit("\n", 1)[0]
-        text = normalize_instructions(text)
-        logger.info("Proactive instruction generation: produced %d chars", len(text))
-        return text
-    except Exception:
-        logger.warning("Proactive instruction generation: LLM call failed", exc_info=True)
+        if len(text) > MAX_TEXT_INSTRUCTIONS_CHARS:
+            # Cap at the scanner threshold — never write content that
+            # would immediately fail IQ check #4. Split on a line boundary
+            # so we don't truncate mid-bullet.
+            text = text[:MAX_TEXT_INSTRUCTIONS_CHARS].rsplit("\n", 1)[0]
+        ok, errors = validate_instruction_text(text, strict=True)
+        if ok:
+            logger.info(
+                "Proactive instruction generation: produced %d chars%s",
+                len(text),
+                " (after repair)" if _repair_attempt > 0 else "",
+            )
+            return text
+
+        # Validation failed — attempt one repair round.
+        if _repair_attempt == 0:
+            logger.info(
+                "Proactive instruction generation: validation failed — "
+                "retrying once with repair prompt. errors=%s",
+                errors,
+            )
+            return _generate_proactive_instructions(
+                metadata_snapshot, w,
+                _repair_attempt=1, _prior_errors=errors,
+            )
+
+        logger.warning(
+            "Proactive instruction generation: validation failed after "
+            "repair — giving up. errors=%s sample=%r",
+            errors, text[:200],
+        )
         return ""
+    except Exception:
+        logger.warning(
+            "Proactive instruction generation: LLM call failed", exc_info=True,
+        )
+        return ""
+
+
+def _expand_instructions(
+    metadata_snapshot: dict,
+    existing_instructions: str,
+    missing_sections: list[str],
+    w: WorkspaceClient | None = None,
+    *,
+    _repair_attempt: int = 0,
+    _prior_errors: list[str] | None = None,
+) -> dict[str, str]:
+    """Generate content for the canonical sections a space is missing.
+
+    Called by the two-phase proactive seeding path (Task B.5) when a
+    space already has instructions but lacks one or more of the five
+    canonical sections. The LLM returns a dict keyed by exact canonical
+    header; we validate every key is in ``missing_sections`` and in
+    :data:`CANONICAL_SECTION_HEADERS` before returning.
+
+    Self-contained repair loop (Task C.1): on per-section validation
+    failure (SQL-in-prose, over-budget), the function recurses ONCE with
+    ``_repair_attempt=1`` and the offending details passed back to the
+    LLM via the prompt prefix.
+
+    Parameters
+    ----------
+    metadata_snapshot
+        Genie Space config snapshot (tables, MVs, join specs).
+    existing_instructions
+        Current prose — used by the prompt to avoid duplicating content.
+    missing_sections
+        Subset of canonical headers to populate. If empty, returns ``{}``.
+    w
+        WorkspaceClient for the LLM call (optional; pass-through).
+
+    Returns
+    -------
+    dict[str, str]
+        ``{canonical_header: section_body_text}`` for each missing section
+        the LLM chose to populate. Sections the LLM declined to fill
+        (because there was nothing meaningful to say) are absent from
+        the dict — the caller merges only what was returned, never
+        overwriting existing content. May also return a
+        ``{"__skip_reason__": ...}`` sentinel when budget is too small
+        to call the LLM.
+    """
+    from genie_space_optimizer.common.config import (
+        CANONICAL_SECTION_HEADERS, EXPAND_INSTRUCTION_PROMPT,
+        MAX_TEXT_INSTRUCTIONS_CHARS, MIN_EXPAND_BUDGET,
+        sql_in_text_findings,
+    )
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    if not missing_sections:
+        return {}
+    missing = [s for s in missing_sections if s in CANONICAL_SECTION_HEADERS]
+    if not missing:
+        return {}
+
+    # ── Budget math (floor-free; strict upper bound on per-section budget) ──
+    # Invariant: per_section_budget * missing_count <= remaining_budget
+    # so the LLM can never legitimately return content that overflows. If
+    # remaining room is too small to be useful, skip the LLM call entirely
+    # rather than forcing a decline-after-generation round-trip.
+    existing_length = len(existing_instructions or "")
+    remaining_budget = max(MAX_TEXT_INSTRUCTIONS_CHARS - existing_length, 0)
+
+    if remaining_budget < MIN_EXPAND_BUDGET:
+        logger.info(
+            "Expand skipped: remaining_budget=%d < MIN_EXPAND_BUDGET=%d "
+            "(existing prose is near the 2000-char cap)",
+            remaining_budget, MIN_EXPAND_BUDGET,
+        )
+        # Sentinel key so callers can distinguish "nothing to do" from
+        # "wanted to do it but ran out of room" in their decline-log output.
+        return {"__skip_reason__": "no_budget"}
+
+    missing_count = len(missing)
+    # Integer division is the strict upper bound. Do NOT floor — floors
+    # inflate the claimed remaining room past the actual cap and defeat
+    # the whole point of the pre-render trim.
+    per_section_budget = remaining_budget // missing_count
+
+    ctx = _build_space_schema_context(metadata_snapshot)
+
+    join_specs: list[str] = []
+    ds = metadata_snapshot.get("data_sources", {})
+    if isinstance(ds, dict):
+        for tbl in ds.get("tables", []):
+            if isinstance(tbl, dict):
+                for js in tbl.get("join_specs", []):
+                    if isinstance(js, dict):
+                        sql_parts = js.get("sql", [])
+                        cond = sql_parts[0] if sql_parts else ""
+                        if cond:
+                            join_specs.append(cond)
+    ctx["join_specs_context"] = (
+        "\n".join(f"- {j}" for j in join_specs) if join_specs else "(none)"
+    )
+    ctx["existing_instructions"] = existing_instructions or "(none)"
+    ctx["missing_sections"] = "\n".join(f"- {h}" for h in missing)
+    ctx["existing_length"] = str(existing_length)
+    ctx["remaining_budget"] = str(remaining_budget)
+    ctx["missing_count"] = str(missing_count)
+    ctx["per_section_budget"] = str(per_section_budget)
+
+    format_kwargs = _truncate_to_budget(
+        ctx, EXPAND_INSTRUCTION_PROMPT,
+        priority_keys=["existing_instructions", "tables_context"],
+    )
+    prompt = format_mlflow_template(EXPAND_INSTRUCTION_PROMPT, **format_kwargs)
+
+    # Repair preamble — prepended on the second attempt with the specific
+    # errors from the first. Same pattern as _generate_proactive_instructions.
+    if _prior_errors:
+        prompt = (
+            "REPAIR CALL — your previous reply failed validation with these "
+            "specific errors:\n"
+            + "\n".join(f"  - {e}" for e in _prior_errors[:5])
+            + "\n\nFix ONLY those issues. Keep all other content. "
+            "Return only the JSON.\n\n"
+            + prompt
+        )
+    system_msg = (
+        "You expand Databricks Genie Space instructions — only the "
+        "missing canonical sections."
+    )
+
+    span_name = (
+        "expand_instructions_repair" if _repair_attempt > 0 else "expand_instructions"
+    )
+    try:
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name=span_name,
+            max_tokens=1536,
+        )
+    except Exception:
+        logger.warning("Expand instructions: LLM call failed", exc_info=True)
+        return {}
+
+    try:
+        parsed = _extract_json(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning(
+            "Expand instructions: JSON parse failed. raw=%r", (text or "")[:200],
+        )
+        return {}
+
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "Expand instructions: expected JSON object, got %s",
+            type(parsed).__name__,
+        )
+        return {}
+
+    sections_raw = parsed.get("sections", parsed)
+    if not isinstance(sections_raw, dict):
+        return {}
+
+    allowed = set(missing)
+    out: dict[str, str] = {}
+    for header, body in sections_raw.items():
+        header_str = str(header).strip()
+        if header_str not in allowed:
+            logger.info(
+                "Expand instructions: dropping non-requested / non-canonical header %r",
+                header_str,
+            )
+            continue
+        body_str: str
+        if isinstance(body, list):
+            body_str = "\n".join(str(s).rstrip() for s in body if str(s).strip())
+        else:
+            body_str = str(body).strip()
+        if not body_str:
+            continue
+        out[header_str] = body_str
+
+    # ── Per-section validation (repair-loop trigger) ────────────────
+    # The merged-text validation happens in the harness; here we only
+    # check each section INDIVIDUALLY for SQL-in-prose and per-section
+    # over-budget. Those are the two failure modes the LLM can self-heal
+    # via one repair call — other failures (e.g. totally empty output)
+    # aren't worth a retry.
+    errors: list[str] = []
+    for header, body_str in out.items():
+        sql_offenders = sql_in_text_findings(body_str)
+        if sql_offenders:
+            errors.append(
+                f"Section {header!r} contains SQL: "
+                f"{sql_offenders[0].strip()[:100]!r}. "
+                "Rephrase using English verbs (combine, link, pair) — "
+                "never SQL keywords."
+            )
+        if len(body_str) > per_section_budget * 2:
+            # Allow 2× per-section budget headroom before triggering repair.
+            # Layer 1 (harness pre-render trim) will hard-clip whatever lands,
+            # but spending a repair round on a 10× overshoot produces better
+            # output than trimming mid-bullet.
+            errors.append(
+                f"Section {header!r} is {len(body_str)} chars; "
+                f"budget was ~{per_section_budget}. Trim to fit."
+            )
+
+    if errors and _repair_attempt == 0:
+        logger.info(
+            "Expand instructions: per-section validation failed — "
+            "retrying once with repair prompt. errors=%s",
+            errors,
+        )
+        return _expand_instructions(
+            metadata_snapshot, existing_instructions, missing_sections, w=w,
+            _repair_attempt=1, _prior_errors=errors,
+        )
+
+    if errors:
+        logger.warning(
+            "Expand instructions: validation failed after repair — "
+            "dropping offending sections. errors=%s",
+            errors,
+        )
+        # Drop any offending section rather than returning it — the harness
+        # can still merge the clean ones.
+        out = {h: b for h, b in out.items() if not sql_in_text_findings(b)}
+
+    logger.info(
+        "Expand instructions: produced %d/%d requested sections (%s)%s",
+        len(out), len(missing), ", ".join(out.keys()) or "(none)",
+        " (after repair)" if _repair_attempt > 0 else "",
+    )
+    return out
 
 
 def _generate_sample_questions(
@@ -2139,6 +4497,115 @@ def _extract_table_pairs_from_clusters(clusters: list[dict]) -> set[tuple[str, s
     return pairs
 
 
+def _semantics_is_metric_view_id(metadata_snapshot: dict, identifier: str) -> bool:
+    """PR 29 — Return True when ``identifier`` resolves to a metric view in
+    ``metadata_snapshot["_asset_semantics"]``.
+
+    Falls back to ``False`` (treat as non-MV) when the snapshot has no
+    semantics map yet, when the identifier is empty, or when any error
+    occurs during the lookup. The caller is responsible for fanning the
+    legacy ``_metric_view_yaml`` cache into ``_asset_semantics`` upstream
+    so this lookup is consistent for every consumer.
+    """
+    try:
+        from genie_space_optimizer.common.asset_semantics import (
+            is_metric_view as _sem_is_mv,
+        )
+    except Exception:
+        return False
+    if not identifier:
+        return False
+    try:
+        return bool(_sem_is_mv(metadata_snapshot, identifier))
+    except Exception:
+        return False
+
+
+def _semantics_direct_join_block_reason(
+    metadata_snapshot: dict,
+    identifier: str,
+) -> str | None:
+    """Return why direct joins are blocked for ``identifier``, if known."""
+    try:
+        from genie_space_optimizer.common.asset_semantics import (
+            direct_join_block_reason as _block_reason,
+        )
+    except Exception:
+        return None
+    if not identifier:
+        return None
+    try:
+        return _block_reason(metadata_snapshot, identifier)
+    except Exception:
+        return None
+
+
+def filter_join_specs_by_semantics(
+    metadata_snapshot: dict,
+    join_specs: list[dict],
+    *,
+    counters: dict[str, int] | None = None,
+    skipped_examples: list[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """PR 29 — Drop join specs whose left or right identifier is a
+    metric view per ``_asset_semantics``. Direct joins on metric views
+    raise ``METRIC_VIEW_JOIN_NOT_SUPPORTED`` at execute time; gating
+    them at discovery prevents the cascade entirely.
+
+    ``counters`` is mutated in place (when supplied) with two keys:
+    ``joins_skipped_metric_view_left`` and
+    ``joins_skipped_metric_view_right``. ``skipped_examples`` (if
+    supplied) is appended with ``(left_id, right_id)`` tuples for the
+    first few skipped pairs so the call site can log a sample.
+    """
+    if not isinstance(join_specs, list) or not join_specs:
+        return list(join_specs) if isinstance(join_specs, list) else []
+
+    kept: list[dict] = []
+    for spec in join_specs:
+        if not isinstance(spec, dict):
+            kept.append(spec)
+            continue
+        left_obj = spec.get("left") or {}
+        right_obj = spec.get("right") or {}
+        if isinstance(left_obj, dict):
+            left_id = left_obj.get("identifier", "") or ""
+        else:
+            left_id = spec.get("left_table_name", "") or ""
+        if isinstance(right_obj, dict):
+            right_id = right_obj.get("identifier", "") or ""
+        else:
+            right_id = spec.get("right_table_name", "") or ""
+
+        left_block_reason = _semantics_direct_join_block_reason(
+            metadata_snapshot, left_id,
+        )
+        right_block_reason = _semantics_direct_join_block_reason(
+            metadata_snapshot, right_id,
+        )
+        if left_block_reason or right_block_reason:
+            if counters is not None:
+                if left_block_reason:
+                    key = (
+                        "joins_skipped_metric_view_left"
+                        if left_block_reason == "metric_view"
+                        else "joins_skipped_unresolved_asset_left"
+                    )
+                    counters[key] = counters.get(key, 0) + 1
+                if right_block_reason:
+                    key = (
+                        "joins_skipped_metric_view_right"
+                        if right_block_reason == "metric_view"
+                        else "joins_skipped_unresolved_asset_right"
+                    )
+                    counters[key] = counters.get(key, 0) + 1
+            if skipped_examples is not None and len(skipped_examples) < 5:
+                skipped_examples.append((left_id, right_id))
+            continue
+        kept.append(spec)
+    return kept
+
+
 def discover_join_candidates(
     metadata_snapshot: dict,
     soft_signal_clusters: list[dict] | None = None,
@@ -2154,6 +4621,13 @@ def discover_join_candidates(
 
     Existing join specs are excluded.  Returns a list of hint dicts
     (not final join specs) that feed into the LLM discovery prompt.
+
+    PR 29 — Pairs whose left or right identifier resolves to
+    ``kind=metric_view`` in ``metadata_snapshot["_asset_semantics"]``
+    are also dropped because direct joins on a metric view raise
+    ``METRIC_VIEW_JOIN_NOT_SUPPORTED``. The shared CTE-first repair in
+    PR 31 still rewrites genuine MV-side queries; this filter prevents
+    the LLM from ever proposing a *new* join spec that touches an MV.
 
     Each hint has the shape::
 
@@ -2329,6 +4803,46 @@ def discover_join_candidates(
         logger.info(
             "Join discovery: %d feedback pairs from %d soft signal clusters",
             len(feedback_pairs), len(soft_signal_clusters),
+        )
+
+    # Drop hint pairs whose either side is unsafe for a direct join. The
+    # semantics helper returns no block reason when semantics are unavailable,
+    # so this remains a no-op for snapshots that pre-date the contract.
+    pre_filter = len(hints)
+    skipped_left = 0
+    skipped_right = 0
+    skipped_unresolved_left = 0
+    skipped_unresolved_right = 0
+    skipped_examples: list[tuple[str, str]] = []
+    filtered_hints: list[dict] = []
+    for h in hints:
+        lt = h.get("left_table", "") if isinstance(h, dict) else ""
+        rt = h.get("right_table", "") if isinstance(h, dict) else ""
+        l_reason = _semantics_direct_join_block_reason(metadata_snapshot, lt)
+        r_reason = _semantics_direct_join_block_reason(metadata_snapshot, rt)
+        if l_reason or r_reason:
+            if l_reason == "metric_view":
+                skipped_left += 1
+            elif l_reason:
+                skipped_unresolved_left += 1
+            if r_reason == "metric_view":
+                skipped_right += 1
+            elif r_reason:
+                skipped_unresolved_right += 1
+            if len(skipped_examples) < 5:
+                skipped_examples.append((lt, rt))
+            continue
+        filtered_hints.append(h)
+    hints = filtered_hints
+
+    if pre_filter != len(hints):
+        logger.info(
+            "Join discovery: dropped %d direct-join-unsafe hint pair(s) "
+            "(mv_left=%d, mv_right=%d, unresolved_left=%d, unresolved_right=%d); "
+            "examples=%s",
+            pre_filter - len(hints), skipped_left, skipped_right,
+            skipped_unresolved_left, skipped_unresolved_right,
+            skipped_examples,
         )
 
     logger.info(
@@ -3944,65 +6458,111 @@ def _format_cluster_briefs(
     return "\n".join(lines)
 
 
+def _format_cluster_briefs_afs(clusters: list[dict], top_n: int = 5) -> str:
+    """AFS-projected variant of :func:`_format_cluster_briefs`.
+
+    Bug #4 (P2.2) — every cluster is projected through ``format_afs``
+    before rendering so no raw benchmark text (question, expected_sql,
+    generated_sql, sample rows) reaches the strategist/holistic prompt.
+    The legacy ``_format_cluster_briefs`` is retained for debug logging
+    behind ``GSO_DEBUG_RAW_SQL=1`` only.
+    """
+    if not clusters:
+        return "(No failure clusters.)"
+
+    from genie_space_optimizer.optimization.afs import format_afs
+
+    hard = [c for c in clusters if c.get("signal_type") != "soft"]
+    soft = [c for c in clusters if c.get("signal_type") == "soft"]
+    sorted_hard = sorted(
+        hard, key=lambda c: len(c.get("question_ids", [])), reverse=True,
+    )
+
+    lines: list[str] = []
+    for idx, cluster in enumerate(sorted_hard[:top_n], 1):
+        afs = format_afs(cluster)
+        cid = afs.get("cluster_id", f"C{idx:03d}")
+        ft = afs.get("failure_type", "unknown")
+        qc = afs.get("question_count", 0)
+        judge = afs.get("affected_judge", "unknown")
+        lines.append(f"### {cid}: {ft} ({qc} questions, judge: {judge})")
+        blame = afs.get("blame_set") or []
+        if blame:
+            lines.append(f"Blamed objects: {', '.join(blame[:5])}")
+        cf = afs.get("counterfactual_fixes") or []
+        if cf:
+            lines.append("Suggested fixes:")
+            for f in cf[:3]:
+                lines.append(f"  - {f}")
+        sd = afs.get("structural_diff") or {}
+        if sd:
+            lines.append(f"Structural signature: {json.dumps(sd, default=str)}")
+        ff = afs.get("failure_features") or {}
+        if ff:
+            lines.append(f"Typed failure features: {json.dumps(ff, default=str)}")
+        vp = afs.get("judge_verdict_pattern")
+        if vp:
+            lines.append(f"Judge verdict pattern: {vp}")
+        lines.append("")
+
+    remaining = sorted_hard[top_n:]
+    if remaining:
+        lines.append(f"### Additional hard-failure clusters ({len(remaining)} more):")
+        for cluster in remaining:
+            afs = format_afs(cluster)
+            blame = afs.get("blame_set") or []
+            blame_str = f" blamed=[{', '.join(blame[:3])}]" if blame else ""
+            lines.append(
+                f"  - {afs.get('failure_type', 'unknown')}: "
+                f"{afs.get('question_count', 0)} questions "
+                f"(judge: {afs.get('affected_judge', 'unknown')}){blame_str}"
+            )
+
+    if soft:
+        sorted_soft = sorted(
+            soft, key=lambda c: len(c.get("question_ids", [])), reverse=True,
+        )
+        lines.append("")
+        lines.append("### Correct-but-Suboptimal Patterns (arbiter: correct, individual judges: failed)")
+        lines.append("These queries returned correct results but used suboptimal approaches.")
+        lines.append("Use these to inform best-practice guidance, NOT to fix failures.")
+        lines.append("")
+        for idx, cluster in enumerate(sorted_soft[:top_n], 1):
+            afs = format_afs(cluster)
+            cid = afs.get("cluster_id", f"S{idx:03d}")
+            lines.append(
+                f"#### {cid}: {afs.get('failure_type', 'unknown')} "
+                f"({afs.get('question_count', 0)} questions, "
+                f"judge: {afs.get('affected_judge', 'unknown')})"
+            )
+            blame = afs.get("blame_set") or []
+            if blame:
+                lines.append(f"Blamed objects: {', '.join(blame[:5])}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Structured-JSON context builders (Phase 7)
 # ---------------------------------------------------------------------------
 
 def _build_cluster_data(clusters: list[dict], *, top_n: int = 5) -> list[dict]:
-    """Convert failure clusters into structured dicts for JSON context."""
+    """Convert failure clusters into structured dicts for JSON context.
+
+    Bug #4 (P2.2) — returns AFS projections, never raw benchmark text.
+    Previously this function copied ``question``/``expected_sql`` /
+    ``generated_sql`` + result samples per cluster; that was the primary
+    raw-text carrier into downstream LLM prompts. Now every cluster is
+    projected through ``format_afs`` which enforces the closed schema.
+    """
+    from genie_space_optimizer.optimization.afs import format_afs
+
     hard = [c for c in clusters if c.get("signal_type") != "soft"]
-    sorted_hard = sorted(hard, key=lambda c: len(c.get("question_ids", [])), reverse=True)
-    result: list[dict] = []
-    for cluster in sorted_hard[:top_n]:
-        questions: list[dict] = []
-        for ctx in cluster.get("sql_contexts", [])[:3]:
-            comp = ctx.get("comparison", {}) or {}
-            q_entry: dict[str, Any] = {
-                "question": ctx.get("question", ""),
-                "expected_sql": ctx.get("expected_sql", ""),
-                "generated_sql": ctx.get("generated_sql", ""),
-            }
-            if isinstance(comp, dict):
-                if comp.get("error"):
-                    q_entry["error"] = comp["error"]
-                elif not comp.get("match"):
-                    q_entry["mismatch_type"] = comp.get("match_type", "unknown")
-                gt_sample = comp.get("gt_sample")
-                if gt_sample:
-                    q_entry["expected_sample"] = str(gt_sample)[:500]
-                genie_sample = comp.get("genie_sample")
-                if genie_sample:
-                    q_entry["genie_sample"] = str(genie_sample)[:500]
-            questions.append(q_entry)
-        entry: dict[str, Any] = {
-            "cluster_id": cluster.get("cluster_id", "?"),
-            "root_cause": cluster.get("root_cause", "unknown"),
-            "judge": cluster.get("affected_judge", "unknown"),
-            "question_count": len(cluster.get("question_ids", [])),
-            "blamed_objects": _normalize_blame(cluster.get("asi_blame_set")),
-            "questions": questions,
-        }
-        cf = cluster.get("asi_counterfactual_fixes", [])
-        if cf:
-            entry["suggested_fixes"] = [str(f)[:200] for f in cf[:5]]
-        ja_list = cluster.get("join_assessments", [])
-        if ja_list:
-            entry["join_assessments"] = [
-                {k: v for k, v in ja.items() if k != "question_id"}
-                for ja in ja_list[:5]
-            ]
-        result.append(entry)
-    if len(sorted_hard) > top_n:
-        for cluster in sorted_hard[top_n:]:
-            result.append({
-                "cluster_id": cluster.get("cluster_id", "?"),
-                "root_cause": cluster.get("root_cause", "unknown"),
-                "judge": cluster.get("affected_judge", "unknown"),
-                "question_count": len(cluster.get("question_ids", [])),
-                "blamed_objects": _normalize_blame(cluster.get("asi_blame_set")),
-                "summary_only": True,
-            })
-    return result
+    sorted_hard = sorted(
+        hard, key=lambda c: len(c.get("question_ids", [])), reverse=True,
+    )
+    return [format_afs(c) for c in sorted_hard]
 
 
 def _build_soft_signal_data(soft_clusters: list[dict]) -> list[dict]:
@@ -4046,11 +6606,119 @@ def _build_soft_signal_data(soft_clusters: list[dict]) -> list[dict]:
     return result
 
 
+def _parse_struct_field_names(data_type: str) -> list[str]:
+    """Return top-level field names from a Spark ``struct<…>`` data type.
+
+    Handles nested types correctly by tracking angle / paren depth so a
+    ``struct<a:int, b:struct<c:int, d:int>, e:array<int>>`` returns
+    ``["a", "b", "e"]`` and not ``["a", "b", "c", "d", "e"]``. Returns an
+    empty list when the type is not a struct or cannot be parsed.
+
+    The LLM uses this to distinguish struct columns (``foo.bar`` is a
+    nested-field reference) from separate dim tables of the same name
+    (``foo.bar`` is an ``UNRESOLVED_COLUMN`` unless joined). Mis-mapping
+    one onto the other was the root cause of the ``dim_date`` hallucination.
+    """
+    if not data_type:
+        return []
+    s = data_type.strip()
+    if not s.lower().startswith("struct<") or not s.endswith(">"):
+        return []
+    body = s[len("struct<"):-1]
+
+    fields: list[str] = []
+    depth = 0
+    cursor = 0
+    for i, ch in enumerate(body):
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            chunk = body[cursor:i]
+            cursor = i + 1
+            colon = chunk.find(":")
+            if colon > 0:
+                fields.append(chunk[:colon].strip())
+    chunk = body[cursor:]
+    colon = chunk.find(":")
+    if colon > 0:
+        fields.append(chunk[:colon].strip())
+    return [f for f in fields if f]
+
+
+def _collect_related_tables_by_identifier(
+    metadata_snapshot: dict,
+) -> dict[str, list[dict[str, str]]]:
+    """Index ``join_specs`` by identifier so each table sees its joinable peers.
+
+    Returns ``{lower_identifier: [{table, join_on}, …]}``. ``join_on`` is the
+    rendered ``L.col = R.col`` form when extractable, otherwise the spec's
+    ``description``. Surfacing this in the schema brief tells the LLM that
+    e.g. a sibling ``mv_<domain>_dim_<entity>`` is reached via JOIN, not
+    as a struct column on a sibling MV.
+    """
+    ds = metadata_snapshot.get("data_sources", {}) or {}
+    if not isinstance(ds, dict):
+        ds = {}
+    _inst = metadata_snapshot.get("instructions", {})
+    if not isinstance(_inst, dict):
+        _inst = {}
+    join_specs = (
+        metadata_snapshot.get("join_specs", [])
+        or _inst.get("join_specs", [])
+        or ds.get("join_specs", [])
+        or []
+    )
+    by_id: dict[str, list[dict[str, str]]] = {}
+    seen_pairs: set[tuple[str, str, str]] = set()
+    for spec in join_specs:
+        if not isinstance(spec, dict):
+            continue
+        left_obj = spec.get("left", {})
+        right_obj = spec.get("right", {})
+        if isinstance(left_obj, dict) and isinstance(right_obj, dict):
+            lt = str(left_obj.get("identifier", "")).strip()
+            rt = str(right_obj.get("identifier", "")).strip()
+            l_col = str(left_obj.get("column", left_obj.get("column_name", ""))).strip()
+            r_col = str(right_obj.get("column", right_obj.get("column_name", ""))).strip()
+        else:
+            lt = str(spec.get("left_table_name", "")).strip()
+            rt = str(spec.get("right_table_name", "")).strip()
+            l_col = str(spec.get("left_column_name", "")).strip()
+            r_col = str(spec.get("right_column_name", "")).strip()
+        if not lt or not rt:
+            continue
+        if l_col and r_col:
+            join_on = f"{lt.split('.')[-1]}.{l_col} = {rt.split('.')[-1]}.{r_col}"
+        else:
+            join_on = str(spec.get("description", "") or "").strip()
+        for src, dst in ((lt, rt), (rt, lt)):
+            key = (src.lower(), dst.lower(), join_on)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            by_id.setdefault(src.lower(), []).append(
+                {"table": dst, "join_on": join_on} if join_on else {"table": dst}
+            )
+    return by_id
+
+
 def _build_schema_data(
     metadata_snapshot: dict,
     filter_tables: set[str] | None = None,
 ) -> list[dict]:
-    """Build schema context as structured list of table dicts."""
+    """Build schema context as structured list of table dicts.
+
+    Each column entry now carries ``kind: "struct"`` plus a ``fields`` list
+    when the column's ``data_type`` is a Spark struct, so the LLM can tell a
+    nested field reference apart from a reference to a separately-joined dim
+    table of the same name. Each table entry also carries ``related_tables``
+    derived from ``join_specs`` so dim tables look like joinable peers, not
+    nested fields. Together these prevent the LLM from analogising
+    ``dim_location.region`` (a real struct field) onto ``dim_date.year``
+    (a separate MV that must be JOINed).
+    """
     from genie_space_optimizer.optimization.structured_metadata import (
         deduplicate_structured_description,
     )
@@ -4060,6 +6728,7 @@ def _build_schema_data(
         ds = {}
     tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
     mvs = ds.get("metric_views", []) or []
+    related_by_id = _collect_related_tables_by_identifier(metadata_snapshot)
     result: list[dict] = []
     for tbl in list(tables) + list(mvs):
         identifier = tbl.get("identifier", "")
@@ -4085,6 +6754,10 @@ def _build_schema_data(
             col_entry: dict[str, Any] = {"name": col_name}
             if data_type:
                 col_entry["type"] = data_type
+                struct_fields = _parse_struct_field_names(data_type)
+                if struct_fields:
+                    col_entry["kind"] = "struct"
+                    col_entry["fields"] = struct_fields
             if desc:
                 col_entry["description"] = desc
             syns = cc.get("synonyms", [])
@@ -4096,6 +6769,9 @@ def _build_schema_data(
             entry["description"] = tbl_desc
         if columns:
             entry["columns"] = columns
+        related = related_by_id.get((identifier or "").lower(), [])
+        if related:
+            entry["related_tables"] = related
         result.append(entry)
     return result
 
@@ -4476,6 +7152,30 @@ def _extract_tables_from_clusters(clusters: list[dict]) -> set[str] | None:
     return tables if tables else None
 
 
+_ADAPTIVE_PROMPT_TOKEN_SAFETY_MARGIN = 500
+
+
+def _adaptive_context_budget_tokens() -> int:
+    """Return the per-iteration context budget for the adaptive strategist.
+
+    The adaptive prompt's rendered shell (role + RCA contract +
+    instructions + identifier allowlist + output schema) consumes
+    several thousand tokens before ``context_json`` is interpolated.
+    Reserve room for the rendered overhead (estimated from the static
+    template length plus a small safety margin) so context truncation
+    cannot push the final rendered prompt over ``PROMPT_TOKEN_BUDGET``.
+    """
+    from genie_space_optimizer.common.config import (
+        ADAPTIVE_STRATEGIST_PROMPT,
+        PROMPT_TOKEN_BUDGET,
+    )
+
+    template_tokens = _estimate_tokens(ADAPTIVE_STRATEGIST_PROMPT)
+    reserved = template_tokens + _ADAPTIVE_PROMPT_TOKEN_SAFETY_MARGIN
+    budget = max(1_000, int(PROMPT_TOKEN_BUDGET) - reserved)
+    return min(budget, int(PROMPT_TOKEN_BUDGET) - 1)
+
+
 def _truncate_context_to_budget(context: dict, budget_tokens: int) -> dict:
     """Truncate context dict to fit within token budget.
 
@@ -4539,6 +7239,481 @@ def _truncate_context_to_budget(context: dict, budget_tokens: int) -> dict:
     return result
 
 
+def _iq_scan_strategist_enabled() -> bool:
+    """Return True when the strategist prompt should include IQ Scan findings."""
+    return os.environ.get("GSO_ENABLE_IQ_SCAN_STRATEGIST", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _format_strategist_budget_preamble(*, budget: int, n_clusters: int) -> str:
+    """Render the ``PATCH BUDGET`` preamble prepended to the strategist prompt.
+
+    Surfaces the per-AG patch cap and active-cluster count so the
+    strategist sizes ActionGroups within the cap rather than emitting
+    bundles the cap will collapse.
+    """
+    return (
+        f"PATCH BUDGET: each ActionGroup is capped at {budget} applied patches. "
+        f"Active hard clusters: {n_clusters}. "
+        f"Bundle clusters only when their root causes are truly defect-compatible — "
+        f"otherwise emit one ActionGroup per cluster so the cap does not collapse them."
+    )
+
+
+def format_prior_dropped_causal_patches_text(
+    drops: list[dict] | tuple,
+) -> str:
+    """Cycle 5 T2 closeout — render the prior iteration's gate-drops
+    of causal-target patches into a strategist-prompt block.
+
+    Each ``DroppedCausalPatch`` is summarised on one line with its
+    gate, drop reason, patch type, target table, and the
+    outside-target dependents that triggered the drop. The
+    strategist sees this BEFORE the cluster narrative so it can
+    propose a narrower variant or shift levers instead of re-emitting
+    the same dropped pattern.
+
+    Returns an empty string when ``drops`` is empty so the caller can
+    skip the prepend without a special case.
+    """
+    if not drops:
+        return ""
+    lines = [
+        "PRIOR-ITERATION DROPPED CAUSAL PATCHES — these were rejected "
+        "by safety gates and SHOULD NOT be re-emitted verbatim. "
+        "Propose a narrower variant or shift to a different lever:",
+    ]
+    for d in drops:
+        # ``d`` may be a frozen dataclass (DroppedCausalPatch) or a
+        # plain dict if the harness already converted via to_dict.
+        gate = getattr(d, "gate", None) if not isinstance(d, dict) else d.get("gate")
+        reason = (
+            getattr(d, "reason", None) if not isinstance(d, dict)
+            else d.get("reason")
+        )
+        patch_type = (
+            getattr(d, "patch_type", None) if not isinstance(d, dict)
+            else d.get("patch_type")
+        )
+        target = (
+            getattr(d, "target", None) if not isinstance(d, dict)
+            else d.get("target")
+        )
+        target_qids = (
+            getattr(d, "target_qids", ()) if not isinstance(d, dict)
+            else d.get("target_qids", ())
+        )
+        dependents = (
+            getattr(d, "dependents_outside_target", ())
+            if not isinstance(d, dict)
+            else d.get("dependents_outside_target", ())
+        )
+        lines.append(
+            f"  - gate={gate or '?'} reason={reason or '?'} "
+            f"patch_type={patch_type or '?'} target={target or '?'} "
+            f"target_qids={list(target_qids)} "
+            f"outside_target_dependents={list(dependents)}"
+        )
+    return "\n".join(lines)
+
+
+def format_strategist_ranking_text(
+    priority_ranking: list[dict],
+    *,
+    top_n: int = 10,
+) -> str:
+    """Render the strategist's per-cluster priority ranking text.
+
+    Cycle 2 Task 4 closeout — when ``cluster["recommended_levers"]`` is
+    set (post-``rank_clusters`` stamp via
+    ``stages.action_groups.stamp_recommended_levers_on_clusters``),
+    the per-cluster lever hint is appended to the cluster's ranking
+    line so the strategist LLM sees ``recommended_levers=[...]``
+    alongside cluster identity. Clusters without the field render
+    as before (backwards-compatible — pre-extraction format
+    preserved verbatim).
+    """
+    ranking_lines: list[str] = []
+    for c in priority_ranking[:top_n]:
+        line = (
+            f"  Rank {c.get('rank', '?')}: "
+            f"[{c.get('cluster_id', '?')}] {c.get('root_cause', '?')} "
+            f"(judge={c.get('affected_judge', '?')}, "
+            f"questions={len(c.get('question_ids', []))}, "
+            f"impact={c.get('impact_score', 0):.1f})"
+        )
+        levers = c.get("recommended_levers")
+        if levers:
+            line += f" recommended_levers={list(levers)}"
+        ranking_lines.append(line)
+    return "\n".join(ranking_lines) if ranking_lines else "(no clusters)"
+
+
+def _format_iq_scan_findings(scan_summary: dict | None) -> str:
+    """Render the scan summary for the strategist prompt.
+
+    Returns an empty string when the strategist flag is disabled or the
+    summary is absent. Each section is omitted when the corresponding field
+    is empty so the prompt stays compact.
+    """
+    if not _iq_scan_strategist_enabled() or not scan_summary:
+        return ""
+
+    lines: list[str] = []
+    score = scan_summary.get("score")
+    total = scan_summary.get("total", 12)
+    maturity = scan_summary.get("maturity")
+    if score is not None and maturity:
+        lines.append(f"IQ Score: {score}/{total} ({maturity})")
+
+    ceilings = scan_summary.get("ceilings") or []
+    for ceiling in ceilings:
+        lines.append(f"WARNING: {ceiling}")
+
+    rls = scan_summary.get("rls_tables") or []
+    if rls:
+        lines.append(
+            "Tables with row-level security (entity matching is silently disabled here): "
+            + ", ".join(rls)
+        )
+
+    gaps = scan_summary.get("coverage_gaps") or []
+    if gaps:
+        lines.append("Coverage gaps: " + "; ".join(gaps))
+
+    levers = scan_summary.get("recommended_levers") or []
+    if levers:
+        # Import locally to avoid cycles and to pick up LEVER_NAMES at call time.
+        from genie_space_optimizer.common.config import LEVER_NAMES
+        pretty = [f"{lv} ({LEVER_NAMES.get(lv, '?')})" for lv in levers]
+        lines.append("Scan-recommended levers: " + ", ".join(pretty))
+
+    return "\n".join(lines)
+
+
+def _field(obj: Any, name: str, default: Any = "") -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _theme_target_qids(theme: Any) -> tuple[str, ...]:
+    values = getattr(theme, "target_qids", None)
+    if isinstance(theme, dict):
+        values = theme.get("target_qids")
+    return tuple(str(q).strip() for q in (values or ()) if str(q).strip())
+
+
+def _theme_matches_target_qids(
+    theme: Any,
+    target_qids: Iterable[str] | None = None,
+) -> bool:
+    """Return True if the theme should be eligible for the current AG.
+
+    When ``target_qids`` is empty/None the legacy global behavior applies
+    (every theme is eligible) so existing call sites without a known AG
+    target set keep working.
+    """
+    requested = {str(q).strip() for q in (target_qids or ()) if str(q).strip()}
+    if not requested:
+        return True
+    return bool(requested.intersection(_theme_target_qids(theme)))
+
+
+def _target_qids_for_rca_bridges(
+    action_group: dict,
+    strategy: dict,
+    metadata_snapshot: dict,
+) -> tuple[str, ...]:
+    """Resolve the canonical AG target QIDs used to scope RCA bridge themes."""
+    source_clusters = (
+        strategy.get("_source_clusters")
+        or metadata_snapshot.get("_failure_clusters")
+        or metadata_snapshot.get("failure_clusters")
+        or []
+    )
+    try:
+        from genie_space_optimizer.optimization.control_plane import (
+            target_qids_from_action_group,
+        )
+
+        return target_qids_from_action_group(action_group, source_clusters)
+    except Exception:
+        return tuple(
+            str(q).strip()
+            for q in (action_group.get("affected_questions") or ())
+            if str(q).strip()
+        )
+
+
+def _rca_themes_requesting_synthesis(
+    themes: list[Any],
+    target_qids: Iterable[str] | None = None,
+) -> list[Any]:
+    out: list[Any] = []
+    for theme in themes or []:
+        if not _theme_matches_target_qids(theme, target_qids):
+            continue
+        patches = getattr(theme, "patches", None)
+        if isinstance(theme, dict):
+            patches = theme.get("patches")
+        for patch in patches or ():
+            if isinstance(patch, dict) and patch.get("type") == "request_example_sql_synthesis":
+                out.append(theme)
+                break
+    return out
+
+
+def _append_teaching_kit_support_proposals(
+    proposals: list[dict],
+    *,
+    synth_proposal: dict,
+    provenance_base: dict,
+    ag_id: str,
+    source_cluster_id: str = "",
+) -> None:
+    """Append teaching-kit support patches to ``proposals`` in place.
+
+    Shared between the strategist-driven Lever 5 cluster synthesis branch
+    and the RCA-theme-driven cluster synthesis branch so kit shape stamping
+    (``kit_id``, ``target_qids``, provenance, dual_persistence, defaults)
+    is identical regardless of which path produced the primary example.
+    """
+    for support in synth_proposal.get("_supporting_proposals", []) or []:
+        if not isinstance(support, dict):
+            continue
+        support.setdefault("proposal_id", f"P{len(proposals) + 1:03d}")
+        support.setdefault("cluster_id", f"{ag_id}_KIT")
+        support.setdefault("lever", support.get("lever", 5))
+        support.setdefault("scope", "genie_config")
+        support.setdefault(
+            "change_description",
+            f"[{ag_id}] Teaching kit support: {support.get('patch_type', '?')}",
+        )
+        support.setdefault(
+            "rationale",
+            f"Support patch for teaching kit {synth_proposal.get('kit_id', '')}",
+        )
+        support.setdefault(
+            "dual_persistence",
+            DUAL_PERSIST_PATHS.get(int(support.get("lever", 5)), DUAL_PERSIST_PATHS[5]),
+        )
+        support.setdefault("confidence", 0.8)
+        support.setdefault(
+            "questions_fixed",
+            len(synth_proposal.get("target_qids", []) or []),
+        )
+        support.setdefault("questions_at_risk", 0)
+        support.setdefault("net_impact", 0.7)
+        support.setdefault("target_qids", synth_proposal.get("target_qids", []))
+        support.setdefault("kit_id", synth_proposal.get("kit_id", ""))
+        support["provenance"] = {
+            **provenance_base,
+            **(support.get("provenance") or {}),
+            "patch_type": support.get("patch_type", ""),
+            "synthesis_source": "cluster_driven_teaching_kit",
+            "kit_id": support.get("kit_id", ""),
+            "source_cluster_id": source_cluster_id,
+        }
+        proposals.append(support)
+
+
+def _cluster_from_rca_example_theme(theme: Any) -> dict:
+    """Project an RCA theme into a cluster-shaped dict for cluster-driven synthesis.
+
+    The cluster-driven engine reads ``cluster_id``, ``root_cause``,
+    ``asi_blame_set``, ``asi_counterfactual_fixes``, and ``question_ids``
+    via ``format_afs``. We synthesize that shape from the RCA theme so the
+    same engine can be reused for both strategist-driven and RCA-driven
+    Example SQL requests.
+    """
+    patches = list(getattr(theme, "patches", ()) or ())
+    synth_patch = next(
+        (
+            p for p in patches
+            if isinstance(p, dict)
+            and p.get("type") == "request_example_sql_synthesis"
+        ),
+        {},
+    )
+    target_qids = [
+        str(q)
+        for q in (getattr(theme, "target_qids", ()) or ())
+        if str(q)
+    ]
+    blame_set = synth_patch.get("blame_set") or list(
+        getattr(theme, "touched_objects", ()) or ()
+    )
+    return {
+        "cluster_id": str(getattr(theme, "rca_id", "") or "rca_theme"),
+        "root_cause": str(
+            synth_patch.get("root_cause")
+            or getattr(getattr(theme, "rca_kind", None), "value", "")
+            or "rca_example_sql"
+        ),
+        "affected_judge": "rca",
+        "asi_blame_set": list(blame_set or []),
+        "asi_counterfactual_fixes": [
+            str(
+                synth_patch.get("intent")
+                or "Synthesize a counterfactual teaching example for this RCA shape."
+            )
+        ],
+        "question_ids": target_qids,
+        "target_qids": target_qids,
+        "rca_id": str(getattr(theme, "rca_id", "")),
+        "patch_family": str(getattr(theme, "patch_family", "")),
+    }
+
+
+_RCA_SQL_SNIPPET_PATCH_TYPES: frozenset[str] = frozenset({
+    "add_sql_snippet_measure",
+    "add_sql_snippet_filter",
+    "add_sql_snippet_expression",
+})
+
+
+def _rca_themes_requesting_sql_snippets(
+    themes: list[Any],
+    target_qids: Iterable[str] | None = None,
+) -> list[Any]:
+    out: list[Any] = []
+    for theme in themes or []:
+        if not _theme_matches_target_qids(theme, target_qids):
+            continue
+        patches = getattr(theme, "patches", None)
+        if isinstance(theme, dict):
+            patches = theme.get("patches")
+        for patch in patches or ():
+            if isinstance(patch, dict) and patch.get("type") in _RCA_SQL_SNIPPET_PATCH_TYPES:
+                out.append(theme)
+                break
+    return out
+
+
+def _rca_themes_requesting_join_specs(
+    themes: list[Any],
+    target_qids: Iterable[str] | None = None,
+) -> list[Any]:
+    out: list[Any] = []
+    for theme in themes or []:
+        if not _theme_matches_target_qids(theme, target_qids):
+            continue
+        patches = getattr(theme, "patches", None)
+        if isinstance(theme, dict):
+            patches = theme.get("patches")
+        for patch in patches or ():
+            if isinstance(patch, dict) and patch.get("type") == "add_join_spec":
+                out.append(theme)
+                break
+    return out
+
+
+_RCA_LEVER1_PATCH_TYPES: frozenset[str] = frozenset({
+    "update_column_description",
+    "add_column_synonym",
+    "update_description",
+})
+
+
+def _lever1_theme_key(cluster: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    """Stable theme key for grouping Lever-1 RCA work.
+
+    Tuple of (root_cause, patch_family, sorted_blame_set). Two clusters
+    with the same key are in the same RCA theme and can share metadata
+    proposals so we don't ask the LLM to rewrite the same description
+    once per cluster.
+    """
+    blame = cluster.get("asi_blame_set") or cluster.get("blame_set") or []
+    if isinstance(blame, str):
+        blame_items = [blame]
+    else:
+        blame_items = [str(item) for item in blame]
+    return (
+        str(cluster.get("root_cause") or "unknown"),
+        str(cluster.get("patch_family") or "unknown"),
+        tuple(sorted(item for item in blame_items if item)),
+    )
+
+
+def _rca_themes_requesting_lever1(
+    themes: list[Any],
+    target_qids: Iterable[str] | None = None,
+) -> list[Any]:
+    out: list[Any] = []
+    for theme in themes or []:
+        if not _theme_matches_target_qids(theme, target_qids):
+            continue
+        patches = getattr(theme, "patches", None)
+        if isinstance(theme, dict):
+            patches = theme.get("patches")
+        for patch in patches or ():
+            if isinstance(patch, dict) and patch.get("type") in _RCA_LEVER1_PATCH_TYPES:
+                out.append(theme)
+                break
+    return out
+
+
+def _format_rca_themes_for_strategy(
+    rca_themes: list[Any],
+    conflicts: list[Any],
+) -> str:
+    lines: list[str] = ["## Typed RCA Themes"]
+    if not rca_themes:
+        lines.append("(No typed RCA themes available.)")
+    for idx, theme in enumerate((rca_themes or [])[:8], 1):
+        rca_id = _field(theme, "rca_id", "")
+        rca_kind = _field(theme, "rca_kind", "")
+        if hasattr(rca_kind, "value"):
+            rca_kind = rca_kind.value
+        patch_family = _field(theme, "patch_family", "")
+        target_qids = _field(theme, "target_qids", ())
+        touched = _field(theme, "touched_objects", ())
+        confidence = _field(theme, "confidence", 0.0)
+        evidence = str(_field(theme, "evidence_summary", "") or "")
+        patches = list(_field(theme, "patches", ()) or ())
+        levers = sorted({
+            int(p.get("lever"))
+            for p in patches
+            if isinstance(p, dict) and str(p.get("lever", "")).isdigit()
+        })
+        lines.append(
+            f"{idx}. {rca_id} kind={rca_kind} family={patch_family} "
+            f"confidence={float(confidence):.2f} recommended_levers={levers} "
+            f"targets={list(target_qids)} touched={list(touched)[:8]}"
+        )
+        if evidence:
+            lines.append(f"   evidence={evidence[:500]}")
+        for patch in patches[:6]:
+            if not isinstance(patch, dict):
+                continue
+            ptype = patch.get("type", "")
+            lever = patch.get("lever", "")
+            intent = patch.get("intent", "")
+            target = (
+                patch.get("target")
+                or patch.get("target_object")
+                or patch.get("column")
+                or patch.get("table")
+                or patch.get("root_cause")
+                or ""
+            )
+            lines.append(
+                f"   - lever={lever} patch_type={ptype} target={target} "
+                f"intent={str(intent)[:240]}"
+            )
+    if conflicts:
+        lines.append("\n## RCA Theme Conflict Matrix")
+        for conflict in conflicts[:8]:
+            left = _field(conflict, "left_rca_id", "")
+            right = _field(conflict, "right_rca_id", "")
+            obj = _field(conflict, "object_id", "")
+            reason = _field(conflict, "reason", "")
+            lines.append(f"- {left} -> {right} on `{obj}`: {reason}")
+    return "\n".join(lines)
+
+
 def _build_context_data(
     *,
     clusters: list[dict],
@@ -4552,6 +7727,8 @@ def _build_context_data(
     persistence_text: str,
     proven_patterns_text: str,
     suggestions_text: str,
+    iq_scan_text: str = "",
+    rca_theme_context: str = "",
 ) -> dict:
     """Assemble all context sections as a single Python dict for JSON serialization."""
     from genie_space_optimizer.optimization.applier import _get_general_instructions
@@ -4560,6 +7737,10 @@ def _build_context_data(
 
     return {
         "progress_summary": success_summary,
+        "mandatory_regression_debt_qids": (
+            list(metadata_snapshot.get("_mandatory_regression_debt_qids") or [])
+            or None
+        ),
         "priority_analysis": [
             {
                 "rank": c.get("rank", "?"),
@@ -4575,8 +7756,18 @@ def _build_context_data(
         "proven_patterns": proven_patterns_text,
         "persistent_failures": persistence_text,
         "human_suggestions": suggestions_text or None,
+        "iq_scan_findings": iq_scan_text or None,
+        "rca_theme_context": rca_theme_context or None,
         "schema": _build_schema_data(metadata_snapshot, filter_tables=relevant_tables),
         "failure_clusters": _build_cluster_data(clusters),
+        "failure_features": [
+            {
+                "cluster_id": c.get("cluster_id"),
+                **(c.get("failure_features") or {}),
+            }
+            for c in clusters[:10]
+            if c.get("failure_features")
+        ],
         "soft_signal_clusters": _build_soft_signal_data(soft_signal_clusters),
         "structured_metadata": {
             "tables": _build_structured_table_data(metadata_snapshot, blame_set),
@@ -4596,6 +7787,132 @@ _SQL_PATTERN_ROOT_CAUSES = frozenset({
     "wrong_table", "wrong_join", "missing_filter", "missing_aggregation",
     "wrong_aggregation", "wrong_measure", "select_star", "tvf_parameter_error",
 })
+
+
+_SQL_SHAPE_ROOT_CAUSES = frozenset({
+    # Superset of _SQL_PATTERN_ROOT_CAUSES used by A3 (Lever 5 structural
+    # gate) and B2 (weighted root-cause tie-break). A "SQL-shape" cause is
+    # any failure whose fix requires changing the generated SQL's
+    # structure (tables, joins, filters, measures, dimensions) rather
+    # than prose instructions. For these causes, a Lever 5 text_instruction
+    # is a weak signal; we require an example_sql or route to a different
+    # lever (6, 4, 3, 1).
+    "wrong_table",
+    "wrong_column",
+    "wrong_join",
+    "wrong_join_spec",
+    "missing_join_spec",
+    "missing_filter",
+    "missing_scd_filter",
+    "missing_temporal_filter",
+    "wrong_filter_condition",
+    "wrong_aggregation",
+    "wrong_measure",
+    "missing_aggregation",
+    "missing_dimension",
+    "wrong_grouping",
+    "select_star",
+    "tvf_parameter_error",
+    # Tier 2.13 / 2.14: Genie behaviour patterns detected by the
+    # over_filtered_dimension / wide_vs_long_shape classifiers in
+    # evaluation.classify_genie_shape_patterns. Treated as SQL-shape
+    # because the fix is an example_sql showing the correct row shape,
+    # not a prose instruction.
+    "over_filtered_dimension",
+    "wide_vs_long_shape",
+    # P1 pattern labels emitted by ``_detect_failure_pattern`` (this file,
+    # near L990+). Each pattern's corrective fix is an ``example_sql``
+    # demonstrating the right SQL shape — never a prose instruction —
+    # so they belong here so the Lever 5 structural gate (A3a/A3b) blocks
+    # text-only proposals and forces example_sql synthesis.
+    "plural_top_n_collapse",
+    "time_window_pivot",
+    "value_format_mismatch",
+    "column_disambiguation",
+    "granularity_drop",
+})
+
+
+_ACTIONABLE_ROOT_CAUSES: frozenset[str] = _SQL_SHAPE_ROOT_CAUSES | frozenset({
+    "column_disambiguation",
+    "missing_filter",
+    "missing_temporal_filter",
+    "missing_join_spec",
+    "missing_scd_filter",
+    "wrong_filter_condition",
+})
+
+
+def _select_dominant_root_cause(weighted: dict[str, float]) -> str:
+    """Return the dominant root cause with actionability as the primary key.
+
+    Actionable labels are members of ``_ACTIONABLE_ROOT_CAUSES`` — the
+    SQL-shape causes plus explicit filter/join/disambiguation labels.
+    Non-actionable labels (notably ``format_difference`` and
+    ``extra_columns_only``) reflect cosmetic output differences the
+    optimizer cannot ship as a lever-shaped fix and therefore lose to
+    any actionable label even at lower weight.
+    """
+    if not weighted:
+        return "other"
+    return max(
+        weighted.items(),
+        key=lambda kv: (
+            1 if kv[0] in _ACTIONABLE_ROOT_CAUSES else 0,
+            kv[1],
+            1 if kv[0] in _SQL_SHAPE_ROOT_CAUSES else 0,
+            -len(kv[0]),
+        ),
+    )[0]
+
+
+# ── Bug #4 (benchmark leakage) counters ────────────────────────────────
+# Incremented whenever the optimizer suppresses a path that would have copied
+# benchmark content verbatim. Harvested by write_iteration() and reset per
+# iteration via reset_bug4_counters().
+_BUG4_COUNTERS: dict[str, int] = {
+    "secondary_mining_blocked": 0,
+    "firewall_rejections": 0,
+    # Phase A3: bumped when a Lever 5 instruction-only proposal is blocked
+    # because the cluster's dominant root cause is structural
+    # (in _SQL_SHAPE_ROOT_CAUSES) but no example_sql is attached.
+    "lever5_text_only_blocked": 0,
+}
+
+
+def reset_bug4_counters() -> None:
+    """Reset Bug #4 counters. Called at the start of each iteration."""
+    for key in _BUG4_COUNTERS:
+        _BUG4_COUNTERS[key] = 0
+
+
+def get_bug4_counters() -> dict[str, int]:
+    """Snapshot of Bug #4 counters for persistence by write_iteration()."""
+    return dict(_BUG4_COUNTERS)
+
+
+def _incr_bug4_counter(key: str, amount: int = 1) -> None:
+    _BUG4_COUNTERS[key] = _BUG4_COUNTERS.get(key, 0) + amount
+
+
+# ── Lever 5 structural-gate drop side-channel ──────────────────────────
+# Cycle 8 Bug 1 Phase 3b Task B: the gate at line 13961 silently zeroes
+# instruction proposals when the dominant cluster root cause is SQL-shape
+# but no example_sql is attached. We append one record per drop here so
+# the harness can build typed DecisionRecords downstream and surface the
+# drop in the operator transcript. Reset per iteration alongside the
+# Bug-4 counters.
+_LEVER5_GATE_DROPS: list[dict] = []
+
+
+def reset_lever5_gate_drops() -> None:
+    """Reset the Lever 5 structural-gate drop ledger between iterations."""
+    _LEVER5_GATE_DROPS.clear()
+
+
+def get_lever5_gate_drops() -> list[dict]:
+    """Snapshot of Lever 5 structural-gate drops for harness wiring."""
+    return list(_LEVER5_GATE_DROPS)
 
 
 def _resolve_lever5_llm_result(
@@ -4644,6 +7961,14 @@ def _resolve_lever5_llm_result(
             "target_table": llm_result.get("target_table", ""),
         }
 
+    # Bug #4 — benchmark leakage prevention. Previously, when the LLM
+    # returned text_instruction for a SQL-pattern root cause, this block would
+    # copy representative["question"]/representative["expected_sql"] verbatim
+    # into an add_example_sql proposal. That channel is closed: it contaminated
+    # the training signal by installing benchmark SQL into the space being
+    # evaluated on those same benchmarks. Structural synthesis (Phase 3) is
+    # the supported replacement. We still record that we blocked this path so
+    # observability can confirm the fix is active.
     if cluster and cluster.get("root_cause") in _SQL_PATTERN_ROOT_CAUSES:
         sql_ctxs = cluster.get("sql_contexts", [])
         representative = next(
@@ -4651,17 +7976,41 @@ def _resolve_lever5_llm_result(
             None,
         )
         if representative:
+            _incr_bug4_counter("secondary_mining_blocked")
             logger.info(
-                "Forcing add_example_sql for SQL-pattern root cause '%s' "
-                "(LLM returned text_instruction)",
+                "Bug #4: secondary mining blocked for SQL-pattern root cause "
+                "'%s' — falling through to text_instruction (was: verbatim "
+                "copy of benchmark question/expected_sql)",
                 cluster["root_cause"],
             )
-            return "add_example_sql", {
-                "example_question": representative["question"],
-                "example_sql": representative["expected_sql"],
-                "parameters": [],
-                "usage_guidance": llm_result.get("rationale", ""),
-                "forced_from_sql_pattern": True,
+            # Fall through to the structural-gate check below (A3b).
+
+    # Phase A3b: structural-cause gate. For the broader
+    # _SQL_SHAPE_ROOT_CAUSES set, a text-only instruction is a weak
+    # signal — we drop it with a sentinel instead of emitting a
+    # downgraded add_instruction. The caller is expected to recognize
+    # the sentinel and skip the proposal. Bug #4's counter bump above
+    # is preserved so observability parity is maintained for the
+    # narrower _SQL_PATTERN_ROOT_CAUSES overlap.
+    if cluster:
+        _cluster_rc = (
+            cluster.get("asi_failure_type")
+            or cluster.get("root_cause")
+            or ""
+        )
+        if _cluster_rc in _SQL_SHAPE_ROOT_CAUSES:
+            logger.info(
+                "Phase A3b: Lever 5 text_instruction skipped for structural "
+                "root cause '%s' — expected example_sql or different lever.",
+                _cluster_rc,
+            )
+            return "skipped_no_example_sql", {
+                "reason": (
+                    "text_instruction is too weak a signal for structural "
+                    "root causes; an example_sql or structural lever is "
+                    "required."
+                ),
+                "root_cause": _cluster_rc,
             }
 
     if original_patch_type == "add_example_sql":
@@ -4708,7 +8057,14 @@ def _call_llm_for_proposal(
         if c.get("enable_entity_matching")
     )
 
-    sql_diffs = _format_sql_diffs(cluster)
+    # Bug #4 (P2.2) — Route cluster context through the AFS serializer so no
+    # raw benchmark text (question / expected_sql / generated_sql) reaches the
+    # prompt. The AFS output is a typed, leak-free classification; the legacy
+    # ``_format_sql_diffs`` carries raw SQL tokens and is reserved for
+    # debug-only logging (behind GSO_DEBUG_RAW_SQL=1, see P2.6).
+    from genie_space_optimizer.optimization.afs import format_afs
+    _afs = format_afs(cluster)
+    sql_diffs = json.dumps(_afs.get("structural_diff", {}), default=str)
     blame = cluster.get("asi_blame_set")
     if not blame:
         blame = _derive_blame_from_sql(cluster)
@@ -4742,7 +8098,10 @@ def _call_llm_for_proposal(
             metadata_snapshot, blame
         ),
         "patch_type_description": _describe_patch_type(patch_type),
-        "failures_context": json.dumps(cluster, default=str),
+        # Bug #4 (P2.2) — failures_context is the AFS projection, never the
+        # raw cluster dict. Prevents question/expected_sql/generated_sql +
+        # result samples from reaching the LLM prompt.
+        "failures_context": json.dumps(_afs, default=str),
         "sql_diffs": sql_diffs,
         "current_join_specs": json.dumps(_join_specs, default=str),
         "table_relationships": json.dumps(
@@ -5107,7 +8466,7 @@ def _call_llm_for_join_discovery(
                 "│ Join specs returned: %d\n"
                 "│ Rationale: %s\n"
                 "└─────────────────────────────────────────────────────────────────────────",
-                len(out), str(rationale)[:300],
+                len(out), _truncate_on_boundary(str(rationale), 300),
             )
             return out
         except json.JSONDecodeError:
@@ -5134,8 +8493,45 @@ def _call_llm_for_join_discovery(
     return []
 
 
+_MARKDOWN_RESIDUE_RE = re.compile(
+    r'(?m)'
+    r'(?:^```[a-z]*\s*$)'                     # fenced code blocks
+    r'|(?:^---+\s*$)'                         # horizontal rules
+    r'|(?:^\*\*\*+\s*$)'
+    r'|(?:^___+\s*$)'
+    r'|(?:^#{1,6}\s+\S)'                      # leading ``## HEADER``
+    r'|(?:\*\*[^*]+\*\*)'                     # bold
+    r'|(?:`[^`]+`)'                           # inline backticks
+    r'|(?:\[[^\]]+\]\([^)]+\))'               # markdown links
+    r'|(?:\n{3,})'                            # excess blank lines
+)
+
+
+def _is_already_canonical_plaintext(text: str) -> bool:
+    """Phase 3.3: cheap idempotency check for the sanitizer.
+
+    Returns True if *text* contains no Markdown residue that
+    :func:`_sanitize_plaintext_instructions` would otherwise touch. We
+    skip the regex pipeline in that case so a second pass over already-
+    canonical input doesn't generate spurious diffs (re-stripping
+    backticks, re-flowing whitespace) on every iteration.
+    """
+    if not text:
+        return True
+    return _MARKDOWN_RESIDUE_RE.search(text) is None
+
+
 def _sanitize_plaintext_instructions(text: str) -> str:
-    """Strip residual Markdown from instruction text for plain-text display."""
+    """Strip residual Markdown from instruction text for plain-text display.
+
+    Phase 3.3: idempotent — if the input already has no Markdown
+    residue, the function returns the (stripped) text unchanged
+    instead of running the regex pipeline. This eliminates the
+    "every iteration produces a diff for unchanged content" symptom
+    from the iter-1 lever loop.
+    """
+    if _is_already_canonical_plaintext(text):
+        return text.strip() if text else ""
     text = re.sub(r'^```[a-z]*\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'^---+\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\*\*\*+\s*$', '', text, flags=re.MULTILINE)
@@ -5289,9 +8685,25 @@ _pre_structure_cache: dict[int, dict[str, list[str]]] = {}
 
 
 def _is_unstructured(text: str) -> bool:
-    """Return True if *text* has no recognized ALL-CAPS section headers."""
+    """Return True if *text* has no recognized section headers.
+
+    Treats both the legacy 12-section ALL-CAPS vocabulary AND the new
+    canonical 5-section schema (PR #178) as "structured" — the lever
+    loop's restructure block must not re-classify a space whose prose
+    has already been normalised by the prose rule miner. That would
+    undo the miner's work on every optimisation run and produce ever-
+    growing churn in the text_instructions content.
+    """
     if not text or not text.strip():
         return True
+    # New canonical-schema detection runs BEFORE sanitisation because
+    # ``_sanitize_plaintext_instructions`` rewrites ``## FOO`` to
+    # ``FOO:`` (legacy shape). If we let it through first, the verbatim
+    # header #5 loses its casing and passes the lever loop's ALL-CAPS
+    # detector only accidentally.
+    from genie_space_optimizer.common.config import CANONICAL_SECTION_HEADERS
+    if any(h in text for h in CANONICAL_SECTION_HEADERS):
+        return False
     sanitized = _sanitize_plaintext_instructions(text)
     sections, preamble = _parse_sections(sanitized)
     return (not sections) and bool(preamble)
@@ -5302,78 +8714,53 @@ def _pre_structure_instructions(
     metadata_snapshot: dict,
     w: WorkspaceClient | None = None,
 ) -> dict[str, list[str]]:
-    """Classify unstructured instructions into canonical section format via LLM.
+    """Heuristic fallback that groups free-form prose into legacy sections.
 
-    Returns a dict keyed by section header (e.g. ``"PURPOSE"``) with lists
-    of bullet lines.  Falls back to ``_merge_structured_instructions`` if the
-    LLM call fails.
+    Historical note: this function used to drive an LLM round-trip via
+    ``INSTRUCTION_RESTRUCTURE_PROMPT`` to classify prose into the legacy
+    12-section ALL-CAPS vocabulary. That prompt and the classifier were
+    deleted as part of the 5-section schema migration — the prose rule
+    miner (:func:`_convert_instructions_to_sql_expressions`) now performs
+    canonical grouping as part of its rewrite step, which subsumes this
+    concern for spaces touched by proactive enrichment.
+
+    What remains is a heuristic fallback used by the in-loop lever
+    machinery (:func:`_ensure_structured`) when a space's prose still
+    lacks recognised section headers. The fallback preserves content
+    rather than inventing structure; the miner re-homes it on the next
+    optimisation run.
     """
-    from genie_space_optimizer.common.config import INSTRUCTION_RESTRUCTURE_PROMPT
+    if not raw or not raw.strip():
+        return {}
 
     cache_key = hash(raw)
     if cache_key in _pre_structure_cache:
         return _pre_structure_cache[cache_key]
 
-    ctx = _build_space_schema_context(metadata_snapshot)
-    format_kwargs = {
-        "existing_instructions": raw,
-        "tables_context": ctx.get("tables_context", "(no tables)"),
-    }
-    prompt = format_mlflow_template(INSTRUCTION_RESTRUCTURE_PROMPT, **format_kwargs)
-    system_msg = "You classify Genie Space instructions into canonical sections."
-
-    try:
-        text, _response = _traced_llm_call(
-            w, system_msg, prompt,
-            span_name="pre_structure_instructions",
-            max_tokens=4096,
-        )
-        text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
-        text = _sanitize_plaintext_instructions(text)
-        sections, preamble = _parse_sections(text)
-
-        if not sections:
-            logger.warning(
-                "Pre-structuring LLM returned no sections — falling back to heuristic"
-            )
-            raise ValueError("LLM did not produce structured output")
-
-        if preamble:
-            non_blank = [ln for ln in preamble if ln.strip()]
-            if non_blank:
-                target = "PURPOSE" if "PURPOSE" not in sections else "CONSTRAINTS"
-                sections.setdefault(target, []).extend(non_blank)
-
-        result: dict[str, list[str]] = {}
-        for section in INSTRUCTION_SECTION_ORDER:
-            if section in sections:
-                result[section] = [
-                    ln for ln in sections[section] if ln.strip()
-                ]
-
-        logger.info(
-            "Pre-structured instructions into %d sections (%s)",
-            len(result),
-            ", ".join(result.keys()),
-        )
-        _pre_structure_cache[cache_key] = result
-        return result
-
-    except Exception:
-        logger.warning(
-            "Pre-structuring LLM call failed — falling back to heuristic merge",
-            exc_info=True,
-        )
-        fallback_text = _merge_structured_instructions(
-            existing=raw, contributions=[], global_guidance=""
-        )
-        sections, _ = _parse_sections(fallback_text)
-        result = {
-            section: [ln for ln in lines if ln.strip()]
-            for section, lines in sections.items()
+    fallback_text = _merge_structured_instructions(
+        existing=raw, contributions=[], global_guidance="",
+    )
+    sections, preamble = _parse_sections(fallback_text)
+    if preamble:
+        non_blank = [ln for ln in preamble if ln.strip()]
+        if non_blank:
+            target = "PURPOSE" if "PURPOSE" not in sections else "CONSTRAINTS"
+            sections.setdefault(target, []).extend(non_blank)
+    if not sections:
+        # Nothing parseable — dump under CONSTRAINTS so content is
+        # preserved, not silently dropped. The miner will promote or
+        # re-home it on the next run.
+        sections = {
+            "CONSTRAINTS": [
+                ln.strip() for ln in raw.splitlines() if ln.strip()
+            ],
         }
-        _pre_structure_cache[cache_key] = result
-        return result
+    result: dict[str, list[str]] = {
+        k: [ln for ln in v if ln.strip()]
+        for k, v in sections.items()
+    }
+    _pre_structure_cache[cache_key] = result
+    return result
 
 
 def _ensure_structured(
@@ -5552,7 +8939,7 @@ def _call_llm_for_holistic_instructions(
     format_kwargs: dict[str, Any] = {
         "space_description": space_desc,
         "eval_summary": _format_eval_summary(focus_clusters),
-        "cluster_briefs": _format_cluster_briefs(focus_clusters, top_n=5),
+        "cluster_briefs": _format_cluster_briefs_afs(focus_clusters, top_n=5),
         "lever_summary": _format_lever_summary(lever_changes),
         "current_instructions": current_instructions or "(No current instructions.)",
         "existing_example_sqls": existing_example_sqls,
@@ -5629,7 +9016,7 @@ def _call_llm_for_holistic_instructions(
                 "│ Example SQL proposals: %d\n"
                 "│ Rationale: %s\n"
                 "└─────────────────────────────────────────────────────────────────────────",
-                len(instruction_text), len(example_proposals), str(rationale)[:300],
+                len(instruction_text), len(example_proposals), _truncate_on_boundary(str(rationale), 300),
             )
             return {
                 "instruction_text": instruction_text,
@@ -5706,7 +9093,13 @@ def _format_soft_signal_summary(soft_clusters: list[dict]) -> str:
 
 
 def _format_join_specs_context(metadata_snapshot: dict) -> str:
-    """Format current join specs for the strategist prompt."""
+    """Format current join specs for the strategist prompt.
+
+    PR 29 — Specs whose left or right identifier resolves to a metric
+    view in ``_asset_semantics`` are flagged inline as MV-incompatible
+    so the strategist never proposes synthesis SQL that joins them
+    directly.
+    """
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
@@ -5725,7 +9118,24 @@ def _format_join_specs_context(metadata_snapshot: dict) -> str:
         left = js.get("left", {})
         right = js.get("right", {})
         sql = js.get("sql", "")
-        lines.append(f"- {left.get('identifier','?')} <-> {right.get('identifier','?')}: {sql[:200]}")
+        left_id = left.get("identifier", "?") if isinstance(left, dict) else "?"
+        right_id = right.get("identifier", "?") if isinstance(right, dict) else "?"
+        l_mv = _semantics_is_metric_view_id(metadata_snapshot, left_id)
+        r_mv = _semantics_is_metric_view_id(metadata_snapshot, right_id)
+        suffix = ""
+        if l_mv or r_mv:
+            mv_sides = []
+            if l_mv:
+                mv_sides.append("left")
+            if r_mv:
+                mv_sides.append("right")
+            suffix = (
+                f"  [SKIP: METRIC_VIEW on {'+'.join(mv_sides)}; "
+                "use CTE-first pattern instead of direct JOIN]"
+            )
+        lines.append(
+            f"- {left_id} <-> {right_id}: {str(sql)[:200]}{suffix}"
+        )
     return "\n".join(lines)
 
 
@@ -5852,16 +9262,53 @@ def _try_parse_string_as_section_dict(text: str) -> dict[str, str] | None:
     return None
 
 
+def _truncate_on_boundary(text: str, max_len: int, ellipsis: str = "...") -> str:
+    """T3.16: Truncate ``text`` to at most ``max_len`` characters, preferring
+    a word boundary (whitespace or punctuation) over a mid-word cut.
+
+    If ``len(text) <= max_len`` the original string is returned unchanged
+    and no ellipsis is appended. Otherwise the function looks backwards
+    from ``max_len`` for the last run of whitespace or common sentence
+    punctuation (``.,;:!?)]}``) and cuts there — falling back to a hard
+    slice if no reasonable boundary exists within the last ~20% of the
+    window.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    if max_len <= 0:
+        return ""
+    if len(s) <= max_len:
+        return s
+    candidate = s[: max_len]
+    _lookback = max(1, max_len // 5)
+    _min_boundary = max_len - _lookback
+    boundary_idx = -1
+    for i in range(max_len - 1, _min_boundary - 1, -1):
+        ch = candidate[i]
+        if ch.isspace() or ch in ".,;:!?)]}":
+            boundary_idx = i + 1
+            break
+    if boundary_idx <= 0:
+        boundary_idx = max_len
+    return candidate[:boundary_idx].rstrip() + ellipsis
+
+
 def _preview_instruction_rewrite(rewrite: dict | str, max_chars: int = 200) -> str:
-    """Human-readable preview of an instruction rewrite for logging."""
+    """Human-readable preview of an instruction rewrite for logging.
+
+    T3.16: uses ``_truncate_on_boundary`` so previews no longer slice
+    through mid-word — prevents log lines like
+    ``ASSET ROUTING: use fact_sales whenev...``.
+    """
     if isinstance(rewrite, dict):
         parts = [
-            f"{k}: {v[:60]}..." if len(str(v)) > 60 else f"{k}: {v}"
+            f"{k}: {_truncate_on_boundary(str(v), 60)}" if len(str(v)) > 60 else f"{k}: {v}"
             for k, v in rewrite.items() if v
         ]
         preview = "; ".join(parts)
-        return preview[:max_chars] + ("..." if len(preview) > max_chars else "")
-    return str(rewrite)[:max_chars]
+        return _truncate_on_boundary(preview, max_chars, ellipsis="...")
+    return _truncate_on_boundary(str(rewrite), max_chars, ellipsis="...")
 
 
 def _call_llm_for_strategy(
@@ -5888,7 +9335,7 @@ def _call_llm_for_strategy(
 
     format_kwargs: dict[str, Any] = {
         "full_schema_context": _format_full_schema_context(metadata_snapshot),
-        "cluster_briefs": _format_cluster_briefs(clusters, top_n=5, max_sql_chars=300),
+        "cluster_briefs": _format_cluster_briefs_afs(clusters, top_n=5),
         "soft_signal_summary": _format_soft_signal_summary(soft_signal_clusters),
         "structured_table_context": _format_structured_table_context(
             metadata_snapshot, blame_set, lever=1,
@@ -5980,7 +9427,7 @@ def _call_llm_for_strategy(
         "│ Global instruction rewrite: %s\n"
         "│ Rationale: %s\n"
         "└─────────────────────────────────────────────────────────────────────────",
-        len(action_groups), _rewrite_desc, str(rationale)[:300],
+        len(action_groups), _rewrite_desc, _truncate_on_boundary(str(rationale), 300),
     )
     print(
         f"\n  Strategy produced {len(action_groups)} action group(s), "
@@ -6018,6 +9465,10 @@ def _call_llm_for_adaptive_strategy(
     verdict_history: dict | None = None,
     skill_exemplars: list[dict] | None = None,
     human_suggestions: list[dict] | None = None,
+    iq_scan_summary: dict | None = None,
+    max_ag_patches: int | None = None,
+    intent_collisions: list[dict] | None = None,
+    prior_iteration_dropped_causal_patches: list | tuple | None = None,
 ) -> dict:
     """Single-call strategist that produces exactly ONE action group.
 
@@ -6032,22 +9483,42 @@ def _call_llm_for_adaptive_strategy(
         _link_prompt_to_trace,
     )
 
+    # ── Cap budget visibility (v2 Task 5) ────────────────────────────
+    # Surface MAX_AG_PATCHES to the strategist so it sizes ActionGroups
+    # against the cap. Without this, multi-cluster bundles emit N×3+
+    # patches and the cap drops most of them.
+    from genie_space_optimizer.common.config import (
+        MAX_AG_PATCHES as _CFG_MAX_AG_PATCHES,
+    )
+    _budget = int(max_ag_patches or _CFG_MAX_AG_PATCHES)
+    budget_text = _format_strategist_budget_preamble(
+        budget=_budget, n_clusters=len(clusters),
+    )
+
+    # v2 Task 12 — surface cross-cluster intent collisions to the
+    # strategist prompt. When the LLM omits the corresponding
+    # ``add_conditional_disambiguation_instruction`` patch, we emit a
+    # deterministic one in the post-processing block below.
+    intent_collision_text = ""
+    if intent_collisions:
+        intent_collision_text = (
+            "INTENT COLLISIONS DETECTED — emit add_conditional_disambiguation_instruction "
+            "patches for each collision below; do not pick a single global mapping:\n"
+        )
+        for c in intent_collisions:
+            intent_collision_text += (
+                f"  - term '{c['term']}' resolves to "
+                f"{sorted(c['column_choices'])} across clusters "
+                f"{sorted({cid for cids in c['clusters_by_column'].values() for cid in cids})}\n"
+            )
+
     _blame_items: list[str] = []
     for c in clusters:
         _blame_items.extend(_normalize_blame(c.get("asi_blame_set")))
     blame_set: list[str] | None = list(dict.fromkeys(_blame_items)) if _blame_items else None
 
     # ── Build priority ranking text ──────────────────────────────────
-    ranking_lines: list[str] = []
-    for c in priority_ranking[:10]:
-        ranking_lines.append(
-            f"  Rank {c.get('rank', '?')}: "
-            f"[{c.get('cluster_id', '?')}] {c.get('root_cause', '?')} "
-            f"(judge={c.get('affected_judge', '?')}, "
-            f"questions={len(c.get('question_ids', []))}, "
-            f"impact={c.get('impact_score', 0):.1f})"
-        )
-    ranking_text = "\n".join(ranking_lines) if ranking_lines else "(no clusters)"
+    ranking_text = format_strategist_ranking_text(priority_ranking)
 
     # ── Build success summary ────────────────────────────────────────
     failing = total_benchmarks - passing_benchmarks
@@ -6115,6 +9586,14 @@ def _call_llm_for_adaptive_strategy(
                 lines_hs.append(f"- {item}")
         suggestions_text = "\n".join(lines_hs)
 
+    iq_scan_text = _format_iq_scan_findings(iq_scan_summary)
+    rca_theme_context = ""
+    if ENABLE_RCA_THEMES_STRATEGIST:
+        rca_theme_context = _format_rca_themes_for_strategy(
+            metadata_snapshot.get("_rca_themes") or [],
+            metadata_snapshot.get("_rca_theme_conflicts") or [],
+        )
+
     # ── Build structured context ────────────────────────────────────
     context_data = _build_context_data(
         clusters=clusters,
@@ -6128,8 +9607,10 @@ def _call_llm_for_adaptive_strategy(
         persistence_text=persistence_text,
         proven_patterns_text=proven_patterns_text,
         suggestions_text=suggestions_text,
+        iq_scan_text=iq_scan_text,
+        rca_theme_context=rca_theme_context,
     )
-    context_data = _truncate_context_to_budget(context_data, PROMPT_TOKEN_BUDGET)
+    context_data = _truncate_context_to_budget(context_data, _adaptive_context_budget_tokens())
     context_json = json.dumps(context_data, indent=2, default=str)
 
     format_kwargs: dict[str, Any] = {
@@ -6141,6 +9622,29 @@ def _call_llm_for_adaptive_strategy(
     }
 
     prompt = format_mlflow_template(ADAPTIVE_STRATEGIST_PROMPT, **format_kwargs)
+    # v2 Task 5: prepend cap budget so the strategist sees it before any
+    # cluster bundling instructions in the templated prompt body.
+    # v2 Task 12: intent_collision_text follows the budget so collisions
+    # are surfaced before the cluster narrative; it is empty when no
+    # collisions were detected.
+    # Cycle 5 T2 closeout: surface the prior iteration's dropped causal
+    # patches BEFORE the cluster narrative so the strategist sees what
+    # was rejected and can propose a narrower variant or shift levers.
+    # Gated by GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST at the harness
+    # caller; ``prior_iteration_dropped_causal_patches`` is None /
+    # empty when the flag is off, so the rendered text is empty.
+    _t2_dropped_text = format_prior_dropped_causal_patches_text(
+        prior_iteration_dropped_causal_patches or ()
+    )
+    if _t2_dropped_text:
+        prompt = (
+            budget_text + "\n\n"
+            + intent_collision_text + "\n"
+            + _t2_dropped_text + "\n\n"
+            + prompt
+        )
+    else:
+        prompt = budget_text + "\n\n" + intent_collision_text + "\n" + prompt
 
     _W = 78
     _iter_label = len(reflection_buffer) + 1
@@ -6196,12 +9700,33 @@ def _call_llm_for_adaptive_strategy(
         "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
         "Do NOT include any explanation, analysis, or markdown outside the JSON. "
         "Your entire response must be parseable by json.loads(). "
-        "The JSON must contain an 'action_groups' array with EXACTLY one entry."
+        "The JSON must contain an 'action_groups' array with EXACTLY one entry. "
+        # Tier 2.5: scope bound — one source cluster per AG.
+        "The action group MUST target exactly ONE source cluster. Multiple "
+        "failure signatures require multiple iterations, not one giant AG. "
+        # T2.16: require an explicit primary_cluster_id plus optional
+        # secondary_cluster_ids. source_cluster_ids is still accepted for
+        # backward-compatible replay; validator promotes the first entry
+        # to primary_cluster_id and rejects cross-namespace spans
+        # (mixing H### with S###) unless secondary_cluster_ids was set.
+        "Set 'primary_cluster_id' to the single cluster this AG addresses "
+        "(H### for hard, S### for soft). If the AG legitimately spans "
+        "both hard and soft clusters that share a blame set, add the "
+        "cross-namespace IDs to 'secondary_cluster_ids'. For backward "
+        "compatibility you may instead populate 'source_cluster_ids' "
+        "with a list of length 1; the validator will migrate it to "
+        "primary_cluster_id. If the same root cause spans multiple "
+        "clusters with the same blame set, pick the highest impact one; "
+        "the remaining clusters will be addressed in subsequent iterations."
     )
 
     try:
         text, _response = _traced_llm_call(
-            w, system_msg, prompt, span_name="adaptive_strategy",
+            w,
+            system_msg,
+            prompt,
+            span_name="adaptive_strategy",
+            response_validator=_adaptive_strategist_response_validator,
         )
     except Exception:
         logger.exception("Adaptive strategist LLM call failed after retries")
@@ -6219,6 +9744,119 @@ def _call_llm_for_adaptive_strategy(
     action_groups = result.get("action_groups", [])
     if not isinstance(action_groups, list):
         action_groups = []
+
+    # Tier 2.5: AG scope post-validator. Enforce one-cluster-per-AG by
+    # keeping only the highest-impact source cluster when the LLM returns
+    # multiple clusters with different root_causes. AGs with a single
+    # cluster pass through unchanged. This prevents scope-creep AGs like
+    # iteration 2 (3 clusters x 4 levers x 27 patches) where a single bad
+    # patch takes down the other 26 when the iteration rolls back.
+    _all_clusters_map: dict[str, dict] = {
+        c.get("cluster_id", ""): c for c in list(clusters) + list(soft_signal_clusters) if c.get("cluster_id")
+    }
+
+    def _cluster_namespace(_cid: str) -> str:
+        """T2.16: H vs S namespace for a cluster id (backward-compatible with bare C###)."""
+        if not _cid:
+            return ""
+        _ch = _cid[:1].upper()
+        return _ch if _ch in ("H", "S") else ""
+
+    _validated_ags: list[dict] = []
+    for _ag in action_groups:
+        if not isinstance(_ag, dict):
+            continue
+        # T2.16: normalise primary/secondary cluster IDs. LLMs that still
+        # emit ``source_cluster_ids`` (legacy) are auto-migrated: the
+        # first entry becomes primary, the rest secondaries. We also
+        # refuse implicit cross-namespace spans — if primary is H### but
+        # a secondary is S### (or vice versa) and the LLM did not
+        # explicitly declare secondary_cluster_ids, drop the cross-ns
+        # entries and log it.
+        _primary_id = str(_ag.get("primary_cluster_id") or "").strip()
+        _secondary_ids_raw = _ag.get("secondary_cluster_ids") or []
+        if not _primary_id:
+            _legacy_ids = [str(x) for x in (_ag.get("source_cluster_ids") or []) if x]
+            if _legacy_ids:
+                _primary_id = _legacy_ids[0]
+                if len(_legacy_ids) > 1 and not _secondary_ids_raw:
+                    _secondary_ids_raw = _legacy_ids[1:]
+                    logger.info(
+                        "T2.16: migrated legacy source_cluster_ids=%s -> "
+                        "primary=%s, secondary=%s",
+                        _legacy_ids, _primary_id, _secondary_ids_raw,
+                    )
+        if _primary_id:
+            _ag["primary_cluster_id"] = _primary_id
+            _primary_ns = _cluster_namespace(_primary_id)
+            _kept_secondaries: list[str] = []
+            _explicit_secondary = bool(_ag.get("secondary_cluster_ids"))
+            for _sid in _secondary_ids_raw:
+                _sid_str = str(_sid).strip()
+                if not _sid_str or _sid_str == _primary_id:
+                    continue
+                _sid_ns = _cluster_namespace(_sid_str)
+                if _sid_ns and _primary_ns and _sid_ns != _primary_ns and not _explicit_secondary:
+                    logger.warning(
+                        "T2.16: dropped implicit cross-namespace secondary %s "
+                        "(primary=%s, namespaces differ). Declare secondary_cluster_ids "
+                        "explicitly to span hard+soft.",
+                        _sid_str, _primary_id,
+                    )
+                    continue
+                _kept_secondaries.append(_sid_str)
+            if _kept_secondaries:
+                _ag["secondary_cluster_ids"] = _kept_secondaries
+            elif "secondary_cluster_ids" in _ag:
+                _ag["secondary_cluster_ids"] = []
+            # Mirror into source_cluster_ids so all downstream back-fill
+            # and printer code paths keep working without duplication.
+            _ag["source_cluster_ids"] = [_primary_id] + _kept_secondaries
+        _src_ids = list(_ag.get("source_cluster_ids") or [])
+        if len(_src_ids) <= 1:
+            _validated_ags.append(_ag)
+            continue
+        _src_clusters = [
+            _all_clusters_map.get(str(cid))
+            for cid in _src_ids
+            if _all_clusters_map.get(str(cid))
+        ]
+        if not _src_clusters:
+            _validated_ags.append(_ag)
+            continue
+        _winner = max(_src_clusters, key=cluster_impact)
+        _compatible_clusters = [
+            c for c in _src_clusters
+            if c is _winner or clusters_share_defect_identity(_winner, c)
+        ]
+        if len(_compatible_clusters) < len(_src_clusters):
+            _dropped_ids = [
+                str(c.get("cluster_id", ""))
+                for c in _src_clusters
+                if c not in _compatible_clusters
+            ]
+            logger.warning(
+                "AG scope bound (RCA defect identity): dropped %d incompatible "
+                "source cluster(s) %s — kept defect-compatible clusters %s",
+                len(_dropped_ids),
+                _dropped_ids,
+                [c.get("cluster_id", "") for c in _compatible_clusters],
+            )
+        _ag["source_cluster_ids"] = [
+            str(c.get("cluster_id", ""))
+            for c in _compatible_clusters
+            if c.get("cluster_id")
+        ]
+        _ag["affected_questions"] = sorted({
+            str(q)
+            for c in _compatible_clusters
+            for q in (c.get("question_ids", []) or [])
+            if str(q)
+        })
+        _validated_ags.append(_ag)
+        continue
+    action_groups = _validated_ags
+
     global_rewrite = _normalize_instruction_rewrite(result.get("global_instruction_rewrite"))
     rationale = result.get("rationale", "")
 
@@ -6235,8 +9873,110 @@ def _call_llm_for_adaptive_strategy(
         "└─────────────────────────────────────────────────────────────────────────",
         len(action_groups),
         _rewrite_desc,
-        str(rationale)[:300],
+        _truncate_on_boundary(str(rationale), 300),
     )
+
+    # Tier 2.1 + 2.12: back-fill ``affected_questions`` from
+    # ``source_cluster_ids`` when the LLM omitted it. Prefer
+    # ``base_question_ids`` (real benchmark ids) over the internal
+    # ``question_ids`` (which may carry :vN suffixes) so outward-facing
+    # AG fields never leak synthetic tokens.
+    #
+    # T1.10: also populate ``affected_base_question_ids`` on every AG —
+    # downstream code that gates pass/fail accounting (slice sampler,
+    # persistence counter) uses base qids, while row-targeting uses the
+    # suffixed ``affected_questions``. Keeping both lists on the AG is
+    # cheap and eliminates the last source of ``_003`` vs ``_003:v2``
+    # confusion across hard/soft passes.
+    _all_clusters = list(clusters) + list(soft_signal_clusters)
+    _clusters_by_id = {
+        c.get("cluster_id", ""): c for c in _all_clusters if c.get("cluster_id")
+    }
+    for _ag in action_groups:
+        if not isinstance(_ag, dict):
+            continue
+        _source_cids = _ag.get("source_cluster_ids") or []
+        _base_qids_union: set[str] = set()
+        _suffixed_qids_union: set[str] = set()
+        for _cid in _source_cids:
+            _src = _clusters_by_id.get(str(_cid))
+            if _src:
+                _base_qids_union.update(_src.get("base_question_ids") or [])
+                _suffixed_qids_union.update(_src.get("question_ids") or [])
+        if _base_qids_union and not _ag.get("affected_base_question_ids"):
+            _ag["affected_base_question_ids"] = sorted(_base_qids_union)
+
+        # T2.16: primary-cluster coverage assertion. After backfill, the
+        # AG's affected_base_question_ids MUST be a superset of the
+        # primary cluster's base_question_ids. If the LLM returned a
+        # shrunk list (e.g. AG1 with primary=H001 but only [_001, _006]
+        # while H001 covers {_001, _003, _007, _009}), back-fill the
+        # missing entries and log a warning so it's visible in runs.
+        _primary_id_check = str(_ag.get("primary_cluster_id") or "").strip()
+        if _primary_id_check:
+            _primary_cluster = _clusters_by_id.get(_primary_id_check)
+            if _primary_cluster:
+                _primary_base = set(_primary_cluster.get("base_question_ids") or [])
+                _current_base = set(_ag.get("affected_base_question_ids") or [])
+                _missing = _primary_base - _current_base
+                if _missing:
+                    _ag["affected_base_question_ids"] = sorted(_current_base | _primary_base)
+                    logger.warning(
+                        "T2.16: AG affected_base_question_ids did not cover primary "
+                        "cluster %s — added %d missing base qid(s) %s",
+                        _primary_id_check, len(_missing), sorted(_missing),
+                    )
+
+        if _ag.get("affected_questions"):
+            continue
+        _qids: set[str] = set(_base_qids_union) or set(_suffixed_qids_union)
+        if _qids:
+            _ag["affected_questions"] = sorted(_qids)
+            logger.info(
+                "Back-filled ag.affected_questions from source_cluster_ids=%s "
+                "(%d base_question_id(s))",
+                list(_source_cids), len(_qids),
+            )
+
+    # ── v2 Task 12: deterministic conditional-disambiguation emission ──
+    # When the strategist LLM did not surface a collision the detector
+    # found, attach a deterministic conditional-disambiguation patch to
+    # the AG whose affected questions overlap the collision; otherwise
+    # fall back to the first AG so the rule is never silently dropped.
+    if intent_collisions:
+        from genie_space_optimizer.optimization.intent_disambiguation import (
+            build_conditional_disambiguation_patch,
+        )
+        addressed_terms = {
+            str(p.get("term") or "").strip()
+            for ag in action_groups for p in (ag.get("proposed_patches") or [])
+            if p.get("type") == "add_conditional_disambiguation_instruction"
+        }
+        representatives_by_qid: dict[str, str] = {}
+        for c in clusters:
+            rep = c.get("representative_question") or ""
+            for q in c.get("question_ids") or []:
+                if rep and q not in representatives_by_qid:
+                    representatives_by_qid[str(q)] = str(rep)
+        for collision in intent_collisions:
+            if collision["term"] in addressed_terms:
+                continue
+            patch = build_conditional_disambiguation_patch(
+                collision=collision,
+                representatives=representatives_by_qid,
+                proposal_id=f"P_INTENT_{collision['term']}",
+            )
+            for ag in action_groups:
+                shared_qids = set(patch["target_qids"]) & set(
+                    ag.get("affected_questions") or []
+                )
+                if shared_qids:
+                    ag.setdefault("proposed_patches", []).append(patch)
+                    break
+            else:
+                if action_groups:
+                    action_groups[0].setdefault("proposed_patches", []).append(patch)
+
     _out_lines = [
         f"\n{'=' * _W}",
         f"  STRATEGIST OUTPUT (Iteration {_iter_label})",
@@ -6250,18 +9990,18 @@ def _call_llm_for_adaptive_strategy(
         _out_lines.append(f"|  {'Levers:':<28s} {', '.join(levers)}")
         _out_lines.append(f"|  {'Affected Questions:':<28s} {len(qs)} — {', '.join(qs[:5])}")
         _out_lines.append(f"|  {'Escalation:':<28s} {ag.get('escalation', 'none') or 'none'}")
-        _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
+        _out_lines.append(f"|  {'Rationale:':<28s} {_truncate_on_boundary(str(rationale), 200)}")
         if global_rewrite:
-            _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {_rewrite_preview}...")
+            _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {_rewrite_preview}")
     else:
         _out_lines.append("|  No action group produced")
         if rationale:
-            _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
+            _out_lines.append(f"|  {'Rationale:':<28s} {_truncate_on_boundary(str(rationale), 200)}")
     _out_lines.append(f"{'=' * _W}")
     print("\n".join(_out_lines))
 
     return {
-        "action_groups": action_groups[:1],
+        "action_groups": action_groups[:MAX_ACTION_GROUPS_PER_STRATEGY],
         "global_instruction_rewrite": global_rewrite,
         "rationale": rationale,
     }
@@ -6403,12 +10143,18 @@ def _call_llm_for_ag_detail(
     if not relevant_clusters:
         relevant_clusters = clusters[:3]
 
+    # Bug #4 (P2.2) — strategist detail context uses AFS structural_diff,
+    # never raw expected_sql / generated_sql.
+    from genie_space_optimizer.optimization.afs import format_afs as _format_afs_local
     sql_diffs_parts: list[str] = []
     for cluster in relevant_clusters:
         cid = cluster.get("cluster_id", "?")
         rc = cluster.get("root_cause", "unknown")
         sql_diffs_parts.append(f"### Cluster {cid}: {rc}")
-        sql_diffs_parts.append(_format_sql_diffs(cluster))
+        _afs_local = _format_afs_local(cluster)
+        sql_diffs_parts.append(
+            json.dumps(_afs_local.get("structural_diff", {}), default=str, indent=2)
+        )
         sql_diffs_parts.append("")
     sql_diffs_text = "\n".join(sql_diffs_parts) if sql_diffs_parts else "(no SQL context)"
 
@@ -6944,10 +10690,28 @@ def _validate_lever5_proposals(
     gold_schema: str = "",
     w: Any = None,
     warehouse_id: str = "",
+    benchmarks: list[dict] | None = None,
 ) -> list[dict]:
-    """Filter out empty, generic, over-length, or hallucinated Lever 5 proposals."""
+    """Filter out empty, generic, over-length, or hallucinated Lever 5 proposals.
+
+    Bug #4 firewall — when ``benchmarks`` is provided, every proposal is
+    additionally gated by ``is_benchmark_leak``. Proposals whose text or SQL
+    fields match any benchmark at n-gram >= 0.60 (or whose SQL fingerprint
+    matches exactly) are rejected. Callers that omit benchmarks degrade to
+    the pre-Bug-#4 behaviour with a logged warning.
+    """
     from genie_space_optimizer.common.config import MAX_INSTRUCTION_TEXT_CHARS
     from genie_space_optimizer.common.genie_schema import count_instruction_slots, MAX_INSTRUCTION_SLOTS
+
+    bug4_corpus = None
+    if benchmarks:
+        from genie_space_optimizer.optimization.leakage import BenchmarkCorpus
+        bug4_corpus = BenchmarkCorpus.from_benchmarks(benchmarks)
+    else:
+        logger.warning(
+            "_validate_lever5_proposals called without benchmarks — "
+            "Bug #4 firewall skipped. Caller should pass benchmarks.",
+        )
 
     _tables = metadata_snapshot.get("tables") or []
     _funcs = metadata_snapshot.get("functions") or []
@@ -6965,7 +10729,19 @@ def _validate_lever5_proposals(
         name = (m.get("name") or m.get("identifier", "")).lower()
         known_assets.add(name)
         known_assets.add(name.rsplit(".", 1)[-1])
+    for t in _tables:
+        for c in t.get("column_configs", []) or t.get("columns", []) or []:
+            if not isinstance(c, dict):
+                continue
+            col_name = str(c.get("name") or c.get("identifier") or "").strip()
+            if col_name:
+                known_assets.add(col_name.lower())
+                known_assets.add(col_name.rsplit(".", 1)[-1].lower())
     known_assets.discard("")
+
+    from genie_space_optimizer.optimization.instruction_publishability import (
+        validate_publishable_instruction_text,
+    )
 
     id_allowlist = _build_identifier_allowlist(metadata_snapshot)
 
@@ -7017,10 +10793,21 @@ def _validate_lever5_proposals(
             ]
             if not found_sections:
                 logger.warning(
-                    "rewrite_instruction has no recognized structured sections "
-                    "(expected ALL-CAPS headers like PURPOSE:, ASSET ROUTING:, etc.). "
-                    "Content will still be accepted but may lack structure."
+                    "Rejecting rewrite_instruction with no recognized structured sections "
+                    "(expected ALL-CAPS headers like PURPOSE:, ASSET ROUTING:, etc.)."
                 )
+                continue
+            publishability = validate_publishable_instruction_text(
+                text,
+                known_assets=known_assets,
+            )
+            if not publishability.ok:
+                logger.warning(
+                    "Rejecting non-publishable rewrite_instruction (%s): %.120s",
+                    ",".join(publishability.reasons),
+                    text,
+                )
+                continue
             valid.append(p)
             continue
 
@@ -7040,6 +10827,17 @@ def _validate_lever5_proposals(
             if known_assets and not any(a in text_lower for a in known_assets):
                 logger.warning(
                     "Rejecting generic add_instruction (no known asset referenced): %.100s...",
+                    text,
+                )
+                continue
+            publishability = validate_publishable_instruction_text(
+                text,
+                known_assets=known_assets,
+            )
+            if not publishability.ok:
+                logger.warning(
+                    "Rejecting non-publishable add_instruction (%s): %.120s",
+                    ",".join(publishability.reasons),
                     text,
                 )
                 continue
@@ -7103,6 +10901,20 @@ def _validate_lever5_proposals(
 
             added_slots += 1
 
+        # Bug #4 firewall — catches near-verbatim copies that slipped past
+        # the per-field duplicate checks. Runs last so cheap validators reject
+        # first; only non-duplicate, well-shaped proposals reach here.
+        if bug4_corpus is not None:
+            from genie_space_optimizer.optimization.leakage import is_benchmark_leak
+            is_leak, leak_reason = is_benchmark_leak(p, ptype, bug4_corpus)
+            if is_leak:
+                _incr_bug4_counter("firewall_rejections")
+                logger.info(
+                    "Bug #4 firewall: Lever 5 %s rejected - %s",
+                    ptype, leak_reason,
+                )
+                continue
+
         valid.append(p)
 
     rejected = len(proposals) - len(valid)
@@ -7113,7 +10925,7 @@ def _validate_lever5_proposals(
     return valid
 
 
-def _mine_benchmark_example_sqls(
+def _DEPRECATED_mine_benchmark_example_sqls_verbatim(
     benchmarks: list[dict],
     metadata_snapshot: dict,
     *,
@@ -7123,16 +10935,26 @@ def _mine_benchmark_example_sqls(
     w: Any = None,
     warehouse_id: str = "",
 ) -> list[dict]:
-    """Mine benchmarks with ``expected_sql`` as ready-made example SQL proposals.
+    """DEPRECATED — disabled as part of Bug #4 (benchmark leakage) remediation.
 
-    Skips benchmarks whose question already exists in the config's
-    ``example_question_sqls``.  Validates each via
-    ``validate_ground_truth_sql(..., execute=True)`` so only SQL that
-    actually runs and returns rows is proposed.
+    This function used to copy benchmark ``expected_sql`` into ``example_sqls``
+    verbatim, which contaminates the training signal: the optimizer was then
+    evaluated on benchmarks whose exact SQL it had just installed into the
+    space. Structural synthesis (see ``_synthesize_example_sqls``) replaces
+    this path.
 
-    Respects the 100-slot instruction budget — stops mining once the
-    remaining slot budget is exhausted.
+    Gated behind ``GSO_ALLOW_VERBATIM_MINING=1`` for emergency rollback only.
+    Without the flag this function raises ``RuntimeError``.
     """
+    import os as _os
+    if _os.getenv("GSO_ALLOW_VERBATIM_MINING", "0").lower() not in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "_DEPRECATED_mine_benchmark_example_sqls_verbatim is disabled "
+            "(benchmark leakage prevention, Bug #4). Use structural synthesis "
+            "via _synthesize_example_sqls instead. Set "
+            "GSO_ALLOW_VERBATIM_MINING=1 only for emergency rollback."
+        )
+
     from genie_space_optimizer.common.genie_schema import count_instruction_slots, MAX_INSTRUCTION_SLOTS
 
     current_slots = count_instruction_slots(metadata_snapshot)
@@ -7295,7 +11117,13 @@ def _ngram_similarity(a: str, b: str, n: int = 3) -> float:
 
 
 def _format_existing_sql_snippets(metadata_snapshot: dict) -> str:
-    """Format existing SQL snippets for the Lever 6 prompt context."""
+    """Format existing SQL snippets for the Lever 6 prompt context.
+
+    Each row includes the source table parsed from the snippet's SQL
+    so the LLM has explicit disambiguation context. Without this hint
+    the model can produce generic names like ``Month-to-Date Filter``
+    even when the space already has one for a different fact table.
+    """
     snippets = metadata_snapshot.get("sql_snippets", {})
     if not isinstance(snippets, dict):
         return "(No existing SQL expressions.)"
@@ -7311,11 +11139,459 @@ def _format_existing_sql_snippets(metadata_snapshot: dict) -> str:
             sql = item.get("sql", [])
             sql_str = sql[0] if isinstance(sql, list) and sql else str(sql)
             syns = item.get("synonyms", [])
-            lines.append(f"  - {name}: `{sql_str}`")
+            primary_table = _extract_primary_table_identifier(sql_str)
+            short_table = (
+                primary_table.rsplit(".", 1)[-1] if primary_table else ""
+            )
+            tag = f" [{short_table}]" if short_table else ""
+            lines.append(f"  - {name}{tag}: `{sql_str}`")
             if syns:
                 lines.append(f"    Synonyms: {', '.join(syns)}")
 
     return "\n".join(lines) if lines else "(No existing SQL expressions.)"
+
+
+def _filter_rca_synonyms(
+    candidates: list[Any], existing: list[str],
+) -> list[str]:
+    """Drop low-quality synonym candidates and dedupe against existing list."""
+    existing_lower = {str(s).strip().lower() for s in existing}
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        s = str(raw).strip().lower()
+        if len(s) < 2:
+            continue
+        if s in existing_lower or s in seen:
+            continue
+        # Drop SQL-shaped tokens (snake_case without spaces)
+        if "_" in s and " " not in s:
+            continue
+        if s.isupper():
+            continue
+        out.append(s)
+        seen.add(s)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _generate_lever1_rca_proposal(
+    theme: Any,
+    patch: dict,
+    metadata_snapshot: dict,
+    *,
+    w: "WorkspaceClient | None" = None,
+    benchmarks: list[dict] | None = None,
+) -> dict | None:
+    """Generate a Lever-1 column/table proposal from an RCA theme patch.
+
+    Calls the LLM to produce a description and (for column patches) a
+    synonyms list. Uses the AFS projection of source clusters for
+    leakage safety: only sanitized failure_type, blame_set, and the
+    target_qids' question phrases reach the LLM.
+    """
+    import json as _json
+    from genie_space_optimizer.optimization.afs import format_afs
+    from genie_space_optimizer.optimization.leakage import is_benchmark_leak
+
+    ptype = str(patch.get("type") or "")
+    intent = str(patch.get("intent") or "").strip()
+    rca_id = str(getattr(theme, "rca_id", ""))
+    target_qids = list(getattr(theme, "target_qids", ()) or ())
+
+    if ptype == "update_description":
+        target = str(patch.get("target") or "")
+        if not target:
+            return None
+        is_table_level = True
+        table, column = target, ""
+    else:
+        table = str(patch.get("table") or "")
+        column = str(patch.get("column") or "")
+        if not column:
+            return None
+        is_table_level = False
+        # Producer-side strict shape contract (Task 5). Reject malformed
+        # column targets at the producer so they never burn cap budget
+        # downstream, and so any future regression is visible in logs.
+        from genie_space_optimizer.optimization.proposal_shape import (
+            ProposalShapeError,
+            validate_column_proposal_shape,
+        )
+        try:
+            validate_column_proposal_shape({
+                "proposal_id": rca_id or "rca_theme",
+                "patch_type": ptype,
+                "table": table,
+                "column": column,
+            })
+        except ProposalShapeError:
+            logger.info(
+                "Rejected malformed Lever-1 RCA target rca_id=%s patch_type=%s "
+                "table=%r column=%r",
+                rca_id, ptype, table, column,
+                exc_info=True,
+            )
+            return None
+
+    failure_clusters = (
+        metadata_snapshot.get("_failure_clusters")
+        or metadata_snapshot.get("failure_clusters")
+        or []
+    )
+    qid_set = set(target_qids)
+    relevant_clusters = [
+        c for c in failure_clusters
+        if isinstance(c, dict)
+        and qid_set & set(c.get("question_ids", []) or [])
+    ]
+    afs_projections = [format_afs(c) for c in relevant_clusters[:3]]
+
+    expected_objects = list(patch.get("expected_objects") or [])
+    actual_objects = list(patch.get("actual_objects") or [])
+
+    existing_synonyms: list[str] = []
+    existing_description = ""
+    tables = metadata_snapshot.get("tables") or []
+    for t in tables:
+        if not isinstance(t, dict):
+            continue
+        if t.get("identifier") == table or t.get("name") == table:
+            if is_table_level:
+                existing_description = str(t.get("description", "") or "")
+            else:
+                for col in t.get("columns") or []:
+                    if isinstance(col, dict) and col.get("name") == column:
+                        existing_description = str(col.get("description", "") or "")
+                        existing_synonyms = list(col.get("synonyms") or [])
+                        break
+
+    prompt = (
+        "You are a metadata curator for a Genie SQL space. "
+        "An RCA theme has identified that the following column/table needs "
+        "metadata improvements based on a class of failed eval rows.\n\n"
+        f"TARGET: {'table ' + table if is_table_level else table + '.' + column}\n"
+        f"INTENT: {intent}\n"
+        f"EXPECTED (correct) objects: {expected_objects}\n"
+        f"ACTUAL (wrongly chosen) objects: {actual_objects}\n"
+        f"FAILURE CONTEXT (sanitized): {_json.dumps(afs_projections, default=str)}\n"
+        f"EXISTING DESCRIPTION: {existing_description[:300]}\n"
+        f"EXISTING SYNONYMS: {existing_synonyms}\n\n"
+        "Produce a JSON object with these keys:\n"
+        '  "description": a 1-3 sentence description that strengthens the '
+        "intended semantics and (if relevant) contrasts with the wrongly "
+        "chosen objects. Do not contradict the existing description; "
+        "extend it.\n"
+        + ("" if is_table_level else
+           '  "synonyms": a list of 2-5 lowercase NL phrases users might '
+           "say that should route to this column. Derive from FAILURE "
+           "CONTEXT phrases and EXPECTED/ACTUAL identifiers. Do not include "
+           "phrases already in EXISTING SYNONYMS. Avoid SQL identifiers "
+           "(snake_case, ALL_CAPS).\n")
+        + "Return ONLY the JSON object, no prose."
+    )
+
+    try:
+        raw_text, _ = _traced_llm_call(
+            w, "You are a metadata curator.", prompt,
+            span_name="lever1_rca_proposal",
+        )
+    except Exception:
+        logger.warning(
+            "Lever-1 RCA bridge LLM call failed for %s", rca_id, exc_info=True,
+        )
+        return None
+
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+    parsed = _extract_json(raw_text)
+    if not isinstance(parsed, dict):
+        return None
+    description = str(parsed.get("description") or "").strip()
+    synonyms_raw = parsed.get("synonyms") or []
+    if not isinstance(synonyms_raw, list):
+        synonyms_raw = []
+    synonyms = _filter_rca_synonyms(synonyms_raw, existing_synonyms)
+
+    if benchmarks:
+        is_leak, _reason = is_benchmark_leak(
+            {"description": description, "patch_type": ptype},
+            ptype, benchmarks,
+        )
+        if is_leak:
+            logger.info("Lever-1 RCA proposal rejected (leakage)")
+            return None
+
+    if not description and not synonyms:
+        return None
+
+    if is_table_level:
+        return {
+            "patch_type": "update_description",
+            "table": table,
+            "table_sections": {"description": description} if description else {},
+            "table_entity_type": "table",
+        }
+    sections: dict[str, Any] = {}
+    if description:
+        sections["description"] = description
+    if synonyms:
+        sections["synonyms"] = synonyms
+    return {
+        "patch_type": ptype,
+        "table": table,
+        "column": column,
+        "column_sections": sections,
+        "column_entity_type": "",
+        "_rca_synonyms": synonyms,
+    }
+
+
+_STRUCTURAL_SQL_SNIPPET_PATCH_TYPES = {
+    "measure": "add_sql_snippet_measure",
+    "filter": "add_sql_snippet_filter",
+    "expression": "add_sql_snippet_expression",
+}
+
+
+def _proposal_from_structural_sql_candidate(
+    candidate: dict,
+    *,
+    metadata_snapshot: dict,
+    cluster_id: str,
+    target_qids: tuple[str, ...],
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
+    w: WorkspaceClient | None = None,
+    warehouse_id: str = "",
+    benchmarks: list[dict] | None = None,
+) -> dict | None:
+    """Translate one structural SQL candidate into a Lever 6 proposal.
+
+    Refuses to emit anything other than ``add_sql_snippet_*`` patch types
+    when the source tag is ``rca_failed_question_sql``. This is the
+    primary firewall preventing failed-row benchmark SQL from leaking
+    into Example SQL artifacts.
+    """
+    del benchmarks  # Reserved for future post-validation hooks.
+    if not isinstance(candidate, dict):
+        return None
+    if candidate.get("source") != "rca_failed_question_sql":
+        return None
+    snippet_type = str(candidate.get("snippet_type") or "").strip().lower()
+    patch_type = _STRUCTURAL_SQL_SNIPPET_PATCH_TYPES.get(snippet_type)
+    if patch_type is None:
+        logger.warning(
+            "Rejected rca_failed_question_sql candidate with non-snippet type=%s",
+            snippet_type,
+        )
+        return None
+    sql_raw = str(candidate.get("sql") or "").strip()
+    if not sql_raw:
+        return None
+
+    sql_ok, violations = _validate_sql_identifiers(
+        sql_raw,
+        _build_identifier_allowlist(metadata_snapshot),
+    )
+    if not sql_ok:
+        logger.info(
+            "Lever 6 structural candidate rejected by identifier allowlist: %s",
+            violations,
+        )
+        return None
+
+    validation_passed = False
+    if spark is not None or (w is not None and warehouse_id):
+        from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
+
+        valid_result = validate_sql_snippet(
+            sql_raw,
+            snippet_type,
+            metadata_snapshot,
+            spark=spark,
+            catalog=catalog,
+            gold_schema=gold_schema,
+            w=w,
+            warehouse_id=warehouse_id,
+        )
+        if not valid_result[0]:
+            logger.info(
+                "Lever 6 structural candidate validation failed kind=%s reason=%s",
+                snippet_type,
+                valid_result[1],
+            )
+            return None
+        sql_raw = valid_result[2] if len(valid_result) > 2 else sql_raw
+        validation_passed = True
+
+    _qualified = _qualify_sql_snippet_metadata(
+        {
+            "snippet_type": snippet_type,
+            "sql": sql_raw,
+            "display_name": candidate.get("display_name", ""),
+            "instruction": candidate.get("instruction", ""),
+            "target_table": candidate.get("target_table", ""),
+        },
+        target_table=str(candidate.get("target_table", "") or ""),
+    )
+
+    return {
+        "patch_type": patch_type,
+        "lever": 6,
+        "snippet_type": snippet_type,
+        "display_name": _qualified.get("display_name", ""),
+        "alias": candidate.get("alias", ""),
+        "sql": sql_raw,
+        "synonyms": candidate.get("synonyms", []),
+        "instruction": _qualified.get("instruction", ""),
+        "target_table": candidate.get("target_table", ""),
+        "rationale": candidate.get("evidence", "RCA structural SQL learning"),
+        "affected_questions": list(target_qids),
+        "target_qids": list(target_qids),
+        "confidence": float(candidate.get("confidence", 0.85) or 0.85),
+        "questions_fixed": len(target_qids),
+        "validation_passed": validation_passed,
+        "source": "rca_failed_question_sql",
+        "source_question_id": candidate.get("source_question_id", ""),
+        "cluster_id": cluster_id,
+    }
+
+
+def _lever6_reject_payload(
+    *,
+    reason: str,
+    cluster_id: str,
+    target_table: str = "",
+    detail: Any = "",
+) -> dict[str, Any]:
+    """Structured payload for Lever-6 rejection MLflow spans.
+
+    Reason values are intentionally a closed enum so trace dashboards can
+    group rejection causes:
+      - ``llm_call_failed``
+      - ``unparseable_json``
+      - ``invalid_snippet_type``
+      - ``empty_sql``
+      - ``invalid_identifiers``
+      - ``snippet_validation_failed``
+    """
+    return {
+        "rejected": True,
+        "reject_reason": reason,
+        "cluster_id": str(cluster_id or ""),
+        "target_table": str(target_table or ""),
+        "detail": detail,
+    }
+
+
+_LEVER3_ROOT_CAUSES = frozenset({
+    "missing_data_asset",
+    "wrong_function",
+    "incorrect_function_usage",
+    "tvf_parameter_error",
+})
+
+
+def _cluster_expects_lever3(cluster: dict[str, Any]) -> bool:
+    """Return True when a cluster looks like it should route to Lever 3.
+
+    Either the root cause is a known Lever-3 family, or the blame set names
+    a SQL routine (``fn_*`` or anything containing ``function``).
+    """
+    root_cause = str(cluster.get("root_cause") or "").strip().lower()
+    if root_cause in _LEVER3_ROOT_CAUSES:
+        return True
+    blame = cluster.get("asi_blame_set") or cluster.get("blame_set") or []
+    if isinstance(blame, str):
+        blame_items = [blame]
+    else:
+        blame_items = [str(item) for item in blame]
+    return any("fn_" in item.lower() or "function" in item.lower() for item in blame_items)
+
+
+def _strategist_memo_key(
+    clusters: list[dict[str, Any]],
+    metadata_snapshot: dict[str, Any],
+    *,
+    sql_shape_deltas: list[dict[str, Any]] | None = None,
+) -> str:
+    """Deterministic key for memoizing adaptive strategist results.
+
+    Same cluster signatures + same space revision produce the same key, so
+    repeated iterations against unchanged failure clusters can short-circuit
+    the strategist call.
+
+    v2 Task 23 — once Tasks 19/20 land, rejected AGs carry
+    ``sql_shape_deltas``. Including a fingerprint of those deltas in the
+    key prevents the strategist memo cache from returning a stale
+    strategy after a rollback whose only signal was a SQL-shape change.
+    """
+    cluster_parts: list[str] = []
+    for cluster in clusters:
+        sig = str(cluster.get("cluster_signature") or cluster.get("cluster_id") or "")
+        root = str(cluster.get("root_cause") or "")
+        qids = ",".join(sorted(str(q) for q in (cluster.get("question_ids") or [])))
+        blame = cluster.get("asi_blame_set") or cluster.get("blame_set") or []
+        if isinstance(blame, str):
+            blame_s = blame
+        else:
+            blame_s = ",".join(sorted(str(b) for b in blame))
+        cluster_parts.append(f"{sig}:{root}:{qids}:{blame_s}")
+    revision = str(
+        metadata_snapshot.get("space_revision")
+        or metadata_snapshot.get("config_version")
+        or metadata_snapshot.get("space_id")
+        or metadata_snapshot.get("revision")
+        or ""
+    )
+    delta_parts: list[str] = []
+    for delta in sql_shape_deltas or []:
+        target = str(delta.get("target_qid") or "")
+        improved = ",".join(sorted(str(x) for x in (delta.get("improved") or [])))
+        remaining = ",".join(sorted(str(x) for x in (delta.get("remaining") or [])))
+        delta_parts.append(f"{target}:{improved}:{remaining}")
+    raw = (
+        "|".join(sorted(cluster_parts))
+        + f"|revision={revision}"
+        + "|deltas="
+        + "|".join(sorted(delta_parts))
+    )
+    return raw[:2000]
+
+
+def _diagnose_lever3_directive_emission(
+    clusters: list[dict[str, Any]],
+    strategy: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Report clusters that expect Lever 3 but lack a strategist action group.
+
+    Used after adaptive strategy generation so a missing Lever-3 directive is
+    visible in logs and trace metadata instead of silently dropping the RCA.
+    """
+    action_groups = strategy.get("action_groups") or []
+    diagnostics: list[dict[str, Any]] = []
+    for cluster in clusters:
+        if not _cluster_expects_lever3(cluster):
+            continue
+        qids = [str(q) for q in (cluster.get("question_ids") or [])]
+        has_l3 = False
+        for ag in action_groups:
+            lever = int(ag.get("target_lever") or ag.get("lever") or 0)
+            affected = {str(q) for q in (ag.get("affected_questions") or [])}
+            if lever == 3 and (not qids or affected.intersection(qids)):
+                has_l3 = True
+                break
+        if not has_l3:
+            diagnostics.append({
+                "cluster_id": str(cluster.get("cluster_id") or ""),
+                "expected_lever": 3,
+                "status": "missing_lever3_action_group",
+                "question_ids": qids,
+                "blame_set": cluster.get("asi_blame_set") or cluster.get("blame_set") or [],
+            })
+    return diagnostics
 
 
 def _generate_lever6_proposal(
@@ -7328,6 +11604,7 @@ def _generate_lever6_proposal(
     catalog: str = "",
     gold_schema: str = "",
     warehouse_id: str = "",
+    benchmarks: list[dict] | None = None,
 ) -> dict | None:
     """Generate a SQL Expression proposal for a failure cluster.
 
@@ -7337,6 +11614,10 @@ def _generate_lever6_proposal(
 
     The LLM chooses the snippet_type (measure/filter/expression) — the
     static _LEVER_TO_PATCH_TYPE mapping is NOT used here.
+
+    Bug #4 firewall — when ``benchmarks`` is provided, the proposal is
+    checked via ``is_benchmark_leak`` before being returned. Leaky proposals
+    are dropped with a counter increment; callers get ``None``.
     """
     import json as _json
 
@@ -7346,7 +11627,11 @@ def _generate_lever6_proposal(
     root_cause = cluster.get("root_cause", "other")
 
     with mlflow.start_span(name=f"lever6_proposal_{root_cause}", span_type=_SpanType.CHAIN) as span:
-        cluster_context = _format_cluster_briefs([cluster])
+        # Bug #4 (P2.2) — Lever 6 cluster context must be the AFS projection.
+        # _format_cluster_briefs is retained only for debug/logging.
+        from genie_space_optimizer.optimization.afs import format_afs
+        _afs_ctx = format_afs(cluster)
+        cluster_context = _json.dumps(_afs_ctx, indent=2, default=str)
         schema_context = _format_schema_index(metadata_snapshot)
         existing_snippets = _format_existing_sql_snippets(metadata_snapshot)
 
@@ -7398,6 +11683,8 @@ def _generate_lever6_proposal(
             logger.warning("Lever 6: SQL snippet has invalid identifiers: %s", violations)
             return None
 
+        _target_table_hint = str(llm_result.get("target_table", "") or "").strip()
+        _cluster_id_hint = cluster.get("cluster_id", "?")
         if spark is not None or (w is not None and warehouse_id):
             from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
 
@@ -7407,9 +11694,36 @@ def _generate_lever6_proposal(
                 w=w, warehouse_id=warehouse_id,
             )
             if not _valid_result[0]:
-                logger.warning("Lever 6: SQL snippet failed execution validation: %s", _valid_result[1])
+                # T2.14: every call to validate_sql_snippet now has an
+                # outcome log line so runs can grep FAILED vs PASSED.
+                logger.info(
+                    "Lever 6 [%s]: snippet validation (kind=%s, target=%s): FAILED — %s",
+                    _cluster_id_hint, snippet_type,
+                    _target_table_hint or "n/a",
+                    _valid_result[1],
+                )
                 return None
             sql_raw = _valid_result[2] if len(_valid_result) > 2 else sql_raw
+            _validation_passed = True
+            logger.info(
+                "Lever 6 [%s]: snippet validation (kind=%s, target=%s): PASSED",
+                _cluster_id_hint, snippet_type,
+                _target_table_hint or "n/a",
+            )
+        else:
+            # T2.14: explicit log line for the "no backend" branch so the
+            # absence of a PASSED line no longer looks like a silent skip.
+            logger.info(
+                "Lever 6 [%s]: snippet validation (kind=%s, target=%s): SKIPPED "
+                "(no spark/warehouse backend; applier gate will reject unless "
+                "validation_passed=True is stamped upstream)",
+                _cluster_id_hint, snippet_type,
+                _target_table_hint or "n/a",
+            )
+            # No execution backend: propose without execute-validation.
+            # The applier-side gate (Tier 2.8) will reject this unless
+            # ``validation_passed=True`` is explicitly set by the caller.
+            _validation_passed = False
 
         from genie_space_optimizer.common.genie_schema import count_sql_snippets, MAX_SQL_SNIPPETS
 
@@ -7445,21 +11759,79 @@ def _generate_lever6_proposal(
 
         span.set_outputs({"snippet_type": snippet_type, "sql": sql_raw[:200]})
 
-        return {
+        # Run the deterministic naming policy over the LLM result before
+        # building the proposal. The qualifier is derived from
+        # ``target_table`` (preferred — it is what the LLM was asked to
+        # name) with a fallback to parsing the validated SQL. This step
+        # is unconditional so prompt drift cannot reintroduce ambiguous
+        # ``Month-to-Date Filter``-style names on domain-specific
+        # tables.
+        _qualified = _qualify_sql_snippet_metadata(
+            {
+                "snippet_type": snippet_type,
+                "sql": sql_raw,
+                "display_name": llm_result.get("display_name", ""),
+                "instruction": llm_result.get("instruction", ""),
+                "target_table": llm_result.get("target_table", ""),
+            },
+            target_table=str(llm_result.get("target_table", "") or ""),
+        )
+
+        proposal = {
             "patch_type": patch_type_map[snippet_type],
             "lever": 6,
             "snippet_type": snippet_type,
-            "display_name": llm_result.get("display_name", ""),
+            "display_name": _qualified.get("display_name", ""),
             "alias": llm_result.get("alias", ""),
             "sql": sql_raw,
             "synonyms": llm_result.get("synonyms", []),
-            "instruction": llm_result.get("instruction", ""),
+            "instruction": _qualified.get("instruction", ""),
             "target_table": llm_result.get("target_table", ""),
             "rationale": llm_result.get("rationale", ""),
             "affected_questions": llm_result.get("affected_questions", []),
             "confidence": 0.7,
+            # Tier 2.8: validation_passed tracks whether validate_sql_snippet
+            # returned a clean EXPLAIN+execute result. The applier refuses
+            # to persist add_sql_snippet_* patches without this stamp.
             "questions_fixed": len(cluster.get("question_traces", [])),
+            "validation_passed": _validation_passed,
         }
+
+        # Bug #4 firewall — kept in place for forward-compatibility with
+        # future patch types routed through this code path, BUT now a
+        # no-op for the sql_snippet patch types Lever 6 actually emits.
+        # The patch-type dispatch in ``leakage._PATCH_TEXT_FIELDS`` no
+        # longer contains ``add_sql_snippet_{measure,filter,expression}``
+        # (see scoping docstring there). Rationale:
+        #
+        #   Lever 6 proposes structural primitives (a measure / filter /
+        #   expression), not answer-shaped example_sqls. These are
+        #   exec-validated at propose time via ``validate_sql_snippet``
+        #   AND go through the post-iteration full-eval arbiter gate
+        #   with rollback on regression — a stronger empirical check
+        #   than fingerprint-matching against the benchmark corpus.
+        #
+        # If a future patch type IS added here that persists answer-
+        # shaped content (e.g. a hypothetical Lever 6-emitted
+        # ``add_example_sql``), it will still be firewalled via its
+        # presence in ``_PATCH_TEXT_FIELDS``.
+        if benchmarks:
+            from genie_space_optimizer.optimization.leakage import (
+                BenchmarkCorpus, is_benchmark_leak,
+            )
+            corpus = BenchmarkCorpus.from_benchmarks(benchmarks)
+            is_leak, leak_reason = is_benchmark_leak(
+                proposal, proposal["patch_type"], corpus,
+            )
+            if is_leak:
+                _incr_bug4_counter("firewall_rejections")
+                logger.info(
+                    "Bug #4 firewall: Lever 6 proposal rejected (%s) - %s",
+                    proposal["patch_type"], leak_reason,
+                )
+                return None
+
+        return proposal
 
 
 # ── Lever 6 / Phase 2: Proactive SQL Expression Mining ─────────────────
@@ -7481,6 +11853,215 @@ _DERIVED_PATTERN = re.compile(
 )
 
 
+# ── Phase 3.R7: alias rewriting for mined SQL expressions ─────────────
+#
+# Benchmark queries routinely use local aliases:
+#   SELECT SUM(F.SALES_AMOUNT_USD) FROM cat.sch.fact_sales F
+# When ``_mine_sql_expression_candidates`` extracts ``SUM(F.SALES_AMOUNT_USD)``
+# the alias ``F`` is lost, so the stand-alone EXPLAIN fails with
+# ``UNRESOLVED_COLUMN: F.SALES_AMOUNT_USD``. These helpers parse the
+# source FROM/JOIN clauses, build ``{alias_lower: full_identifier}``,
+# and rewrite the extracted expression in place.
+
+_FROM_JOIN_WITH_ALIAS_RE = re.compile(
+    # ``FROM``/``JOIN`` + dotted identifier + optional AS / bare alias.
+    # Swallows backticks on either side; stops at whitespace or SQL
+    # punctuation. Deliberately does not capture subqueries
+    # (``FROM (SELECT ...)``) or table-valued expressions (LATERAL,
+    # UNNEST, VALUES) — those have no alias to rebind against.
+    r"\b(?:FROM|JOIN)\s+"
+    r"(?!\(|SELECT\b|LATERAL\b|UNNEST\b|VALUES\b)"
+    r"((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*)"
+    r"(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
+    re.IGNORECASE,
+)
+
+# Reserved words that are not aliases even if they sit in alias position.
+_NOT_AN_ALIAS = frozenset({
+    "where", "group", "order", "having", "limit", "join", "inner",
+    "left", "right", "full", "cross", "outer", "on", "using",
+    "natural", "union", "intersect", "except", "qualify", "window",
+    "cluster", "distribute", "sort", "lateral", "pivot", "unpivot",
+    "with", "as",
+})
+
+
+def _extract_alias_bindings(sql: str) -> dict[str, str]:
+    """Parse FROM/JOIN clauses in ``sql`` and return ``{alias_lower:
+    full_identifier}``. The full identifier preserves its original case
+    (not stripped) so rebinding emits the exact form the schema has on
+    disk. When no alias is declared the table name itself is used as
+    the key (identity binding), so expressions that qualify by table
+    name also validate without rewriting.
+    """
+    if not sql:
+        return {}
+    bindings: dict[str, str] = {}
+    for m in _FROM_JOIN_WITH_ALIAS_RE.finditer(sql):
+        full_ident_raw = m.group(1)
+        alias_raw = m.group(2)
+        full_ident = ".".join(
+            seg.strip().strip("`") for seg in full_ident_raw.split(".")
+        )
+        if alias_raw and alias_raw.lower() not in _NOT_AN_ALIAS:
+            bindings.setdefault(alias_raw.lower(), full_ident)
+        # Identity binding: ``FROM cat.sch.t`` → ``t`` also maps to
+        # ``cat.sch.t`` so expressions qualifying by bare table name
+        # still rebind cleanly.
+        short = full_ident.split(".")[-1]
+        if short:
+            bindings.setdefault(short.lower(), full_ident)
+    return bindings
+
+
+_ALIAS_COL_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+
+
+def _rebind_expression_aliases(
+    expr: str, alias_map: dict[str, str],
+) -> str | None:
+    """Rewrite ``alias.col`` references in ``expr`` using ``alias_map``.
+
+    Returns the rewritten expression on success, or ``None`` when any
+    referenced alias is missing from the map (the caller drops the
+    candidate so EXPLAIN never sees unresolvable references).
+    Already-qualified ``cat.sch.t.col`` forms pass through unchanged.
+    """
+    if not expr:
+        return expr
+    missing: list[str] = []
+
+    def _replace(m: re.Match[str]) -> str:
+        alias = m.group(1)
+        col = m.group(2)
+        # Already the start of a multi-dotted identifier → skip (the
+        # regex is greedy but pattern matching occurs left-to-right; a
+        # preceding ``.`` means we're mid-identifier).
+        before = m.string[: m.start()]
+        if before.endswith("."):
+            return m.group(0)
+        binding = alias_map.get(alias.lower())
+        if binding is None:
+            # Uppercase SQL keywords and aggregate function names are
+            # not aliases — don't demand them in the map.
+            if alias.upper() in {
+                "SUM", "COUNT", "AVG", "MIN", "MAX", "CASE",
+                "WHEN", "THEN", "ELSE", "END", "AS", "AND", "OR",
+                "NOT", "NULL", "TRUE", "FALSE", "DISTINCT", "ALL",
+                "BETWEEN", "IN", "IS", "LIKE", "ILIKE",
+            }:
+                return m.group(0)
+            missing.append(alias)
+            return m.group(0)
+        return f"{binding}.{col}"
+
+    rewritten = _ALIAS_COL_RE.sub(_replace, expr)
+    if missing:
+        return None
+    return rewritten
+
+
+_MINER_TARGETS: tuple[str, ...] = (
+    "sql_snippet", "join_spec", "example_qsql",
+    "table_desc", "column_synonym", "keep_in_prose",
+)
+
+
+def _format_existing_join_specs_brief(metadata_snapshot: dict) -> str:
+    """Return a terse dedup-hint list of existing join specs for the miner.
+
+    PR 29 — Specs that touch a metric view per ``_asset_semantics`` are
+    annotated with ``[METRIC_VIEW: skip]`` so the miner treats them as
+    stale rather than valid join hints.
+    """
+    instr = metadata_snapshot.get("instructions", {})
+    specs = instr.get("join_specs", []) if isinstance(instr, dict) else []
+    lines: list[str] = []
+    for spec in specs or []:
+        if not isinstance(spec, dict):
+            continue
+        left = spec.get("left", {}) if isinstance(spec.get("left"), dict) else {}
+        right = spec.get("right", {}) if isinstance(spec.get("right"), dict) else {}
+        cond = spec.get("sql", [])
+        cond_str = cond[0] if isinstance(cond, list) and cond else str(cond or "")
+        left_id = left.get("identifier", "?") if isinstance(left, dict) else "?"
+        right_id = right.get("identifier", "?") if isinstance(right, dict) else "?"
+        suffix = ""
+        if (
+            _semantics_is_metric_view_id(metadata_snapshot, left_id)
+            or _semantics_is_metric_view_id(metadata_snapshot, right_id)
+        ):
+            suffix = " [METRIC_VIEW: skip; CTE-first only]"
+        lines.append(
+            f"- {left_id} ↔ {right_id} :: {cond_str[:120]}{suffix}"
+        )
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _format_existing_example_sqls_brief(metadata_snapshot: dict) -> str:
+    """Return a terse dedup-hint list of existing example question SQLs."""
+    instr = metadata_snapshot.get("instructions", {})
+    examples = instr.get("example_question_sqls", []) if isinstance(instr, dict) else []
+    lines: list[str] = []
+    for ex in examples or []:
+        if not isinstance(ex, dict):
+            continue
+        question = str(ex.get("question", ""))[:120]
+        sql = ex.get("sql", "")
+        if isinstance(sql, list):
+            sql = " ".join(str(s) for s in sql)
+        lines.append(f"- Q: {question!r} — SQL: {str(sql)[:120]}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _validate_miner_candidate(candidate: Any, instructions_text: str) -> tuple[bool, str]:
+    """Structural validation shared by every target.
+
+    Checks the envelope fields (``target``, ``source_span``, ``confidence``,
+    ``payload``) — per-target payload validation lives in the dispatcher.
+    Returns ``(ok, reason)`` where ``reason`` is a short string used in the
+    observability summary on rejection.
+    """
+    from genie_space_optimizer.common.config import (
+        CANONICAL_SECTION_HEADERS, PROMOTE_MIN_CONFIDENCE,
+        sql_in_text_findings,
+    )
+
+    if not isinstance(candidate, dict):
+        return False, "not_a_dict"
+    target = str(candidate.get("target", "")).strip()
+    if target not in _MINER_TARGETS:
+        return False, f"bad_target:{target or 'missing'}"
+    span = candidate.get("source_span", "")
+    if not isinstance(span, str) or not span.strip():
+        return False, "missing_source_span"
+    try:
+        confidence = float(candidate.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return False, "bad_confidence"
+    if confidence < PROMOTE_MIN_CONFIDENCE:
+        return False, f"low_confidence:{confidence:.2f}"
+    payload = candidate.get("payload")
+    if not isinstance(payload, dict):
+        return False, "missing_payload"
+
+    # ``keep_in_prose`` must specify a canonical section, AND the span
+    # must not contain SQL structure (scanner v2 check). ``source_span``
+    # can be multi-line (compound bullet + sub-bullets); the single-line
+    # ``looks_like_sql_in_prose`` would under-detect, so we use the
+    # line-aware ``sql_in_text_findings`` which iterates ``splitlines()``.
+    if target == "keep_in_prose":
+        section = str(payload.get("section", "")).strip()
+        if section not in CANONICAL_SECTION_HEADERS:
+            return False, f"keep_in_prose_bad_section:{section[:40]!r}"
+        if sql_in_text_findings(span):
+            return False, "keep_in_prose_contains_sql"
+    return True, "ok"
+
+
 def _convert_instructions_to_sql_expressions(
     metadata_snapshot: dict,
     w: WorkspaceClient | None = None,
@@ -7489,30 +12070,73 @@ def _convert_instructions_to_sql_expressions(
     catalog: str = "",
     gold_schema: str = "",
     warehouse_id: str = "",
-) -> list[dict]:
-    """Parse Genie Space instructions for business rules expressible as SQL snippets.
+) -> dict[str, list[dict]]:
+    """Multi-target prose rule miner (extension of the legacy SQL-only miner).
 
-    Calls an LLM to extract default filters, KPI definitions, and derived
-    attributes from ``text_instructions``, then validates each candidate
-    via ``validate_sql_snippet``.  Returns only validated candidates.
+    Calls an LLM with :data:`PROSE_RULE_MINING_PROMPT` to classify every
+    promotable rule in ``text_instructions`` as one of six targets
+    (sql_snippet, join_spec, example_qsql, table_desc, column_synonym,
+    keep_in_prose). Each candidate carries a ``source_span`` — an exact
+    substring of the input prose that the rewrite step later removes.
+
+    This keeps the legacy function name so existing callers compile, but
+    the shape of the return value is now a dict keyed by target rather
+    than a flat ``list[dict]`` of SQL snippets. Callers that only care
+    about SQL snippets should read ``result["sql_snippet"]``.
+
+    Pipeline per call:
+
+    1. Build context (schema digest + existing structured config for
+       dedup hints).
+    2. LLM call with structured-JSON retry (B.2): on parse failure,
+       re-invoke with a repair prompt asking for a plain JSON array.
+    3. Structural validation (envelope + confidence gate).
+    4. Per-target payload validation (including EXPLAIN for sql_snippet
+       / join_spec / example_qsql, dedup against existing config).
+    5. Observability summary: single INFO line with counts by target
+       and rejection reasons.
+
+    Returns a dict with exactly these keys (never missing, may be empty):
+
+    - ``sql_snippet`` : ``list[dict]`` — each with the legacy shape so
+      :func:`_apply_instruction_sql_expressions` still consumes it.
+    - ``join_spec``    : ``list[dict]`` — shape expected by the join
+      spec applier (Task C.3).
+    - ``example_qsql`` : ``list[dict]`` — question / SQL / usage.
+    - ``table_desc``   : ``list[dict]`` — identifier + description_append.
+    - ``column_synonym``: ``list[dict]`` — identifier + column + synonyms.
+    - ``keep_in_prose``: ``list[dict]`` — section + source_span (used by
+      the rewrite step to regroup content under canonical headers).
+    - ``stats``        : ``dict`` — observability (candidates_total,
+      promoted_by_target, rejected_by_reason, retries).
     """
     from genie_space_optimizer.common.config import (
-        INSTRUCTION_TO_SQL_EXPRESSION_PROMPT,
-        format_mlflow_template,
+        PROSE_RULE_MINING_PROMPT, format_mlflow_template,
     )
     from genie_space_optimizer.optimization.applier import _get_general_instructions
-    from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
+    from genie_space_optimizer.optimization.benchmarks import (
+        validate_ground_truth_sql, validate_sql_snippet,
+    )
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    empty: dict[str, list[dict]] = {t: [] for t in _MINER_TARGETS}
+    empty["stats"] = {
+        "candidates_total": 0, "promoted_by_target": {},
+        "rejected_by_reason": {}, "retries": 0,
+    }
 
     instructions_text = _get_general_instructions(metadata_snapshot)
     if not instructions_text or len(instructions_text.strip()) < 20:
-        logger.info("No substantial instructions to convert to SQL expressions")
-        return []
+        logger.info("miner: no substantial instructions to mine")
+        return empty
 
+    # ── Build prompt context ────────────────────────────────────────
     ds = metadata_snapshot.get("data_sources", {})
     all_sources: list = []
     if isinstance(ds, dict):
         all_sources.extend(ds.get("tables", []) or [])
         all_sources.extend(ds.get("metric_views", []) or [])
+    from genie_space_optimizer.optimization.archetypes import _col_type
     schema_lines: list[str] = []
     for t in all_sources:
         if not isinstance(t, dict):
@@ -7520,7 +12144,7 @@ def _convert_instructions_to_sql_expressions(
         tname = t.get("identifier", t.get("name", "")).split(".")[-1]
         for col in (t.get("columns", []) or []):
             cname = col.get("name", "")
-            ctype = col.get("type_text", col.get("type", ""))
+            ctype = _col_type(col)
             desc = col.get("description", "")[:80]
             if cname:
                 schema_lines.append(f"{tname}.{cname} ({ctype}): {desc}")
@@ -7532,84 +12156,321 @@ def _convert_instructions_to_sql_expressions(
 
     instr = metadata_snapshot.get("instructions", {})
     existing_snippets = instr.get("sql_snippets", {}) if isinstance(instr, dict) else {}
-    existing_strs: list[str] = []
+    existing_sql_strs: list[str] = []
     for category in ("measures", "filters", "expressions"):
         for item in existing_snippets.get(category, []):
             sql_raw = item.get("sql", "")
-            sql_str = "".join(str(s) for s in sql_raw).strip() if isinstance(sql_raw, list) else str(sql_raw).strip()
+            sql_str = (
+                "".join(str(s) for s in sql_raw).strip()
+                if isinstance(sql_raw, list) else str(sql_raw).strip()
+            )
             if sql_str:
-                existing_strs.append(f"{category}: {sql_str}")
-    existing_text = "\n".join(existing_strs) if existing_strs else "(none)"
+                existing_sql_strs.append(f"{category}: {sql_str}")
+    existing_expressions = "\n".join(existing_sql_strs) or "(none)"
 
     prompt = format_mlflow_template(
-        INSTRUCTION_TO_SQL_EXPRESSION_PROMPT,
+        PROSE_RULE_MINING_PROMPT,
         instructions_text=instructions_text,
         schema_context=schema_context,
-        existing_expressions=existing_text,
+        existing_expressions=existing_expressions,
+        existing_join_specs=_format_existing_join_specs_brief(metadata_snapshot),
+        existing_example_sqls=_format_existing_example_sqls_brief(metadata_snapshot),
     )
 
-    try:
-        text, _response = _traced_llm_call(
-            w, "You are a SQL expression expert.", prompt,
-            span_name="instruction_to_sql_expression",
+    # ── LLM call with JSON-repair retry ─────────────────────────────
+    system_msg = (
+        "You are a Databricks Genie Space configuration expert. "
+        "Respond with a single JSON array and nothing else."
+    )
+    raw_text = ""
+    candidates_raw: list[Any] | None = None
+    retries = 0
+    for attempt in range(2):
+        try:
+            text, _response = _traced_llm_call(
+                w, system_msg, prompt,
+                span_name="prose_rule_mining" if attempt == 0 else "prose_rule_mining_retry",
+            )
+        except Exception:
+            logger.warning(
+                "miner: LLM call failed (attempt=%d)", attempt + 1, exc_info=True,
+            )
+            continue
+        raw_text = text or ""
+        try:
+            parsed = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                "miner: JSON parse failed (attempt=%d): %s. raw=%r",
+                attempt + 1, exc, raw_text[:200],
+            )
+            if attempt == 0:
+                # Build a one-shot repair prompt that asks the LLM to
+                # emit JUST the JSON — no prose, no fences.
+                prompt = (
+                    "Your previous reply could not be parsed as JSON. "
+                    "Return ONLY the JSON array — no prose, no markdown "
+                    "code fences, no preamble.\n\n"
+                    "Original task:\n" + prompt
+                )
+                retries += 1
+                continue
+            return empty
+        if isinstance(parsed, list):
+            candidates_raw = parsed
+        elif isinstance(parsed, dict):
+            # Tolerate wrapped shape: {"candidates": [...]} or similar.
+            for key in ("candidates", "rules", "expressions"):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    candidates_raw = val
+                    break
+        if candidates_raw is None:
+            logger.warning(
+                "miner: JSON did not contain an array (attempt=%d)",
+                attempt + 1,
+            )
+            if attempt == 0:
+                retries += 1
+                continue
+            return empty
+        break
+
+    if candidates_raw is None:
+        return empty
+
+    # ── Per-target dispatch and validation ──────────────────────────
+    # Observability contract (see Task C.2 in the plan):
+    # - ``by_target`` counts raw LLM output distribution — one bump per
+    #   candidate BEFORE any validation (envelope + per-target).
+    # - ``promoted_by_target`` counts only candidates that survive ALL
+    #   checks and landed in a bucket.
+    # - ``rejected_by_reason`` buckets rejections for a grep-friendly
+    #   diagnostic; the first rejection per target is logged at INFO.
+    buckets: dict[str, list[dict]] = {t: [] for t in _MINER_TARGETS}
+    by_target: dict[str, int] = {}
+    promoted_by_target: dict[str, int] = {}
+    rejected_by_reason: dict[str, int] = {}
+    # Keyed by the candidate's raw target so we log one sample per target,
+    # per the plan ("First rejection reason per target at INFO").
+    first_rejection_by_target: set[str] = set()
+
+    existing_sql_lower = {s.lower().strip() for s in existing_sql_strs}
+
+    for c in candidates_raw:
+        # Raw-target bump BEFORE validation — safe because the envelope
+        # validator guarantees ``target`` is one of the six valid slugs
+        # for every candidate that reaches promotion. For rejects whose
+        # target is missing / invalid, we attribute to ``"_unknown"``.
+        _raw_target = (
+            c.get("target") if isinstance(c, dict) and isinstance(c.get("target"), str)
+            else "_unknown"
         )
-    except Exception:
-        logger.warning("Instruction-to-SQL-expression LLM call failed", exc_info=True)
-        return []
+        by_target[_raw_target] = by_target.get(_raw_target, 0) + 1
 
-    from genie_space_optimizer.optimization.evaluation import _extract_json
-    try:
-        result = _extract_json(text)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("Instruction-to-SQL-expression response not valid JSON")
-        return []
-
-    candidates = result if isinstance(result, list) else result.get("expressions", [])
-    validated: list[dict] = []
-
-    existing_sql_lower = {s.lower().strip() for s in existing_strs}
-
-    for c in candidates:
-        if not isinstance(c, dict):
-            continue
-        sql = c.get("sql", "").strip()
-        snippet_type = c.get("snippet_type", "").strip().lower()
-        if not sql or snippet_type not in ("measure", "filter", "expression"):
-            continue
-        if sql.lower().strip() in existing_sql_lower:
+        ok, reason = _validate_miner_candidate(c, instructions_text)
+        if not ok:
+            rejected_by_reason[reason] = rejected_by_reason.get(reason, 0) + 1
+            if _raw_target not in first_rejection_by_target:
+                logger.info(
+                    "miner.reject target=%s reason=%s sample=%r",
+                    _raw_target, reason, str(c)[:200],
+                )
+                first_rejection_by_target.add(_raw_target)
             continue
 
-        _valid_result = validate_sql_snippet(
-            sql, snippet_type, metadata_snapshot,
-            spark=spark, catalog=catalog, gold_schema=gold_schema,
-            w=w, warehouse_id=warehouse_id,
+        target = c["target"]
+        payload = c["payload"]
+        span = c["source_span"]
+        confidence = float(c["confidence"])
+        # Per-candidate DEBUG line per plan — useful for local diagnosis
+        # without flooding INFO in steady state.
+        logger.debug(
+            "miner.candidate target=%s confidence=%.2f span=%r",
+            target, confidence, (span or "")[:80],
         )
-        is_valid = _valid_result[0]
-        err = _valid_result[1]
-        prefixed_sql = _valid_result[2] if len(_valid_result) > 2 else sql
-        if is_valid:
-            validated.append({
+
+        if target == "sql_snippet":
+            sql = str(payload.get("sql", "")).strip()
+            snippet_type = str(payload.get("snippet_type", "")).strip().lower()
+            if not sql or snippet_type not in ("measure", "filter", "expression"):
+                rejected_by_reason["sql_bad_shape"] = rejected_by_reason.get("sql_bad_shape", 0) + 1
+                continue
+            if sql.lower().strip() in existing_sql_lower:
+                rejected_by_reason["sql_duplicate"] = rejected_by_reason.get("sql_duplicate", 0) + 1
+                continue
+            valid = validate_sql_snippet(
+                sql, snippet_type, metadata_snapshot,
+                spark=spark, catalog=catalog, gold_schema=gold_schema,
+                w=w, warehouse_id=warehouse_id,
+            )
+            if not valid[0]:
+                rejected_by_reason["sql_invalid"] = rejected_by_reason.get("sql_invalid", 0) + 1
+                # T2.14: surface miner-path validation failures at INFO as
+                # well, so the loop log isn't silent about dropped
+                # snippets. The debug line is retained for full detail.
+                logger.info(
+                    "Lever 6 [miner]: snippet validation (kind=%s): FAILED — %s",
+                    snippet_type, valid[1],
+                )
+                logger.debug("miner: sql_snippet rejected: %s — %s", sql[:80], valid[1])
+                continue
+            logger.info(
+                "Lever 6 [miner]: snippet validation (kind=%s): PASSED",
+                snippet_type,
+            )
+            prefixed_sql = valid[2] if len(valid) > 2 else sql
+            # Apply the deterministic naming policy. The prose miner
+            # asks the LLM for ``display_name`` + ``description``; the
+            # qualifier prefixes domain-specific tables and backfills
+            # an instruction hint when neither was supplied.
+            _candidate = _qualify_sql_snippet_metadata({
                 "snippet_type": snippet_type,
                 "sql": prefixed_sql,
-                "display_name": c.get("display_name", ""),
-                "description": c.get("description", ""),
-                "synonyms": c.get("synonyms", []),
-                "alias": c.get("alias", ""),
-                "is_default": c.get("is_default", False),
-                "omit_when": c.get("omit_when"),
+                "display_name": payload.get("display_name", ""),
+                "description": payload.get("description", ""),
+                "synonyms": payload.get("synonyms", []) or [],
+                "alias": payload.get("alias", ""),
+                "is_default": bool(payload.get("is_default", False)),
+                "omit_when": payload.get("omit_when"),
                 "source": "instruction_derived",
+                "source_span": span,
+                "confidence": confidence,
             })
-        else:
-            logger.info(
-                "Instruction-derived SQL expression rejected: %s — %s",
-                sql[:80], err,
-            )
+            buckets["sql_snippet"].append(_candidate)
 
+        elif target == "join_spec":
+            left = payload.get("left", {}) if isinstance(payload.get("left"), dict) else {}
+            right = payload.get("right", {}) if isinstance(payload.get("right"), dict) else {}
+            sql_field = payload.get("sql", [])
+            if not isinstance(sql_field, list) or len(sql_field) < 1:
+                rejected_by_reason["join_bad_shape"] = rejected_by_reason.get("join_bad_shape", 0) + 1
+                continue
+            if not (left.get("identifier") and right.get("identifier")):
+                rejected_by_reason["join_missing_identifier"] = rejected_by_reason.get("join_missing_identifier", 0) + 1
+                continue
+            buckets["join_spec"].append({
+                "left": {"identifier": left.get("identifier"), "alias": left.get("alias") or left.get("identifier", "").split(".")[-1]},
+                "right": {"identifier": right.get("identifier"), "alias": right.get("alias") or right.get("identifier", "").split(".")[-1]},
+                "sql": sql_field,
+                "instruction": payload.get("instruction", ""),
+                "source": "instruction_derived",
+                "source_span": span,
+                "confidence": confidence,
+            })
+
+        elif target == "example_qsql":
+            question = str(payload.get("question", "")).strip()
+            sql = str(payload.get("sql", "")).strip()
+            if not question or not sql:
+                rejected_by_reason["example_bad_shape"] = rejected_by_reason.get("example_bad_shape", 0) + 1
+                continue
+            # EXPLAIN via the ground-truth SQL validator (see Task C.2
+            # in the plan). We run without ``execute=True`` so this is
+            # EXPLAIN-only — fast, deterministic, no data dependency.
+            # When no execution backend is available (unit test, offline
+            # run), validation short-circuits to structural checks.
+            try:
+                is_valid, err = validate_ground_truth_sql(
+                    sql, spark=spark, catalog=catalog, gold_schema=gold_schema,
+                    execute=False, w=w, warehouse_id=warehouse_id,
+                )
+            except Exception as exc:
+                # Validator threw — treat as shape error so we don't
+                # promote an unchecked SQL into the space.
+                logger.debug("miner: example_qsql validator raised: %s", exc)
+                is_valid, err = False, f"validator_error: {exc}"
+            if not is_valid and (spark is not None or warehouse_id):
+                rejected_by_reason["example_invalid"] = rejected_by_reason.get("example_invalid", 0) + 1
+                logger.debug(
+                    "miner: example_qsql rejected: %s — %s", sql[:80], err,
+                )
+                continue
+            # Dedup against existing example_question_sqls (normalised by
+            # lower-casing the SQL body).
+            _instr = metadata_snapshot.get("instructions", {}) or {}
+            _existing_examples = _instr.get("example_question_sqls", []) or []
+            _existing_sqls_lower: set[str] = set()
+            for ex in _existing_examples:
+                if not isinstance(ex, dict):
+                    continue
+                s = ex.get("sql", "")
+                if isinstance(s, list):
+                    s = " ".join(str(x) for x in s)
+                s = str(s).strip().lower()
+                if s:
+                    _existing_sqls_lower.add(s)
+            if sql.lower().strip() in _existing_sqls_lower:
+                rejected_by_reason["example_duplicate"] = rejected_by_reason.get("example_duplicate", 0) + 1
+                continue
+            buckets["example_qsql"].append({
+                "question": question,
+                "sql": sql,
+                "usage_guidance": payload.get("usage_guidance", ""),
+                "source": "instruction_derived",
+                "source_span": span,
+                "confidence": confidence,
+            })
+
+        elif target == "table_desc":
+            tid = str(payload.get("table_identifier", "")).strip()
+            desc_append = str(payload.get("description_append", "")).strip()
+            if not tid or not desc_append:
+                rejected_by_reason["table_desc_bad_shape"] = rejected_by_reason.get("table_desc_bad_shape", 0) + 1
+                continue
+            buckets["table_desc"].append({
+                "table_identifier": tid,
+                "description_append": desc_append,
+                "source": "instruction_derived",
+                "source_span": span,
+                "confidence": confidence,
+            })
+
+        elif target == "column_synonym":
+            tid = str(payload.get("table_identifier", "")).strip()
+            col = str(payload.get("column_name", "")).strip()
+            syns = payload.get("synonyms", []) or []
+            if not tid or not col or not isinstance(syns, list) or not syns:
+                rejected_by_reason["synonym_bad_shape"] = rejected_by_reason.get("synonym_bad_shape", 0) + 1
+                continue
+            buckets["column_synonym"].append({
+                "table_identifier": tid,
+                "column_name": col,
+                "synonyms": [str(s) for s in syns if str(s).strip()],
+                "source": "instruction_derived",
+                "source_span": span,
+                "confidence": confidence,
+            })
+
+        else:  # keep_in_prose
+            buckets["keep_in_prose"].append({
+                "section": payload["section"],
+                "source_span": span,
+                "confidence": confidence,
+            })
+
+        promoted_by_target[target] = promoted_by_target.get(target, 0) + 1
+
+    stats = {
+        "candidates_total": len(candidates_raw),
+        "by_target": by_target,  # raw LLM output distribution
+        "promoted_by_target": promoted_by_target,  # after all validators
+        "rejected_by_reason": rejected_by_reason,
+        "retries": retries,
+    }
+    # Single structured summary line for the run log. Keep it parseable
+    # by grep: the k=v format survives log aggregators better than JSON.
+    # Matches the format in Task C.2 ("Observability") of the plan.
     logger.info(
-        "Instruction-to-SQL-expression: %d/%d candidates validated",
-        len(validated), len(candidates),
+        "miner.summary candidates_total=%d by_target=%s promoted=%s "
+        "rejected=%s retries=%d",
+        stats["candidates_total"],
+        by_target,
+        promoted_by_target,
+        rejected_by_reason,
+        retries,
     )
-    return validated
+    return {**buckets, "stats": stats}
 
 
 def _mine_sql_expression_candidates(
@@ -7634,14 +12495,35 @@ def _mine_sql_expression_candidates(
     where_counter: Counter[str] = Counter()
     derived_counter: Counter[str] = Counter()
 
+    # Phase 3.R7: drops counter lives on the function-local attribute so
+    # the caller can surface it in the SQL expression seeding summary
+    # without changing the return contract. Reset per call.
+    rebind_dropped = 0
+    rebind_dropped_examples: list[str] = []
+
+    def _rebind_or_none(
+        expr: str, alias_map: dict[str, str], upper: bool,
+    ) -> str | None:
+        rewritten = _rebind_expression_aliases(expr, alias_map)
+        if rewritten is None:
+            return None
+        normalized = " ".join(rewritten.split())
+        return normalized.upper() if upper else normalized
+
     for b in benchmarks:
         sql = b.get("expected_sql", "") or ""
         if not sql.strip():
             continue
+        alias_map = _extract_alias_bindings(sql)
 
         for m in _AGG_PATTERN.findall(sql):
-            normalized = " ".join(m.split()).upper()
-            agg_counter[normalized] += 1
+            rebound = _rebind_or_none(m, alias_map, upper=True)
+            if rebound is None:
+                rebind_dropped += 1
+                if len(rebind_dropped_examples) < 3:
+                    rebind_dropped_examples.append(m[:80])
+                continue
+            agg_counter[rebound] += 1
 
         where_match = _WHERE_PATTERN.search(sql)
         if where_match:
@@ -7649,12 +12531,30 @@ def _mine_sql_expression_candidates(
             for condition in re.split(r"\s+AND\s+", clause, flags=re.IGNORECASE):
                 condition = condition.strip()
                 if condition and len(condition) < 200:
-                    normalized = " ".join(condition.split())
-                    where_counter[normalized] += 1
+                    rebound = _rebind_or_none(condition, alias_map, upper=False)
+                    if rebound is None:
+                        rebind_dropped += 1
+                        if len(rebind_dropped_examples) < 3:
+                            rebind_dropped_examples.append(condition[:80])
+                        continue
+                    where_counter[rebound] += 1
 
         for m in _DERIVED_PATTERN.findall(sql):
-            normalized = " ".join(m.split())
-            derived_counter[normalized] += 1
+            rebound = _rebind_or_none(m, alias_map, upper=False)
+            if rebound is None:
+                rebind_dropped += 1
+                if len(rebind_dropped_examples) < 3:
+                    rebind_dropped_examples.append(m[:80])
+                continue
+            derived_counter[rebound] += 1
+
+    # Stash on function attributes so the harness caller can surface the
+    # counts in the seeding summary block without changing the return
+    # shape (the callers that don't read these get zeros by default).
+    _mine_sql_expression_candidates.last_rebind_dropped = rebind_dropped
+    _mine_sql_expression_candidates.last_rebind_dropped_examples = (
+        rebind_dropped_examples
+    )
 
     candidates: list[dict] = []
 
@@ -7702,7 +12602,11 @@ def _mine_sql_expression_candidates(
         seen.add(key)
         deduped.append(c)
 
-    return deduped
+    # Apply the deterministic naming policy. Benchmark candidates have
+    # no explicit ``target_table`` (the miner extracts patterns rather
+    # than scanning schema), so the helper falls back to parsing the
+    # first FQ identifier out of ``sql``.
+    return [_qualify_sql_snippet_metadata(c) for c in deduped]
 
 
 def _auto_display_name(sql: str, snippet_type: str) -> str:
@@ -7733,6 +12637,175 @@ def _auto_display_name(sql: str, snippet_type: str) -> str:
     return sql_clean[:50]
 
 
+# ── SQL Expression naming disambiguation policy ────────────────────────
+#
+# Three SQL Expression population paths (proactive seeding, reactive
+# Lever 6 proposals, and prose mining) all produce ``display_name`` /
+# ``instruction`` metadata. Without a deterministic post-processing
+# step, names like ``Month-to-Date Filter`` end up applied to multiple
+# domain-specific tables in the same Genie Space (e.g. ``mv_<domain_a>_*``
+# vs ``mv_<domain_b>_*`` fact tables), which makes Genie's snippet
+# selection ambiguous.
+#
+# The helpers below are the enforcement layer. Prompts can drift, but
+# this code runs unconditionally after enrichment. Pattern matching is
+# delegated to :mod:`genie_space_optimizer.common.naming` so the
+# leaf-prefix vocabulary stays in one place.
+
+from genie_space_optimizer.common.naming import (  # noqa: E402 — sibling helper
+    DEFAULT_DOMAIN_PREFIX_RE as _MV_DOMAIN_PREFIX_RE,  # backwards-compat alias
+    domain_qualifier_from_identifier as _domain_qualifier_from_identifier_impl,
+    schema_qualifier_from_identifier,
+)
+
+# Regex that finds three-or-more-part fully-qualified identifiers (e.g.
+# ``catalog.schema.table``). Anchored on word boundaries so it doesn't
+# also match plain column references that happen to share a word
+# segment with a table name.
+_FQ_IDENTIFIER_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){2,})\b"
+)
+
+
+def _extract_primary_table_identifier(sql: str) -> str:
+    """Return the first three-part identifier referenced by ``sql``.
+
+    The benchmark miner does not attach explicit ``target_table``
+    metadata to its candidates, so the qualifier helper falls back to
+    parsing the SQL text itself. We pick the first occurrence to keep
+    the rule predictable; ties are exceptionally rare for a single
+    SQL Expression because they typically reference one fact table.
+    """
+    if not sql:
+        return ""
+    match = _FQ_IDENTIFIER_RE.search(sql)
+    if not match:
+        return ""
+    full = match.group(1)
+    # ``catalog.schema.table.column`` → drop the trailing column part
+    # so callers see only the table identifier.
+    parts = full.split(".")
+    if len(parts) >= 4:
+        return ".".join(parts[:3])
+    return full
+
+
+def _domain_qualifier_from_identifier(
+    identifier: str,
+    *,
+    distinct_schemas: int = 0,
+) -> str:
+    """Return the compact source qualifier for ``identifier``.
+
+    Resolves in two passes:
+
+    1. Leaf-prefix match against the broadened
+       ``mv|vw|f|d|stg|...|view_<domain>_*`` vocabulary in
+       :mod:`common.naming` (plus any user-supplied patterns from
+       ``GSO_DOMAIN_TABLE_PATTERNS``).
+    2. Schema fallback when no leaf prefix matches AND the space has
+       multiple distinct schemas (``distinct_schemas >= 2``). The
+       fallback uses the schema portion of the dotted identifier so
+       e.g. ``cat.orders.fact_lines`` becomes ``ORDERS``.
+
+    Generic table names with no recognized prefix in a single-schema
+    space receive no qualifier so we don't add noisy artificial
+    prefixes like ``T `` to a ``Total Revenue`` measure on a plain
+    ``cat.sch.t`` table.
+    """
+    qualifier = _domain_qualifier_from_identifier_impl(identifier)
+    if qualifier:
+        return qualifier
+    return schema_qualifier_from_identifier(
+        identifier, distinct_schemas=distinct_schemas
+    )
+
+
+def _qualify_sql_snippet_metadata(
+    candidate: dict,
+    *,
+    target_table: str = "",
+) -> dict:
+    """Return a copy of ``candidate`` with qualified naming metadata.
+
+    Applies the SQL Expression naming disambiguation policy:
+
+    - Adds the compact domain qualifier (e.g. ``ORDERS`` extracted
+      from ``mv_orders_fact_lines``) to ``display_name`` when the
+      candidate references a domain-specific table and the name does
+      not already start with the qualifier.
+    - Backfills an empty / blank ``instruction`` so Genie picks up the
+      "when to use this" hint with source-aware text.
+    - Returns a new dict so callers can safely substitute the
+      qualified copy without mutating shared candidate state.
+
+    The helper is path-agnostic: it works for benchmark-mined,
+    schema-discovered, LLM-enriched, prose-mined, and Lever 6
+    proposals. The only inputs it needs are ``sql``, ``display_name``,
+    optionally ``target_table`` (or one passed explicitly), and
+    ``instruction`` (read from either ``instruction`` or
+    ``description`` so the prose mining payload shape is supported).
+    """
+    if not isinstance(candidate, dict):
+        return candidate
+
+    out = dict(candidate)
+
+    sql_field = out.get("sql", "")
+    if isinstance(sql_field, list):
+        sql_text = sql_field[0] if sql_field else ""
+    else:
+        sql_text = str(sql_field or "")
+
+    table = (
+        target_table
+        or str(out.get("target_table", "") or "")
+        or _extract_primary_table_identifier(sql_text)
+    )
+    qualifier = _domain_qualifier_from_identifier(table)
+
+    if qualifier:
+        display_name = str(out.get("display_name", "") or "").strip()
+        if display_name and not display_name.upper().startswith(
+            qualifier.upper() + " "
+        ):
+            out["display_name"] = f"{qualifier} {display_name}"
+        elif not display_name:
+            out["display_name"] = qualifier
+
+    instruction_value = out.get("instruction", out.get("description", ""))
+    instruction_text = ""
+    if isinstance(instruction_value, list):
+        instruction_text = " ".join(
+            str(item).strip() for item in instruction_value if item
+        ).strip()
+    else:
+        instruction_text = str(instruction_value or "").strip()
+
+    if not instruction_text and (qualifier or table):
+        # Backfill so Genie has a "when to use this" hint that mentions
+        # the source domain. Keep it short and source-aware — this is
+        # only a fallback when neither the LLM nor the prose miner
+        # produced explicit instruction text.
+        snippet_type = str(out.get("snippet_type", "")).strip().lower()
+        kind = {
+            "measure": "measure",
+            "filter": "filter",
+            "expression": "expression",
+        }.get(snippet_type, "SQL expression")
+        if qualifier:
+            out["instruction"] = (
+                f"Use this {kind} when answering questions about "
+                f"{qualifier} ({table})."
+            )
+        else:
+            out["instruction"] = (
+                f"Use this {kind} when answering questions about {table}."
+            )
+
+    return out
+
+
 def _discover_schema_sql_expressions(
     metadata_snapshot: dict,
 ) -> list[dict]:
@@ -7741,6 +12814,14 @@ def _discover_schema_sql_expressions(
     Scans column names, types, and descriptions for strong signals:
       - Numeric columns named like revenue/cost/amount -> SUM measures
       - Date/timestamp columns -> MONTH/QUARTER expressions
+
+    Reads columns from ``column_configs`` (the serialized_space field the
+    Genie API populates) with a legacy fallback to ``columns``. Also
+    scans ``data_sources.metric_views`` so dimensional MVs with date or
+    numeric columns contribute candidates too. Historically this
+    function only read ``columns`` (never populated in production), so
+    the entire schema-discovery source quietly produced zero candidates
+    and the seeding pool collapsed to benchmark mining.
 
     Returns conservative candidates that still need execution validation.
     """
@@ -7762,19 +12843,68 @@ def _discover_schema_sql_expressions(
     candidates: list[dict] = []
     seen_sqls: set[str] = set()
 
-    for table in (ds.get("tables", []) or []):
-        if not isinstance(table, dict):
+    # Visit tables AND metric_views — both can contribute mining-worthy
+    # numeric/date columns on real spaces (e.g. ``mv_<domain>_fact_<entity>``
+    # plus ``mv_<domain>_dim_date``). Use the shared semantics split so
+    # table-shelf metric views are reclassified before SQL seeding.
+    try:
+        from genie_space_optimizer.common.asset_semantics import (
+            asset_semantics_entry,
+            effective_data_source_split,
+        )
+        split = effective_data_source_split(metadata_snapshot)
+        sources_with_kind = (
+            [(src, "table") for src in split.tables]
+            + [(src, "metric_view") for src in split.metric_views]
+        )
+    except Exception:
+        logger.debug(
+            "Schema SQL expression discovery falling back to raw shelves",
+            exc_info=True,
+        )
+        sources_with_kind = (
+            [(src, "table") for src in list(ds.get("tables", []) or [])]
+            + [(src, "metric_view") for src in list(ds.get("metric_views", []) or [])]
+        )
+
+        def asset_semantics_entry(*_args, **_kwargs):  # type: ignore[no-redef]
+            return None
+
+    def _semantic_measure_names(identifier: str) -> set[str]:
+        try:
+            entry = asset_semantics_entry(metadata_snapshot, identifier)
+        except Exception:
+            entry = None
+        if not isinstance(entry, dict):
+            return set()
+        return {
+            str(m).lower()
+            for m in (entry.get("measures") or [])
+            if isinstance(m, str) and m.strip()
+        }
+
+    for source, source_kind in sources_with_kind:
+        if not isinstance(source, dict):
             continue
-        table_id = table.get("identifier", "")
+        table_id = source.get("identifier", "") or source.get("name", "")
         if not table_id:
             continue
 
-        columns = table.get("columns", []) or []
+        semantic_measures = _semantic_measure_names(table_id)
+
+        # Prefer ``column_configs`` (production shape) and fall back to
+        # ``columns`` so legacy fixtures and internal-normalized snapshots
+        # continue to work.
+        columns = (
+            source.get("column_configs")
+            or source.get("columns")
+            or []
+        )
         for col in columns:
             if not isinstance(col, dict):
                 continue
-            col_name = col.get("name", "") or col.get("column_name", "")
-            col_type = (col.get("type_text", "") or col.get("data_type", "")).lower()
+            col_name = col.get("column_name", "") or col.get("name", "")
+            col_type = (col.get("data_type", "") or col.get("type_text", "") or "").lower()
             if not col_name:
                 continue
 
@@ -7785,7 +12915,15 @@ def _discover_schema_sql_expressions(
             base_type = col_type.split("(")[0].strip()
             fq_col = f"{table_id}.{col_name}"
 
-            if base_type in _NUMERIC_TYPES and _MEASURE_PATTERNS.search(col_name):
+            is_semantic_mv_measure = (
+                source_kind == "metric_view"
+                and col_name.lower() in semantic_measures
+            )
+            if (
+                base_type in _NUMERIC_TYPES
+                and _MEASURE_PATTERNS.search(col_name)
+                and not is_semantic_mv_measure
+            ):
                 sql_expr = f"SUM({fq_col})"
                 if sql_expr.lower() not in seen_sqls:
                     seen_sqls.add(sql_expr.lower())
@@ -7796,6 +12934,7 @@ def _discover_schema_sql_expressions(
                         "display_name": f"Total {col_name.replace('_', ' ').title()}",
                         "alias": alias,
                         "source_count": 0,
+                        "target_table": table_id,
                     })
 
             if _DATE_PATTERNS.search(col_name) and ("date" in base_type or "timestamp" in base_type):
@@ -7813,9 +12952,15 @@ def _discover_schema_sql_expressions(
                             "display_name": f"{col_name.replace('_', ' ').title()} {label}",
                             "alias": alias,
                             "source_count": 0,
+                            "target_table": table_id,
                         })
 
-    return candidates
+    # Apply the deterministic naming policy now that ``target_table``
+    # is attached. For domain-specific tables (``mv_<domain>_*``,
+    # ``vw_<domain>_*``, ``f_<domain>_*``, …) this prefixes the
+    # display name with the qualifier; generic tables are left
+    # untouched.
+    return [_qualify_sql_snippet_metadata(c) for c in candidates]
 
 
 def _enrich_candidates_with_llm(
@@ -7877,7 +13022,12 @@ def _enrich_candidates_with_llm(
         c.setdefault("synonyms", [])
         c.setdefault("instruction", "")
 
-    return candidates
+    # Run the deterministic qualifier as a post-processing pass, so a
+    # generic LLM-supplied ``display_name`` (e.g. ``Month-to-Date
+    # Filter``) for a domain-specific SQL still ends up qualified.
+    # This is the safety net for prompt drift / failures and is cheap
+    # to run.
+    return [_qualify_sql_snippet_metadata(c) for c in candidates]
 
 
 def _filter_no_op_proposals(proposals: list[dict], metadata_snapshot: dict) -> list[dict]:
@@ -8120,6 +13270,85 @@ def _build_provenance(cluster: dict, lever: int, patch_type: str) -> dict:
     }
 
 
+def _resolve_source_cluster_for_ag(
+    action_group: dict, metadata_snapshot: dict,
+) -> dict | None:
+    """Return the first archetype-eligible source cluster for an action group.
+
+    Used by the Lever 5 cluster-driven synthesis intercept. Action groups
+    can span multiple clusters; synthesis runs once per AG so we pick the
+    first cluster in ``source_cluster_ids`` whose ``root_cause`` maps to a
+    shipped archetype (via :func:`archetypes.pick_archetype`). Clusters
+    whose root_cause is terminology / data-quality / other non-SQL-shape
+    return ``None`` so the caller falls back to text instructions rather
+    than forcing the structural gate to reject every synthesized SQL.
+
+    Returns ``None`` when no source cluster is archetype-eligible.
+    """
+    from genie_space_optimizer.optimization.afs import format_afs
+    from genie_space_optimizer.optimization.archetypes import pick_archetype
+
+    source_ids = action_group.get("source_cluster_ids", []) or []
+    all_clusters = (
+        metadata_snapshot.get("_failure_clusters")
+        or metadata_snapshot.get("failure_clusters")
+        or []
+    )
+    by_id = {
+        c.get("cluster_id"): c
+        for c in all_clusters if isinstance(c, dict)
+    }
+    for sid in source_ids:
+        cluster = by_id.get(sid)
+        if cluster is None:
+            continue
+        try:
+            afs = format_afs(cluster)
+        except Exception:
+            logger.debug(
+                "cluster-driven: format_afs failed for cluster=%s; skipping",
+                sid, exc_info=True,
+            )
+            continue
+        if pick_archetype(afs, metadata_snapshot) is not None:
+            return cluster
+    return None
+
+
+def _prune_doa_fingerprints(
+    proposals: list[dict],
+    *,
+    buffer: Any,  # DoaFingerprintBuffer | None
+    ag_id: str,
+) -> list[dict]:
+    """Cycle 9 W4 — drop any candidate whose retry signature was
+    already captured as DOA in this run.
+
+    End-of-function prune (rather than per-append filtering) is
+    dramatically simpler and behaviourally equivalent because no
+    caller reads the partial proposal list mid-function. No-op when
+    ``buffer is None`` or when the
+    ``GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL`` flag is off, so the
+    flag-default-off path is byte-stable with the legacy code.
+    """
+    from genie_space_optimizer.common.config import (
+        doa_fingerprint_block_reproposal_enabled,
+    )
+    if buffer is None or not doa_fingerprint_block_reproposal_enabled():
+        return proposals
+    try:
+        return [
+            p for p in (proposals or [])
+            if not buffer.contains(ag_id=str(ag_id), patch=p)
+        ]
+    except Exception:
+        logger.debug(
+            "Cycle 9 W4: DOA fingerprint prune failed (non-fatal)",
+            exc_info=True,
+        )
+        return proposals
+
+
 def generate_proposals_from_strategy(
     strategy: dict,
     action_group: dict,
@@ -8132,6 +13361,8 @@ def generate_proposals_from_strategy(
     catalog: str = "",
     gold_schema: str = "",
     warehouse_id: str = "",
+    benchmarks: list[dict] | None = None,
+    doa_fingerprint_buffer: Any = None,
 ) -> list[dict]:
     """Generate proposals for a single lever guided by the holistic strategy.
 
@@ -8146,7 +13377,37 @@ def generate_proposals_from_strategy(
     lever_key = str(target_lever)
     lever_dir = directives.get(lever_key, {})
 
-    if not lever_dir and target_lever not in (4, 5, 6):
+    # Tier 2.7: receive any re-routed sections from sibling levers that
+    # stashed them on the AG. Merge into this lever's directive so they
+    # land in this iteration, not deferred to a future one.
+    _pending_routing = action_group.get("_pending_section_routing") or {}
+    _my_pending = _pending_routing.get(target_lever) or _pending_routing.get(lever_key)
+    if isinstance(_my_pending, dict) and _my_pending:
+        _existing = lever_dir.get("instruction_sections") or {}
+        if not isinstance(_existing, dict):
+            _existing = {}
+        _merged = dict(_existing)
+        for _sec, _val in _my_pending.items():
+            _merged[_sec] = (
+                (_merged.get(_sec, "") + "\n" + _val).strip()
+                if _merged.get(_sec) else _val
+            )
+        lever_dir["instruction_sections"] = _merged
+        logger.info(
+            "Lever %d: absorbed %d re-routed section(s) from sibling levers: %s",
+            target_lever, len(_my_pending), sorted(_my_pending.keys()),
+        )
+
+    _rca_execution = action_group.get("_rca_execution") or {}
+    _rca_forces_lever = (
+        isinstance(_rca_execution, dict)
+        and int(target_lever) in {
+            int(x) for x in (_rca_execution.get("required_levers") or [])
+            if str(x).isdigit()
+        }
+    )
+
+    if not lever_dir and target_lever not in (1, 4, 5, 6) and not _rca_forces_lever:
         return proposals
 
     scope = _resolve_scope(target_lever, apply_mode)
@@ -8156,6 +13417,29 @@ def generate_proposals_from_strategy(
     q_fixed = len(affected_qs)
     source_clusters = action_group.get("source_cluster_ids", [])
 
+    # Phase 4.2: per-proposal rationale helper. Until this PR every
+    # proposal stamped the same ``Strategy: <root_cause>.
+    # <coordination_notes>`` string regardless of which target/section
+    # was being modified — so the iter-1 log showed 18 proposals with
+    # byte-identical rationale text. Append target identity so each
+    # proposal carries its own context.
+    def _per_target_rationale(
+        target_id: str,
+        section_keys: list[str] | None = None,
+        extra: str = "",
+    ) -> str:
+        head = f"Strategy: {root_cause}." if root_cause else "Strategy:"
+        parts: list[str] = [head]
+        if coordination_notes:
+            parts.append(coordination_notes.strip())
+        if target_id:
+            parts.append(f"Target: {target_id} (lever {target_lever}).")
+        if section_keys:
+            parts.append(f"Sections: {', '.join(sorted(section_keys))}.")
+        if extra:
+            parts.append(extra.strip())
+        return " ".join(p for p in parts if p)
+
     provenance_base = {
         "cluster_id": ag_id,
         "root_cause": root_cause,
@@ -8164,6 +13448,85 @@ def generate_proposals_from_strategy(
         "lever_name": _LEVER_NAMES.get(target_lever, f"Lever {target_lever}"),
         "patch_type": "",
     }
+
+    _rca_bridge_target_qids = _target_qids_for_rca_bridges(
+        action_group,
+        strategy,
+        metadata_snapshot,
+    )
+
+    def _rca_forced_instruction_proposal() -> dict | None:
+        """Deterministic RCA bridge for forced Lever 5 with no directive.
+
+        When the strategist routed the AG to Lever 5 via the RCA execution
+        contract but did not emit a native ``instruction_sections`` directive,
+        produce a causal instruction patch from the RCA grounding terms so the
+        forced lever can still ground. Dispatch keyed on structured
+        ``root_cause`` rather than substring search across grounding terms.
+        """
+        if target_lever != 5 or not _rca_forces_lever:
+            return None
+        terms = [
+            str(t).strip()
+            for t in (_rca_execution.get("grounding_terms") or [])
+            if str(t).strip()
+        ]
+        cluster_root_cause = str(
+            _rca_execution.get("root_cause")
+            or (action_group or {}).get("root_cause")
+            or ""
+        ).strip()
+        question_text = str(
+            (action_group or {}).get("representative_question") or ""
+        )
+        expected_sql_text = str(
+            (action_group or {}).get("representative_expected_sql") or ""
+        )
+        body = _build_rca_forced_instruction_body(
+            root_cause=cluster_root_cause,
+            grounding_terms=terms,
+            question=question_text,
+            expected_sql=expected_sql_text,
+        )
+        if body is None:
+            return None
+        patch_type = (
+            "add_example_sql"
+            if cluster_root_cause == "format_difference"
+            else "add_instruction"
+        )
+        return {
+            "proposal_id": f"P{len(proposals) + 1:03d}",
+            "cluster_id": ag_id,
+            "lever": 5,
+            "scope": "genie_config",
+            "patch_type": patch_type,
+            "change_description": f"[{ag_id}] RCA forced bridge ({cluster_root_cause})",
+            "proposed_value": body,
+            "rationale": _per_target_rationale(
+                "rca_forced_instruction",
+                extra=f"deterministic RCA bridge for {cluster_root_cause}",
+            ),
+            "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+            "confidence": 0.75,
+            "questions_fixed": q_fixed,
+            "questions_at_risk": 0,
+            "net_impact": max(q_fixed * 0.75, 1.0),
+            "asi": {
+                "failure_type": root_cause or "rca_forced_instruction",
+                "blame_set": terms,
+                "severity": "major",
+                "counterfactual_fixes": [],
+                "ambiguity_detected": False,
+            },
+            "rca_id": ",".join(str(x) for x in (_rca_execution.get("rca_ids") or [])),
+            "patch_family": ",".join(
+                str(x) for x in (_rca_execution.get("defect_keys") or [])
+            ),
+            "target_qids": affected_qs,
+            "_rca_grounding_terms": terms,
+            "provenance": {**provenance_base, "patch_type": patch_type},
+        }
 
     from mlflow.entities import SpanType as _SpanType
 
@@ -8196,7 +13559,9 @@ def generate_proposals_from_strategy(
                         "patch_type": "update_description",
                         "change_description": f"[{ag_id}] Update table {tbl} sections={list(tbl_sections.keys())}",
                         "proposed_value": "",
-                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "rationale": _per_target_rationale(
+                            tbl, list(tbl_sections.keys()),
+                        ),
                         "dual_persistence": DUAL_PERSIST_PATHS.get(target_lever, DUAL_PERSIST_PATHS[5]),
                         "confidence": 0.85,
                         "questions_fixed": q_fixed,
@@ -8231,7 +13596,9 @@ def generate_proposals_from_strategy(
                         "patch_type": "update_column_description",
                         "change_description": f"[{ag_id}] Update {tbl}.{col} sections={list(col_sections.keys())}",
                         "proposed_value": "",
-                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "rationale": _per_target_rationale(
+                            f"{tbl}.{col}", list(col_sections.keys()),
+                        ),
                         "dual_persistence": DUAL_PERSIST_PATHS.get(target_lever, DUAL_PERSIST_PATHS[5]),
                         "confidence": 0.85,
                         "questions_fixed": q_fixed,
@@ -8249,7 +13616,139 @@ def generate_proposals_from_strategy(
                         "column": col,
                         "column_sections": col_sections,
                         "column_entity_type": col_etype,
+                        "metric_view_columns": _select_metric_view_columns(
+                            col_entry, action_group,
+                        ),
                     })
+
+            if target_lever == 1 and ENABLE_RCA_LEVER1_BRIDGE:
+                _bridged_themes = _rca_themes_requesting_lever1(
+                    metadata_snapshot.get("_rca_themes") or [],
+                    target_qids=_rca_bridge_target_qids,
+                )
+                _l1_index: dict[tuple[str, str], dict] = {
+                    (
+                        str(p.get("table", "") or ""),
+                        str(p.get("column", "") or ""),
+                    ): p
+                    for p in proposals
+                    if p.get("patch_type") in _RCA_LEVER1_PATCH_TYPES
+                }
+                for _theme in _bridged_themes:
+                    _theme_patches = list(getattr(_theme, "patches", ()) or ())
+                    _l1_patches = [
+                        p for p in _theme_patches
+                        if isinstance(p, dict)
+                        and p.get("type") in _RCA_LEVER1_PATCH_TYPES
+                    ]
+                    if not _l1_patches:
+                        continue
+                    _theme_id = str(getattr(_theme, "rca_id", ag_id))
+                    _theme_qids = list(getattr(_theme, "target_qids", ()) or ())
+                    _theme_family = str(getattr(_theme, "patch_family", ""))
+                    _theme_kind = getattr(_theme, "rca_kind", None)
+                    _kind_value = (
+                        _theme_kind.value
+                        if hasattr(_theme_kind, "value")
+                        else str(_theme_kind or "unknown")
+                    )
+                    for _p in _l1_patches:
+                        try:
+                            _gen = _generate_lever1_rca_proposal(
+                                _theme, _p, metadata_snapshot,
+                                w=w, benchmarks=benchmarks,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[%s] Lever-1 RCA bridge failed for theme %s",
+                                ag_id, _theme_id, exc_info=True,
+                            )
+                            _gen = None
+                        if not _gen:
+                            continue
+                        _tbl = str(_gen.get("table") or "")
+                        _col = str(_gen.get("column") or "")
+                        _key = (_tbl, _col)
+                        if _key in _l1_index:
+                            existing = _l1_index[_key]
+                            existing_sections = existing.get(
+                                "column_sections", {},
+                            ) or {}
+                            new_synonyms = _gen.get("_rca_synonyms") or []
+                            if new_synonyms:
+                                merged = list(
+                                    existing_sections.get("synonyms") or []
+                                )
+                                for s in new_synonyms:
+                                    if s not in merged:
+                                        merged.append(s)
+                                existing_sections["synonyms"] = merged
+                                existing["column_sections"] = existing_sections
+                                _existing_prov = existing.setdefault(
+                                    "provenance", {},
+                                )
+                                _existing_prov.setdefault(
+                                    "rca_synonym_themes", [],
+                                ).append(_theme_id)
+                            continue
+                        _proposal = {
+                            "proposal_id": f"P{len(proposals) + 1:03d}",
+                            "cluster_id": _theme_id,
+                            "lever": 1,
+                            "scope": scope,
+                            "patch_type": _gen["patch_type"],
+                            "change_description": (
+                                f"[{ag_id}] RCA L1: "
+                                f"{_tbl}.{_col} ({_kind_value})"
+                                if _col else
+                                f"[{ag_id}] RCA L1: {_tbl} ({_kind_value})"
+                            ),
+                            "proposed_value": "",
+                            "rationale": (
+                                f"RCA-driven Lever-1 from theme {_theme_id} "
+                                f"(intent: {_p.get('intent', '')})"
+                            ),
+                            "table": _tbl,
+                            "column": _col,
+                            "column_sections": _gen.get("column_sections", {}),
+                            "column_entity_type": _gen.get(
+                                "column_entity_type", "",
+                            ),
+                            "table_sections": _gen.get("table_sections", {}),
+                            "table_entity_type": _gen.get(
+                                "table_entity_type", "",
+                            ),
+                            "dual_persistence": DUAL_PERSIST_PATHS.get(
+                                1, DUAL_PERSIST_PATHS[5],
+                            ),
+                            "confidence": 0.78,
+                            "questions_fixed": len(_theme_qids),
+                            "questions_at_risk": 0,
+                            "net_impact": max(len(_theme_qids) * 0.78, 1.0),
+                            "asi": {
+                                "failure_type": _kind_value,
+                                "blame_set": [_tbl, _col] if _col else [_tbl],
+                                "severity": "major",
+                                "counterfactual_fixes": [],
+                                "ambiguity_detected": False,
+                            },
+                            "rca_id": _theme_id,
+                            "patch_family": _theme_family,
+                            "target_qids": _theme_qids,
+                            "source": "rca_theme_lever1",
+                            "provenance": {
+                                **provenance_base,
+                                "patch_type": _gen["patch_type"],
+                                "synthesis_source": "rca_theme_lever1",
+                                "rca_id": _theme_id,
+                                "patch_family": _theme_family,
+                            },
+                            "metric_view_columns": _select_metric_view_columns(
+                                _p, _gen, action_group,
+                            ),
+                        }
+                        proposals.append(_proposal)
+                        _l1_index[_key] = _proposal
 
         # ── Lever 3: functions ───────────────────────────────────────────
         elif target_lever == 3:
@@ -8267,7 +13766,9 @@ def generate_proposals_from_strategy(
                         "patch_type": "update_function_description",
                         "change_description": f"[{ag_id}] Update function {fn_name} sections={list(fn_sections.keys())}",
                         "proposed_value": "",
-                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "rationale": _per_target_rationale(
+                            fn_name, list(fn_sections.keys()),
+                        ),
                         "dual_persistence": DUAL_PERSIST_PATHS.get(3, DUAL_PERSIST_PATHS[5]),
                         "confidence": 0.85,
                         "questions_fixed": q_fixed,
@@ -8332,7 +13833,10 @@ def generate_proposals_from_strategy(
                         "patch_type": "add_join_spec",
                         "change_description": f"[{ag_id}] Join: {left_table} ↔ {right_table}",
                         "proposed_value": "",
-                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "rationale": _per_target_rationale(
+                            f"{left_table} <-> {right_table}",
+                            extra="add_join_spec",
+                        ),
                         "join_spec": join_spec,
                         "dual_persistence": DUAL_PERSIST_PATHS.get(4, DUAL_PERSIST_PATHS[5]),
                         "confidence": 0.8,
@@ -8451,9 +13955,117 @@ def generate_proposals_from_strategy(
                         },
                     })
 
+            if ENABLE_RCA_JOIN_SPEC_BRIDGE:
+                _bridged_themes = _rca_themes_requesting_join_specs(
+                    metadata_snapshot.get("_rca_themes") or [],
+                    target_qids=_rca_bridge_target_qids,
+                )
+                for _theme in _bridged_themes:
+                    _theme_patches = list(getattr(_theme, "patches", ()) or ())
+                    _join_patches = [
+                        p for p in _theme_patches
+                        if isinstance(p, dict) and p.get("type") == "add_join_spec"
+                    ]
+                    if not _join_patches:
+                        continue
+                    _theme_id = str(getattr(_theme, "rca_id", ag_id))
+                    _theme_qids = list(getattr(_theme, "target_qids", ()) or ())
+                    _theme_family = str(getattr(_theme, "patch_family", ""))
+                    for _p in _join_patches:
+                        _expected_objects = [
+                            str(o).strip()
+                            for o in (_p.get("expected_objects") or [])
+                            if str(o).strip() and "." in str(o)
+                        ]
+                        if len(_expected_objects) < 2:
+                            logger.debug(
+                                "[%s] RCA join bridge: theme %s has %d qualified "
+                                "expected_objects (need 2); skipping",
+                                ag_id, _theme_id, len(_expected_objects),
+                            )
+                            continue
+                        _left_obj, _right_obj = _expected_objects[0], _expected_objects[1]
+                        _left_table, _left_col = _left_obj.rsplit(".", 1)
+                        _right_table, _right_col = _right_obj.rsplit(".", 1)
+                        if _left_table == _right_table:
+                            logger.debug(
+                                "[%s] RCA join bridge: same-table pair %s; skipping",
+                                ag_id, _left_table,
+                            )
+                            continue
+                        _pair = tuple(sorted((_left_table, _right_table)))
+                        if _pair in _proposed_pairs:
+                            logger.info(
+                                "[%s] RCA join bridge: pair %s already proposed; skipping",
+                                ag_id, _pair,
+                            )
+                            continue
+                        _condition = f"{_left_obj} = {_right_obj}"
+                        _sanitized = _sanitize_join_sql(_condition)
+                        _join_spec = ensure_join_spec_fields({
+                            "left": {"identifier": _left_table},
+                            "right": {"identifier": _right_table},
+                            "sql": [_sanitized] if _sanitized else [],
+                        }, config=metadata_snapshot)
+                        _valid, _reason = validate_join_spec_types(
+                            _join_spec, metadata_snapshot,
+                        )
+                        if not _valid:
+                            logger.info(
+                                "[%s] RCA join bridge rejected (type): %s",
+                                ag_id, _reason,
+                            )
+                            continue
+                        proposals.append({
+                            "proposal_id": f"P{len(proposals) + 1:03d}",
+                            "cluster_id": _theme_id,
+                            "lever": 4,
+                            "scope": "genie_config",
+                            "patch_type": "add_join_spec",
+                            "change_description": (
+                                f"[{ag_id}] RCA join: {_left_table} ↔ {_right_table}"
+                            ),
+                            "proposed_value": "",
+                            "rationale": (
+                                f"RCA-driven join from theme {_theme_id} "
+                                f"({_p.get('intent', 'derived from expected_sql')})"
+                            ),
+                            "join_spec": _join_spec,
+                            "dual_persistence": DUAL_PERSIST_PATHS.get(
+                                4, DUAL_PERSIST_PATHS[5],
+                            ),
+                            "confidence": 0.78,
+                            "questions_fixed": len(_theme_qids),
+                            "questions_at_risk": 0,
+                            "net_impact": max(len(_theme_qids) * 0.78, 1.0),
+                            "asi": {
+                                "failure_type": "missing_join_spec",
+                                "blame_set": [_left_table, _right_table],
+                                "severity": "major",
+                                "counterfactual_fixes": [],
+                                "ambiguity_detected": False,
+                            },
+                            "rca_id": _theme_id,
+                            "patch_family": _theme_family,
+                            "target_qids": _theme_qids,
+                            "source": "rca_theme_lever4",
+                            "provenance": {
+                                **provenance_base,
+                                "patch_type": "add_join_spec",
+                                "synthesis_source": "rca_theme_lever4",
+                                "rca_id": _theme_id,
+                                "patch_family": _theme_family,
+                            },
+                        })
+                        _proposed_pairs.add(_pair)
+
         # ── Lever 5: instructions + example SQL ──────────────────────────
         elif target_lever == 5:
             l5_dir = lever_dir or {}
+            if not lever_dir:
+                bridge = _rca_forced_instruction_proposal()
+                if bridge:
+                    proposals.append(bridge)
             instruction_sections = l5_dir.get("instruction_sections")
             instruction_guidance = (l5_dir.get("instruction_guidance") or "").strip()
 
@@ -8464,6 +14076,80 @@ def generate_proposals_from_strategy(
                     example_sqls_list = [legacy]
             if not isinstance(example_sqls_list, list):
                 example_sqls_list = [example_sqls_list] if isinstance(example_sqls_list, dict) else []
+
+            # ── Phase A3a: Lever 5 structural gate ──────────────────────
+            # For clusters whose dominant root cause is SQL-shape
+            # (missing_filter, wrong_aggregation, wrong_join, etc.), a
+            # text-only instruction is a weak signal. Require an
+            # example_sql; otherwise drop the instruction path entirely
+            # and let the example_sqls_list path (cluster-driven
+            # synthesis) carry the fix. This prevents Q004-class
+            # mis-diagnoses where the strategist's counterfactual came
+            # from the NL-text judge but the failure is structural.
+            _ag_structural_root_causes: set[str] = set()
+            _failure_clusters = (
+                metadata_snapshot.get("_failure_clusters")
+                or metadata_snapshot.get("failure_clusters")
+                or []
+            )
+            _cluster_by_id = {
+                c.get("cluster_id"): c
+                for c in _failure_clusters if isinstance(c, dict)
+            }
+            for _sid in source_clusters:
+                _c = _cluster_by_id.get(_sid)
+                if not isinstance(_c, dict):
+                    continue
+                _rc = (
+                    _c.get("asi_failure_type")
+                    or _c.get("root_cause")
+                    or ""
+                )
+                if _rc in _SQL_SHAPE_ROOT_CAUSES:
+                    _ag_structural_root_causes.add(_rc)
+
+            _l5_structural_gate_blocked = bool(
+                _ag_structural_root_causes and not example_sqls_list
+            )
+            if _l5_structural_gate_blocked:
+                _incr_bug4_counter("lever5_text_only_blocked")
+                # Cycle 8 Bug 1 Phase 3b Task B: capture the drop on a
+                # side-channel ledger so the harness can build a typed
+                # GATE_DECISION DecisionRecord for the operator
+                # transcript. The instruction silencing below remains
+                # the active behaviour; this is observability only.
+                _LEVER5_GATE_DROPS.append({
+                    "ag_id": str(ag_id),
+                    "source_clusters": tuple(str(s) for s in source_clusters),
+                    "root_causes": tuple(sorted(_ag_structural_root_causes)),
+                    "target_lever": 5,
+                    "had_example_sqls": bool(example_sqls_list),
+                    "instruction_sections_dropped": (
+                        isinstance(instruction_sections, dict)
+                        and bool(instruction_sections)
+                    ),
+                    "instruction_guidance_dropped": bool(instruction_guidance),
+                })
+                logger.warning(
+                    "[%s] Lever 5 structural gate: dropping instruction-only "
+                    "proposal. Dominant cluster root cause(s) %s are SQL-shape; "
+                    "no example_sql attached. Expected structural fix via "
+                    "cluster-driven synthesis or a different lever.",
+                    ag_id, sorted(_ag_structural_root_causes),
+                )
+                instruction_sections = None
+                instruction_guidance = ""
+
+            # Computed once for the whole Lever 5 block so both the
+            # instruction_sections branch and the instruction_guidance
+            # branch can reference it. Previously assigned only inside
+            # the if-branch, which made the elif raise UnboundLocalError
+            # whenever the strategist emitted free-form instruction
+            # guidance with no structured sections.
+            invoked_levers = {
+                int(k) for k in action_group.get("lever_directives", {}).keys()
+                if str(k).isdigit()
+            }
 
             if isinstance(instruction_sections, dict) and instruction_sections:
                 from genie_space_optimizer.optimization.applier import _get_general_instructions
@@ -8476,25 +14162,67 @@ def generate_proposals_from_strategy(
                         k: v for k, v in instruction_sections.items() if k in valid_keys
                     }
 
-                # --- Task 4: section ownership enforcement ---
+                # --- Task 4 / Tier 2.7: section ownership enforcement ---
+                # Before folding unauthorised sections into CONSTRAINTS,
+                # check whether another invoked lever in this AG owns the
+                # section via LEVER_TO_SECTIONS. If so, stash the section
+                # on the AG as ``_pending_section_routing`` so the other
+                # lever's proposal generator can pick it up. If no
+                # invoked lever owns it, DROP the section rather than
+                # polluting CONSTRAINTS with semantically-different
+                # content (JOIN GUIDANCE, TEMPORAL FILTERS, etc.). This
+                # fixes the observed AG2 collapse where both JOIN
+                # GUIDANCE (Lever 4) and TEMPORAL FILTERS (Lever 2) were
+                # dumped into Lever 5's CONSTRAINTS.
                 allowed_sections = set(LEVER_TO_SECTIONS.get(target_lever, []))
                 if allowed_sections:
                     unauthorized = {
                         k for k in instruction_sections if k not in allowed_sections
                     }
                     if unauthorized:
-                        logger.warning(
-                            "Lever %d attempted to write instruction sections %s "
-                            "(allowed: %s) — folding into CONSTRAINTS",
-                            target_lever, sorted(unauthorized), sorted(allowed_sections),
-                        )
+                        _rerouted: dict[int, dict[str, str]] = {}
+                        _dropped: list[str] = []
                         for k in sorted(unauthorized):
                             val = instruction_sections.pop(k, "")
-                            if val:
-                                existing_c = instruction_sections.get("CONSTRAINTS", "")
-                                instruction_sections["CONSTRAINTS"] = (
-                                    (existing_c + "\n" + val).strip() if existing_c else val
-                                )
+                            if not val:
+                                continue
+                            # Find another invoked lever that owns this section.
+                            _owner_lever = None
+                            for _lv in sorted(invoked_levers):
+                                if _lv == target_lever:
+                                    continue
+                                if k in set(LEVER_TO_SECTIONS.get(_lv, [])):
+                                    _owner_lever = _lv
+                                    break
+                            if _owner_lever is not None:
+                                _rerouted.setdefault(_owner_lever, {})[k] = val
+                            else:
+                                _dropped.append(k)
+
+                        if _rerouted:
+                            # Stash on action_group so the owning lever's
+                            # proposal generator can pick it up in the
+                            # same iteration. Keyed by lever int.
+                            _pending = action_group.setdefault(
+                                "_pending_section_routing", {}
+                            )
+                            for _lv, _secs in _rerouted.items():
+                                _pending.setdefault(_lv, {}).update(_secs)
+                            logger.warning(
+                                "Lever %d: re-routed %d section(s) to invoked "
+                                "owner lever(s): %s",
+                                target_lever,
+                                sum(len(v) for v in _rerouted.values()),
+                                {lv: sorted(secs.keys()) for lv, secs in _rerouted.items()},
+                            )
+                        if _dropped:
+                            logger.warning(
+                                "Lever %d: dropping %d unauthorised section(s) "
+                                "with no invoked owner: %s (LEVER_TO_SECTIONS "
+                                "maps to levers not in this AG; deferred to a "
+                                "future iteration that invokes those levers)",
+                                target_lever, len(_dropped), sorted(_dropped),
+                            )
 
                 # --- Contradiction check against user-authored instructions ---
                 _orig_sections = metadata_snapshot.get("_original_instruction_sections")
@@ -8602,7 +14330,10 @@ def generate_proposals_from_strategy(
                     "change_description": f"[{ag_id}] Instruction rewrite ({len(merged_text)} chars)",
                     "proposed_value": merged_text,
                     "old_value": current_instructions,
-                    "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                    "rationale": _per_target_rationale(
+                        "general_instructions",
+                        extra=f"rewrite_instruction ({len(merged_text)} chars)",
+                    ),
                     "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
                     "confidence": 0.85,
                     "questions_fixed": q_fixed,
@@ -8616,6 +14347,7 @@ def generate_proposals_from_strategy(
                         "ambiguity_detected": False,
                     },
                     "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
+                    "invoked_levers": sorted(invoked_levers),
                 })
 
             elif instruction_guidance:
@@ -8662,7 +14394,10 @@ def generate_proposals_from_strategy(
                     "change_description": f"[{ag_id}] Instruction rewrite ({len(merged_text)} chars)",
                     "proposed_value": merged_text,
                     "old_value": current_instructions,
-                    "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                    "rationale": _per_target_rationale(
+                        "general_instructions",
+                        extra=f"instruction_guidance ({len(merged_text)} chars)",
+                    ),
                     "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
                     "confidence": 0.85,
                     "questions_fixed": q_fixed,
@@ -8676,49 +14411,355 @@ def generate_proposals_from_strategy(
                         "ambiguity_detected": False,
                     },
                     "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
+                    "invoked_levers": sorted(invoked_levers),
                 })
+
+            # ── Lever 5 example_sql — cluster-driven synthesis intercept ──
+            # Bug #4 Phase 3. When the feature flag is ON (default),
+            # each strategist-emitted example_sql request becomes a
+            # synthesis attempt driven by the AFS of the action group's
+            # source cluster. The strategist's (question, sql_sketch)
+            # tuple is discarded — those fields were generated from a
+            # prompt that saw raw benchmark text and are therefore
+            # leak-risky. Synthesis uses AFS only (leak-free by
+            # construction).
+            #
+            # When the flag is OFF, the legacy verbatim path runs —
+            # reserved for emergency rollback.
+            #
+            # Invariants (see cluster_driven_synthesis module docstring):
+            #   A. We return proposals here; we do NOT apply directly.
+            #   B. space_id is read from metadata_snapshot["_space_id"].
+            #   C. Budget counter is shared across AGs via
+            #      metadata_snapshot["_cluster_synthesis_count"].
+            #   D. Missing-join-spec fallback handled inside the
+            #      cluster-driven module.
+            from genie_space_optimizer.common.config import (
+                ENABLE_CLUSTER_DRIVEN_SYNTHESIS,
+            )
 
             for ex_idx, example_sql_dir in enumerate(example_sqls_list):
                 if not isinstance(example_sql_dir, dict):
                     continue
-                eq = (example_sql_dir.get("question") or "").strip()
-                es = (example_sql_dir.get("sql_sketch") or "").strip()
-                if eq and es:
+
+                if not ENABLE_CLUSTER_DRIVEN_SYNTHESIS:
+                    # Legacy path preserved behind kill-switch. Unchanged
+                    # shape from before the Bug #4 Phase 3 intercept.
+                    eq = (example_sql_dir.get("question") or "").strip()
+                    es = (example_sql_dir.get("sql_sketch") or "").strip()
+                    if eq and es:
+                        proposals.append({
+                            "proposal_id": f"P{len(proposals) + 1:03d}",
+                            "cluster_id": f"{ag_id}_EX{ex_idx + 1}",
+                            "lever": 5,
+                            "scope": "genie_config",
+                            "patch_type": "add_example_sql",
+                            "change_description": f"[{ag_id}] Example SQL {ex_idx + 1}: {eq[:80]}",
+                            "proposed_value": eq,
+                            "example_question": eq,
+                            "example_sql": es,
+                            "parameters": example_sql_dir.get("parameters", []),
+                            "usage_guidance": example_sql_dir.get("usage_guidance", ""),
+                            "rationale": _per_target_rationale(
+                                f"example_sql_{ex_idx + 1}",
+                                extra=eq[:120],
+                            ),
+                            "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                            "confidence": 0.8,
+                            "questions_fixed": 1,
+                            "questions_at_risk": 0,
+                            "net_impact": 0.8,
+                            "asi": {
+                                "failure_type": "asset_routing_error",
+                                "blame_set": source_clusters,
+                                "severity": "major",
+                                "counterfactual_fixes": [],
+                                "ambiguity_detected": False,
+                            },
+                            "provenance": {**provenance_base, "patch_type": "add_example_sql"},
+                        })
+                    continue
+
+                # Cluster-driven path: discard strategist's fields,
+                # synthesize fresh via AFS engine.
+                from genie_space_optimizer.optimization.cluster_driven_synthesis import (
+                    run_cluster_driven_synthesis_for_single_cluster,
+                )
+                from genie_space_optimizer.optimization.afs import format_afs
+                from genie_space_optimizer.optimization.synthesis import (
+                    instruction_only_fallback,
+                )
+
+                source_cluster = _resolve_source_cluster_for_ag(
+                    action_group, metadata_snapshot,
+                )
+                if source_cluster is None:
+                    # No archetype-eligible source cluster — nothing to
+                    # synthesize. Skip silently; strategist's intent is
+                    # already represented elsewhere in the AG (e.g. text
+                    # instruction sections).
+                    logger.info(
+                        "cluster-driven: AG %s has no archetype-eligible "
+                        "source cluster — skipping example_sql %d",
+                        ag_id, ex_idx + 1,
+                    )
+                    continue
+
+                # P3 task 1: synthesis driver returns a typed
+                # ClusterSynthesisResult instead of dict-or-None;
+                # read .proposal to preserve the legacy dict-or-None
+                # contract at this call site.
+                _synth_result = run_cluster_driven_synthesis_for_single_cluster(
+                    source_cluster,
+                    metadata_snapshot,
+                    benchmarks=benchmarks,
+                    catalog=catalog, gold_schema=gold_schema,
+                    warehouse_id=warehouse_id,
+                    w=w, spark=spark,
+                )
+                synth_proposal = _synth_result.proposal
+
+                if synth_proposal is None:
+                    # Synthesis or a gate rejected. Fall back to
+                    # deterministic instruction-only proposal — safe
+                    # under the firewall because it references only AFS
+                    # summary fields.
+                    fallback = instruction_only_fallback(
+                        format_afs(source_cluster),
+                    )
+                    if fallback is None:
+                        continue
                     proposals.append({
                         "proposal_id": f"P{len(proposals) + 1:03d}",
                         "cluster_id": f"{ag_id}_EX{ex_idx + 1}",
                         "lever": 5,
                         "scope": "genie_config",
-                        "patch_type": "add_example_sql",
-                        "change_description": f"[{ag_id}] Example SQL {ex_idx + 1}: {eq[:80]}",
-                        "proposed_value": eq,
-                        "example_question": eq,
-                        "example_sql": es,
-                        "parameters": example_sql_dir.get("parameters", []),
-                        "usage_guidance": example_sql_dir.get("usage_guidance", ""),
-                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "patch_type": "add_instruction",
+                        "change_description": (
+                            f"[{ag_id}] Instruction-only fallback "
+                            "(cluster-driven synthesis declined)"
+                        ),
+                        "proposed_value": str(fallback.get("new_text", "")),
+                        "new_text": str(fallback.get("new_text", "")),
+                        "rationale": (
+                            f"Cluster-driven synthesis for cluster "
+                            f"{source_cluster.get('cluster_id', '?')} failed; "
+                            "applying deterministic instruction fallback. "
+                            f"Root cause: {root_cause}"
+                        ),
                         "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
-                        "confidence": 0.8,
+                        "confidence": 0.6,
                         "questions_fixed": 1,
                         "questions_at_risk": 0,
-                        "net_impact": 0.8,
+                        "net_impact": 0.5,
                         "asi": {
                             "failure_type": "asset_routing_error",
                             "blame_set": source_clusters,
-                            "severity": "major",
+                            "severity": "minor",
                             "counterfactual_fixes": [],
                             "ambiguity_detected": False,
                         },
-                        "provenance": {**provenance_base, "patch_type": "add_example_sql"},
+                        "provenance": {
+                            **provenance_base,
+                            "patch_type": "add_instruction",
+                            "synthesis_source": "cluster_driven_fallback",
+                        },
                     })
+                    continue
+
+                # Synthesis succeeded — shape Lever 5 proposal.
+                proposals.append({
+                    "proposal_id": f"P{len(proposals) + 1:03d}",
+                    "cluster_id": f"{ag_id}_EX{ex_idx + 1}",
+                    "lever": 5,
+                    "scope": "genie_config",
+                    "patch_type": "add_example_sql",
+                    "change_description": (
+                        f"[{ag_id}] Synthesized example SQL: "
+                        f"{synth_proposal['example_question'][:80]}"
+                    ),
+                    "proposed_value": synth_proposal["example_question"],
+                    "example_question": synth_proposal["example_question"],
+                    "example_sql": synth_proposal["example_sql"],
+                    "parameters": synth_proposal.get("parameters", []) or [],
+                    "usage_guidance": synth_proposal.get("usage_guidance", ""),
+                    "rationale": (
+                        f"Cluster-driven synthesis "
+                        f"(archetype={synth_proposal.get('_archetype_name', '?')}). "
+                        f"Root cause: {root_cause}. {coordination_notes}"
+                    ),
+                    "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                    "confidence": 0.85,
+                    "questions_fixed": 1,
+                    "questions_at_risk": 0,
+                    "net_impact": 0.85,
+                    "asi": {
+                        "failure_type": "asset_routing_error",
+                        "blame_set": source_clusters,
+                        "severity": "major",
+                        "counterfactual_fixes": [],
+                        "ambiguity_detected": False,
+                    },
+                    "kit_id": synth_proposal.get("kit_id", ""),
+                    "target_qids": synth_proposal.get("target_qids", []),
+                    "rca_id": synth_proposal.get("rca_id", ""),
+                    "provenance": {
+                        **provenance_base,
+                        "patch_type": "add_example_sql",
+                        "synthesis_source": "cluster_driven",
+                        "archetype": synth_proposal.get("_archetype_name", ""),
+                        "source_cluster_id": synth_proposal.get(
+                            "_cluster_id",
+                            source_cluster.get("cluster_id", ""),
+                        ),
+                        "kit_id": synth_proposal.get("kit_id", ""),
+                        "target_qids": synth_proposal.get("target_qids", []),
+                        "rca_id": synth_proposal.get("rca_id", ""),
+                    },
+                })
+
+                _append_teaching_kit_support_proposals(
+                    proposals,
+                    synth_proposal=synth_proposal,
+                    provenance_base=provenance_base,
+                    ag_id=ag_id,
+                    source_cluster_id=synth_proposal.get(
+                        "_cluster_id",
+                        source_cluster.get("cluster_id", ""),
+                    ),
+                )
+
+            if ENABLE_RCA_EXAMPLE_SQL_SYNTHESIS:
+                try:
+                    from genie_space_optimizer.optimization.cluster_driven_synthesis import (
+                        run_cluster_driven_synthesis_for_single_cluster,
+                    )
+
+                    for _theme in _rca_themes_requesting_synthesis(
+                        metadata_snapshot.get("_rca_themes") or [],
+                        target_qids=_rca_bridge_target_qids,
+                    ):
+                        _cluster = _cluster_from_rca_example_theme(_theme)
+                        # P3 task 1: read .proposal from the typed
+                        # ClusterSynthesisResult to preserve legacy
+                        # dict-or-None semantics at this call site.
+                        _synth_result_rca = run_cluster_driven_synthesis_for_single_cluster(
+                            _cluster,
+                            metadata_snapshot,
+                            benchmarks=benchmarks,
+                            catalog=catalog,
+                            gold_schema=gold_schema,
+                            warehouse_id=warehouse_id,
+                            w=w,
+                            spark=spark,
+                        )
+                        _proposal = _synth_result_rca.proposal
+                        if not _proposal:
+                            continue
+                        _proposal["source"] = "rca_teaching_kit"
+                        _proposal.setdefault(
+                            "rca_id", str(getattr(_theme, "rca_id", "")),
+                        )
+                        _proposal.setdefault(
+                            "target_qids",
+                            list(getattr(_theme, "target_qids", ()) or ()),
+                        )
+                        _proposal.setdefault(
+                            "provenance",
+                            {
+                                **provenance_base,
+                                "patch_type": "add_example_sql",
+                                "synthesis_source": "rca_teaching_kit",
+                                "rca_id": _proposal.get("rca_id", ""),
+                                "kit_id": _proposal.get("kit_id", ""),
+                            },
+                        )
+                        _proposal.setdefault(
+                            "proposal_id",
+                            f"P{len(proposals) + 1:03d}",
+                        )
+                        _proposal.setdefault("cluster_id", ag_id)
+                        _proposal.setdefault("lever", 5)
+                        _proposal.setdefault("scope", "genie_config")
+                        _proposal.setdefault(
+                            "change_description",
+                            f"[{ag_id}] RCA synthesized example SQL",
+                        )
+                        _proposal.setdefault(
+                            "dual_persistence",
+                            DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                        )
+                        proposals.append(_proposal)
+
+                        _append_teaching_kit_support_proposals(
+                            proposals,
+                            synth_proposal=_proposal,
+                            provenance_base=provenance_base,
+                            ag_id=ag_id,
+                            source_cluster_id=_proposal.get("_cluster_id", ""),
+                        )
+                except Exception:
+                    logger.debug("RCA example SQL synthesis failed", exc_info=True)
 
         # ── Lever 6: SQL Expressions ─────────────────────────────────────
         elif target_lever == 6:
             ag_directives = action_group.get("lever_directives", {}).get("6", {})
             strategist_hints = ag_directives.get("sql_expressions", []) if isinstance(ag_directives, dict) else []
 
+            structural_candidates = [
+                c for c in (action_group.get("_lever6_structural_candidates") or [])
+                if isinstance(c, dict)
+            ]
+            target_qids = tuple(
+                str(q)
+                for q in (action_group.get("affected_questions") or [])
+                if str(q)
+            )
+            for candidate in structural_candidates:
+                proposal = _proposal_from_structural_sql_candidate(
+                    candidate,
+                    metadata_snapshot=metadata_snapshot,
+                    cluster_id=ag_id,
+                    target_qids=target_qids,
+                    spark=spark,
+                    catalog=catalog,
+                    gold_schema=gold_schema,
+                    w=w,
+                    warehouse_id=warehouse_id,
+                    benchmarks=benchmarks,
+                )
+                if proposal:
+                    proposal["proposal_id"] = f"P{len(proposals) + 1:03d}"
+                    proposal["scope"] = "genie_config"
+                    proposal["change_description"] = (
+                        f"[{ag_id}] RCA failed-row SQL Expression: "
+                        f"{proposal.get('display_name', 'unnamed')} "
+                        f"({proposal.get('snippet_type', '?')})"
+                    )
+                    proposal["proposed_value"] = proposal.get("sql", "")
+                    proposal["dual_persistence"] = DUAL_PERSIST_PATHS.get(
+                        6,
+                        DUAL_PERSIST_PATHS[5],
+                    )
+                    proposal["questions_at_risk"] = 0
+                    proposal["net_impact"] = max(
+                        proposal.get("questions_fixed", 0) * 0.7,
+                        1.0,
+                    )
+                    proposal["provenance"] = {
+                        **provenance_base,
+                        "patch_type": proposal["patch_type"],
+                        "synthesis_source": "rca_failed_question_sql",
+                        "source_question_id": proposal.get("source_question_id", ""),
+                    }
+                    proposals.append(proposal)
+
             source_cids = set(action_group.get("source_cluster_ids", []))
-            all_clusters = metadata_snapshot.get("failure_clusters", [])
+            all_clusters = (
+                metadata_snapshot.get("_failure_clusters")
+                or metadata_snapshot.get("failure_clusters")
+                or []
+            )
             eligible_clusters = [
                 c for c in all_clusters
                 if c.get("cluster_id") in source_cids
@@ -8734,6 +14775,7 @@ def generate_proposals_from_strategy(
                     strategist_hints=strategist_hints,
                     w=w, spark=spark, catalog=catalog,
                     gold_schema=gold_schema, warehouse_id=warehouse_id,
+                    benchmarks=benchmarks,
                 )
                 if proposal:
                     proposal["proposal_id"] = f"P{len(proposals) + 1:03d}"
@@ -8757,6 +14799,113 @@ def generate_proposals_from_strategy(
                     }
                     proposal["provenance"] = {**provenance_base, "patch_type": proposal["patch_type"]}
                     proposals.append(proposal)
+
+            if ENABLE_RCA_SQL_SNIPPET_BRIDGE:
+                _bridged_themes = _rca_themes_requesting_sql_snippets(
+                    metadata_snapshot.get("_rca_themes") or [],
+                    target_qids=_rca_bridge_target_qids,
+                )
+                for _theme in _bridged_themes:
+                    _theme_patches = list(getattr(_theme, "patches", ()) or ())
+                    _snippet_patches = [
+                        p for p in _theme_patches
+                        if isinstance(p, dict)
+                        and p.get("type") in _RCA_SQL_SNIPPET_PATCH_TYPES
+                    ]
+                    if not _snippet_patches:
+                        continue
+                    _theme_kind = getattr(_theme, "rca_kind", None)
+                    _kind_value = (
+                        _theme_kind.value
+                        if hasattr(_theme_kind, "value")
+                        else str(_theme_kind or "unknown")
+                    )
+                    _theme_qids = list(getattr(_theme, "target_qids", ()) or ())
+                    _theme_touched = list(
+                        getattr(_theme, "touched_objects", ()) or ()
+                    )
+                    _synthetic_cluster = {
+                        "cluster_id": str(getattr(_theme, "rca_id", ag_id)),
+                        "root_cause": _kind_value,
+                        "asi_failure_type": _kind_value,
+                        "question_traces": _theme_qids,
+                        "question_ids": _theme_qids,
+                        "asi_blame_set": _theme_touched,
+                    }
+                    _hints: list[dict] = []
+                    for _p in _snippet_patches:
+                        _target_obj = str(_p.get("target_object") or "")
+                        _target_table = ""
+                        if "." in _target_obj:
+                            _parts = _target_obj.split(".")
+                            if len(_parts) >= 2:
+                                _target_table = _parts[-2]
+                        _hints.append({
+                            "snippet_type": str(_p.get("snippet_type") or ""),
+                            "target_table": _target_table,
+                            "target_object": _target_obj,
+                            "intent": _p.get("intent") or "",
+                            "expected_objects": _p.get("expected_objects") or [],
+                            "rca_kind": _kind_value,
+                            "affected_questions": _theme_qids,
+                        })
+                    try:
+                        _proposal = _generate_lever6_proposal(
+                            _synthetic_cluster, metadata_snapshot,
+                            strategist_hints=_hints,
+                            w=w, spark=spark, catalog=catalog,
+                            gold_schema=gold_schema, warehouse_id=warehouse_id,
+                            benchmarks=benchmarks,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "RCA SQL snippet bridge failed for theme %s",
+                            getattr(_theme, "rca_id", "?"), exc_info=True,
+                        )
+                        _proposal = None
+                    if not _proposal:
+                        continue
+                    _proposal["proposal_id"] = f"P{len(proposals) + 1:03d}"
+                    _proposal["cluster_id"] = _synthetic_cluster["cluster_id"]
+                    _proposal["scope"] = "genie_config"
+                    _proposal["change_description"] = (
+                        f"[{ag_id}] RCA SQL Expression: "
+                        f"{_proposal.get('display_name', 'unnamed')} "
+                        f"({_proposal.get('snippet_type', '?')})"
+                    )
+                    _proposal["proposed_value"] = _proposal.get("sql", "")
+                    _proposal["rationale"] = (
+                        _proposal.get("rationale")
+                        or f"RCA-driven snippet for {_kind_value}"
+                    )
+                    _proposal["dual_persistence"] = DUAL_PERSIST_PATHS.get(
+                        6, DUAL_PERSIST_PATHS[5],
+                    )
+                    _proposal["questions_at_risk"] = 0
+                    _proposal["net_impact"] = max(
+                        _proposal.get("questions_fixed", 0) * 0.7, 1.0,
+                    )
+                    _proposal["asi"] = {
+                        "failure_type": _kind_value,
+                        "blame_set": _theme_touched,
+                        "severity": "major",
+                        "counterfactual_fixes": [],
+                        "ambiguity_detected": False,
+                    }
+                    _proposal["rca_id"] = str(getattr(_theme, "rca_id", ""))
+                    _proposal["patch_family"] = str(
+                        getattr(_theme, "patch_family", "")
+                    )
+                    _proposal["target_qids"] = _theme_qids
+                    _proposal["source"] = "rca_theme_lever6"
+                    _proposal["provenance"] = {
+                        **provenance_base,
+                        "patch_type": _proposal["patch_type"],
+                        "synthesis_source": "rca_theme_lever6",
+                        "rca_id": _proposal["rca_id"],
+                        "patch_family": _proposal["patch_family"],
+                    }
+                    proposals.append(_proposal)
 
         # ── Example SQL from any lever ────────────────────────────────────
         # Preserve the originating lever so patches are attributed correctly
@@ -8807,10 +14956,31 @@ def generate_proposals_from_strategy(
             proposals, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=gold_schema,
             w=w, warehouse_id=warehouse_id,
+            benchmarks=benchmarks,
         )
         proposals = _deduplicate_proposals(proposals)
         proposals = _filter_no_op_proposals(proposals, metadata_snapshot)
         proposals.sort(key=lambda p: p.get("net_impact", 0), reverse=True)
+
+        # Cycle 8 Bug 1 Phase 2 — stamp ``target_qids`` on every proposal
+        # before it leaves this function. Standard L1-L4 paths build
+        # proposal dicts without ``target_qids``; ``_backfill_patch_causal_metadata``
+        # later defaults them to ``ag.affected_questions`` on the patch side
+        # (harness.py:6663-6668), but anywhere downstream that reads
+        # ``proposal.target_qids`` between proposal-emit and patch-backfill
+        # (a 600-line gap, including the replay-fixture snapshot) used to
+        # see ``[]``. The RCA-bridge / cluster-driven / RCA-forced L5 paths
+        # already stamp explicit narrower ``target_qids`` (often via
+        # ``_theme_qids``); the defaulting below preserves those narrower
+        # values and only fills in for the standard-lever proposals.
+        _ag_default_target_qids = [str(q) for q in (affected_qs or []) if q]
+        if _ag_default_target_qids:
+            for _proposal in proposals:
+                _existing = _proposal.get("target_qids") or _proposal.get(
+                    "_grounding_target_qids"
+                ) or []
+                if not [q for q in _existing if q]:
+                    _proposal["target_qids"] = list(_ag_default_target_qids)
 
         span.set_outputs({
             "proposal_count": len(proposals),
@@ -8822,7 +14992,11 @@ def generate_proposals_from_strategy(
             ag_id, target_lever, len(proposals),
         )
 
-    return proposals
+    return _prune_doa_fingerprints(
+        proposals,
+        buffer=doa_fingerprint_buffer,
+        ag_id=str(ag_id),
+    )
 
 
 def generate_metadata_proposals(
@@ -8995,20 +15169,15 @@ def generate_metadata_proposals(
                 },
             })
 
-        if benchmarks:
-            mined = _mine_benchmark_example_sqls(
-                benchmarks, metadata_snapshot,
-                spark=spark, catalog=catalog, gold_schema=gold_schema,
-                w=w, warehouse_id=warehouse_id,
-            )
-            if mined:
-                logger.info("Benchmark mining added %d example SQL proposals", len(mined))
-                proposals.extend(mined)
+        # Bug #4 — verbatim benchmark mining removed from Lever 5 proposal
+        # generation. Example SQLs come exclusively from AFS-gated structural
+        # synthesis (Phase 3), not from copying benchmark expected_sql.
 
         proposals = _validate_lever5_proposals(
             proposals, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=gold_schema,
             w=w, warehouse_id=warehouse_id,
+            benchmarks=benchmarks,
         )
         _pre_dedup_p = len(proposals)
         proposals = _deduplicate_proposals(proposals)
@@ -9021,7 +15190,14 @@ def generate_metadata_proposals(
         return proposals
 
     # ── Standard per-cluster path (levers 1-4) ───────────────────────
-    _MAX_CLUSTERS_PER_LEVER = 3
+    # Phase 1.3: ``_MAX_CLUSTERS_PER_LEVER`` was a hard cap of 3, which
+    # silently dropped a 4th cluster even when each cluster had a
+    # distinct root_cause and deserved its own proposal (observed in
+    # iter-1 log: H001 ``wrong_measure`` was dropped because H002/H003/H004
+    # also mapped to Lever 1).  Lift the floor to the number of distinct
+    # root_causes among eligible clusters so every distinct failure mode
+    # gets at least one proposal slot.
+    _MIN_CLUSTER_BUDGET = 3
     eligible_clusters: list[tuple[dict, int]] = []
     for cluster in clusters:
         natural_lever = _map_to_lever(
@@ -9036,12 +15212,37 @@ def generate_metadata_proposals(
         eligible_clusters.append((cluster, lever))
 
     eligible_clusters.sort(key=lambda x: len(x[0]["question_ids"]), reverse=True)
-    if len(eligible_clusters) > _MAX_CLUSTERS_PER_LEVER:
+    _distinct_root_causes = {
+        c.get("root_cause", "other") for c, _ in eligible_clusters
+    }
+    _max_clusters = max(_MIN_CLUSTER_BUDGET, len(_distinct_root_causes))
+    if len(eligible_clusters) > _max_clusters:
         logger.info(
-            "Capping clusters for lever %s: %d -> %d (keeping top by question count)",
-            target_lever, len(eligible_clusters), _MAX_CLUSTERS_PER_LEVER,
+            "Capping clusters for lever %s: %d -> %d "
+            "(distinct_root_causes=%d, floor=%d)",
+            target_lever, len(eligible_clusters), _max_clusters,
+            len(_distinct_root_causes), _MIN_CLUSTER_BUDGET,
         )
-        eligible_clusters = eligible_clusters[:_MAX_CLUSTERS_PER_LEVER]
+        # Preserve at least one cluster per distinct root_cause before
+        # filling remaining slots by question count.
+        _kept: list[tuple[dict, int]] = []
+        _seen_rc: set[str] = set()
+        for c, lv in eligible_clusters:
+            _rc = c.get("root_cause", "other")
+            if _rc not in _seen_rc:
+                _kept.append((c, lv))
+                _seen_rc.add(_rc)
+            if len(_kept) >= _max_clusters:
+                break
+        # Fill any remaining slots with the highest-question-count clusters.
+        if len(_kept) < _max_clusters:
+            for c, lv in eligible_clusters:
+                if (c, lv) in _kept:
+                    continue
+                _kept.append((c, lv))
+                if len(_kept) >= _max_clusters:
+                    break
+        eligible_clusters = _kept
 
     for cluster, lever in eligible_clusters:
 
@@ -9273,6 +15474,7 @@ def generate_metadata_proposals(
         proposals, metadata_snapshot,
         spark=spark, catalog=catalog, gold_schema=gold_schema,
         w=w, warehouse_id=warehouse_id,
+        benchmarks=benchmarks,
     )
     _pre_dedup_p = len(proposals)
     proposals = _deduplicate_proposals(proposals)
@@ -9284,6 +15486,32 @@ def generate_metadata_proposals(
     proposals = _merge_overlapping_instructions(proposals)
     proposals = _filter_no_op_proposals(proposals, metadata_snapshot)
     proposals.sort(key=lambda p: p["net_impact"], reverse=True)
+
+    # Phase 4.2: post-LLM rationale uniqueness validation. The
+    # ``_per_target_rationale`` helper above guarantees per-target
+    # context within this function, but downstream paths
+    # (``_call_llm_for_proposal``, holistic rewrite) can still produce
+    # near-duplicate rationales when the LLM stamps the same strategy
+    # summary on every proposal. When uniqueness drops below 50%, log
+    # a structured warning and rewrite each rationale by appending the
+    # patch-specific ``change_description`` so operators have at least
+    # a target-aware breadcrumb on every proposal.
+    if proposals:
+        _rationales = [str(p.get("rationale") or "").strip() for p in proposals]
+        _unique = len(set(_rationales))
+        if _unique < max(1, len(proposals) // 2):
+            logger.warning(
+                "Phase 4.2: low rationale uniqueness (%d unique / %d proposals) "
+                "— augmenting with target-specific change_description suffix",
+                _unique, len(proposals),
+            )
+            for _p in proposals:
+                _r = str(_p.get("rationale") or "").strip()
+                _cd = str(_p.get("change_description") or "").strip()
+                if _cd and _cd not in _r:
+                    _p["rationale"] = (
+                        f"{_r} | per-target: {_cd}" if _r else _cd
+                    )
 
     return proposals
 

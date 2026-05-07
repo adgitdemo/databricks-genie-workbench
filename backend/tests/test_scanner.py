@@ -241,25 +241,25 @@ class TestTextInstructions:
         check = _check_by_label(calculate_score(data), "Text instructions (>50 chars)")
         assert check["passed"] is True
 
-    def test_2500_chars_no_length_warning(self):
+    def test_2000_chars_no_length_warning(self):
         tables = [{"name": "t", "columns": []}]
         data = {"data_sources": {"tables": tables},
-                "instructions": {"text_instructions": [{"content": ["x" * 2500]}]},
+                "instructions": {"text_instructions": [{"content": ["x" * 2000]}]},
                 "benchmarks": {}}
         result = calculate_score(data)
         check = _check_by_label(result, "Text instructions (>50 chars)")
         assert check["severity"] == "pass"
-        assert not any("keep under 2,500" in w for w in result["warnings"])
+        assert not any("keep under 2,000" in w for w in result["warnings"])
 
-    def test_over_2500_chars_warning(self):
+    def test_over_2000_chars_warning(self):
         tables = [{"name": "t", "columns": []}]
         data = {"data_sources": {"tables": tables},
-                "instructions": {"text_instructions": [{"content": ["x" * 2501]}]},
+                "instructions": {"text_instructions": [{"content": ["x" * 2001]}]},
                 "benchmarks": {}}
         result = calculate_score(data)
         check = _check_by_label(result, "Text instructions (>50 chars)")
         assert check["severity"] == "warning"
-        assert any("keep under 2,500" in w for w in result["warnings"])
+        assert any("keep under 2,000" in w for w in result["warnings"])
 
     def test_sql_in_text_warning(self):
         tables = [{"name": "t", "columns": []}]

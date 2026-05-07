@@ -77,6 +77,11 @@ export interface IterationSummary {
   iteration: number;
   lever: number | null;
   evalScope: string;
+  // Post-arbiter (arbiter-adjusted) accuracy — the arbiter's final
+  // adjudication is the headline correctness metric across the UI.
+  // Pre-arbiter judge agreement, when emitted, is a diagnostic and is
+  // not surfaced here. See acceptance_policy.decide_acceptance — this
+  // is also the single criterion the lever loop accepts/rejects on.
   overallAccuracy: number;
   // Bug #2 denominator contract. Prefer evaluatedCount for UI math
   // (matches overallAccuracy). totalQuestions is kept for back-compat.
@@ -88,6 +93,15 @@ export interface IterationSummary {
   repeatabilityPct: number | null;
   thresholdsMet: boolean;
   judgeScores: Record<string, number | null>;
+  // Bug #4 — benchmark leakage observability.
+  leakageCountByType: Record<string, number>;
+  firewallRejectionCountByType: Record<string, number>;
+  secondaryMiningBlocked: number;
+  // Bug #4 Phase 3 — structural synthesis observability.
+  synthesisSlotsPersisted: number;
+  arbiterRejectionCount: number;
+  clusterFallbackToInstructionCount: number;
+  synthesisArchetypeDistribution: Record<string, number>;
 }
 
 // Stable enum mirroring EXCLUSION_* codes in evaluation.py. Extended on the
@@ -154,6 +168,9 @@ export interface IterationDetail {
   iteration: number;
   agId: string | null;
   status: string;
+  // Post-arbiter (arbiter-adjusted) accuracy. Same metric as
+  // ``IterationSummary.overallAccuracy``; the arbiter's final
+  // verdict is the canonical correctness signal.
   overallAccuracy: number;
   judgeScores: Record<string, number | null>;
   // Bug #2 denominator contract.
@@ -172,11 +189,29 @@ export interface IterationDetail {
   quarantinedBenchmarks: QuarantinedBenchmark[];
   clusterInfo: Record<string, unknown> | null;
   timestamp: string | null;
+  // Bug #4 — benchmark leakage observability.
+  leakageCountByType: Record<string, number>;
+  firewallRejectionCountByType: Record<string, number>;
+  secondaryMiningBlocked: number;
+  // Bug #4 Phase 3 — structural synthesis observability.
+  synthesisSlotsPersisted: number;
+  arbiterRejectionCount: number;
+  clusterFallbackToInstructionCount: number;
+  synthesisArchetypeDistribution: Record<string, number>;
 }
 
 export interface ProactiveChanges {
   descriptionsEnriched?: number;
   tablesEnriched?: number;
+  // Eligibility + silent-drop counts for description enrichment. When
+  // ``descriptionsEligible > descriptionsEnriched + descriptionsFailedLlm``
+  // the UI can explain the gap (e.g. "2 batches dropped — LLM returned
+  // unparseable JSON after retries"). All optional for backward-compat
+  // with older servers that don't emit these keys.
+  descriptionsEligible?: number;
+  descriptionsFailedLlm?: number;
+  tablesEligibleForDescription?: number;
+  tablesFailedLlm?: number;
   joinSpecsDiscovered?: number;
   spaceDescriptionGenerated?: boolean;
   sampleQuestionsGenerated?: number;
@@ -189,7 +224,24 @@ export interface IterationDetailResponse {
   runId: string;
   spaceId: string;
   baselineScore: number | null;
+  // Canonical post-arbiter (arbiter-adjusted) accuracy after
+  // optimization. The arbiter's final adjudication is the headline
+  // correctness metric the loop accepts on (see
+  // ``acceptance_policy.decide_acceptance``). Backend guarantees
+  // ``optimizedScore >= baselineScore`` and is null while no full-
+  // scope iteration > 0 has been evaluated.
   optimizedScore: number | null;
+  // ``0`` means baseline retained (no iter > 0 strictly improved on it,
+  // or optimization is still running). ``N > 0`` is the iteration that
+  // actually achieved ``optimizedScore``.
+  bestIteration: number | null;
+  // Disambiguates the ``bestIteration === 0`` case:
+  // - ``"full"`` + ``bestIteration === 0`` → baseline retained / mid-run.
+  // - ``"enrichment"`` + ``bestIteration === 0`` → enrichment drove the
+  //   improvement (lever loop short-circuited because thresholds met).
+  // - ``"full"`` + ``bestIteration > 0`` → lever-loop iteration N drove
+  //   the improvement.
+  bestEvalScope?: string | null;
   totalIterations: number;
   iterations: IterationDetail[];
   flaggedQuestions: Record<string, unknown>[];

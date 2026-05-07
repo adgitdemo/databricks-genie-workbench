@@ -23,6 +23,7 @@ from genie_space_optimizer.common.config import (
 )
 from genie_space_optimizer.common.genie_client import fetch_space_config
 from genie_space_optimizer.common.genie_schema import validate_serialized_space
+from genie_space_optimizer.common.mlflow_names import default_tags, preflight_run_name
 from genie_space_optimizer.common.uc_metadata import (
     extract_genie_space_table_refs,
     get_columns,
@@ -77,6 +78,99 @@ def _pf_kv(key: str, value: object) -> str:
 
 def _pf_bar() -> str:
     return "-" * _PF_W
+
+
+_DIM_DATE_STALENESS_DAYS = 30
+
+
+def check_dim_date_staleness(
+    spark: SparkSession,
+    catalog: str,
+    schema: str,
+    table: str = "DIM_DATE",
+    staleness_days: int = _DIM_DATE_STALENESS_DAYS,
+) -> dict[str, Any]:
+    """Warn if calendar flags on ``DIM_DATE`` look stale (C3, plan).
+
+    ``is_current_year`` / ``is_last_12_months`` are static flags that
+    must be refreshed relative to ``CURRENT_DATE()``. When benchmarks
+    assume these flags, stale values silently break accuracy.
+
+    The check is **advisory only** — it logs a warning and returns a
+    status dict. It never raises, so missing tables, permission issues,
+    or non-Databricks unit-test environments gracefully no-op.
+
+    Returns
+    -------
+    dict with keys ``status`` (``ok``/``stale``/``missing``/``error``),
+    ``max_current_year_date``, ``days_behind``, and ``message``.
+    """
+    fqn = f"{catalog}.{schema}.{table}"
+    try:
+        row = spark.sql(
+            f"""
+            SELECT
+                CURRENT_DATE() AS today,
+                MAX(CASE WHEN is_current_year THEN date_key END) AS max_cy_date
+            FROM {fqn}
+            """
+        ).collect()
+    except Exception as exc:
+        msg = str(exc)
+        logger.debug("DIM_DATE staleness probe failed for %s: %s", fqn, msg)
+        if "TABLE_OR_VIEW_NOT_FOUND" in msg or "Path does not exist" in msg:
+            return {"status": "missing", "message": f"{fqn} not found"}
+        return {"status": "error", "message": msg}
+
+    if not row:
+        return {"status": "missing", "message": f"{fqn} returned no rows"}
+
+    today = row[0]["today"]
+    max_cy = row[0]["max_cy_date"]
+    if max_cy is None:
+        logger.warning(
+            "DIM_DATE staleness: no rows flagged is_current_year in %s "
+            "— run scripts/refresh_dim_date_flags.sql before evaluation.",
+            fqn,
+        )
+        return {
+            "status": "stale",
+            "max_current_year_date": None,
+            "days_behind": None,
+            "message": "No rows flagged is_current_year — DIM_DATE flags "
+                       "need a refresh.",
+        }
+
+    try:
+        days_behind = (today - max_cy).days
+    except Exception:
+        days_behind = None
+
+    if days_behind is not None and days_behind > staleness_days:
+        logger.warning(
+            "DIM_DATE staleness: latest is_current_year row in %s is %s "
+            "(%d days behind today). Run scripts/refresh_dim_date_flags.sql "
+            "to refresh calendar flags before evaluation.",
+            fqn, max_cy, days_behind,
+        )
+        return {
+            "status": "stale",
+            "max_current_year_date": str(max_cy),
+            "days_behind": days_behind,
+            "message": f"DIM_DATE is {days_behind} days behind CURRENT_DATE().",
+        }
+
+    logger.info(
+        "DIM_DATE staleness check OK: latest is_current_year row in %s "
+        "is %s (%d days behind today).",
+        fqn, max_cy, days_behind if days_behind is not None else -1,
+    )
+    return {
+        "status": "ok",
+        "max_current_year_date": str(max_cy),
+        "days_behind": days_behind,
+        "message": "DIM_DATE flags look fresh.",
+    }
 
 
 def compute_asset_fingerprint(config: dict) -> str:
@@ -165,6 +259,257 @@ def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> 
         return False
 
 
+# PR 19: detection moved to ``common.metric_view_catalog`` so harness's
+# enrichment startup can reuse it without importing the entire preflight
+# module. Re-exported here under the original name so existing call
+# sites and tests continue to work unchanged.
+from genie_space_optimizer.common.metric_view_catalog import (  # noqa: E402
+    detect_metric_views_via_catalog as _detect_metric_views_via_catalog,
+)
+from genie_space_optimizer.common.warehouse import resolve_warehouse_id  # noqa: E402
+
+
+def _profile_metric_view(
+    spark: "SparkSession",
+    mv_fqn: str,
+    mv_yaml: dict | None,
+    uc_columns: list[dict],
+    *,
+    sample_size: int = 0,
+    low_cardinality_threshold: int = 0,
+    w: Any = None,
+    warehouse_id: str = "",
+    catalog: str = "",
+    schema: str = "",
+) -> dict | None:
+    """Profile a metric view through MV-legal queries.
+
+    The standard table profile path issues ``SELECT count(distinct …),
+    min(…), max(…) FROM (SELECT * FROM tbl TABLESAMPLE …)`` which Spark
+    rejects on metric views (``METRIC_VIEW_UNSUPPORTED_USAGE`` —
+    ``SELECT *`` and naked aggregates over an MV are both forbidden).
+    This helper instead issues per-dimension ``GROUP BY`` queries which
+    the MV planner accepts:
+
+    .. code-block:: sql
+
+       SELECT count(distinct `dim`) AS card,
+              min(`dim`) AS min_v,
+              max(`dim`) AS max_v
+       FROM (SELECT `dim` FROM <mv> GROUP BY `dim`)
+
+    Dimension list resolution:
+      1. ``mv_yaml["dimensions"][*]["name"]`` if available — this is the
+         authoritative list parsed from the catalog.
+      2. UC ``column_type`` rows that are *not* ``measure`` — used as a
+         fallback when the YAML cache is empty (e.g. runtime
+         reclassification with no DESCRIBE payload).
+
+    Measures are not value-profiled (cardinality / min / max over an
+    aggregate is meaningless). Their YAML expressions are recorded
+    verbatim under a top-level ``measures`` key so the synthesis prompt
+    builder can describe each one to the LLM.
+
+    Returns ``{"row_count": N, "columns": {dim: {...}}, "measures": {...}}``,
+    or ``None`` when no dimensions can be resolved (no YAML, no
+    dimension-typed UC columns) — the caller skips the entity in that
+    case.
+    """
+    import json as _json
+
+    from genie_space_optimizer.common.config import (
+        LOW_CARDINALITY_THRESHOLD,
+        PROFILE_SAMPLE_SIZE,
+    )
+    from genie_space_optimizer.optimization.evaluation import (
+        _exec_sql,
+        is_metric_view_error,
+    )
+
+    sample_size = sample_size or PROFILE_SAMPLE_SIZE
+    low_cardinality_threshold = low_cardinality_threshold or LOW_CARDINALITY_THRESHOLD
+
+    _sql_kw: dict[str, Any] = dict(
+        w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema,
+    )
+
+    parts = mv_fqn.replace("`", "").split(".")
+    fq_quoted = ".".join(f"`{p.strip()}`" for p in parts)
+    leaf = parts[-1].lower()
+
+    # 1. Dimension resolution — YAML first, UC columns as fallback. We
+    #    record dtype alongside the name so min/max projections only
+    #    fire for numeric/date dims (string min/max is rarely useful
+    #    and risks awkward planner choices on collation-sensitive
+    #    catalogs).
+    dim_meta: list[tuple[str, str]] = []  # (name, dtype)
+    seen: set[str] = set()
+    if isinstance(mv_yaml, dict):
+        for dim in mv_yaml.get("dimensions") or []:
+            if isinstance(dim, dict):
+                name = str(dim.get("name") or "").strip()
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    dtype = str(dim.get("data_type") or "").strip().lower()
+                    dim_meta.append((name, dtype))
+
+    if not dim_meta:
+        for col in uc_columns or []:
+            if not isinstance(col, dict):
+                continue
+            tbl = str(col.get("table_name") or "").strip().lower()
+            if tbl and tbl != leaf:
+                continue
+            ctype = str(col.get("column_type") or "").strip().lower()
+            if ctype == "measure":
+                continue
+            name = str(col.get("column_name") or "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            dtype = str(col.get("data_type") or "").strip().lower().split("(")[0]
+            dim_meta.append((name, dtype))
+
+    if not dim_meta:
+        logger.info(
+            "Metric-view profile: no dimensions resolvable for %s, skipping",
+            mv_fqn,
+        )
+        return None
+
+    # 2. Row count — single-row aggregate without ``MEASURE`` is allowed
+    #    on most MV implementations but we treat it as best-effort.
+    try:
+        count_df = _exec_sql(
+            f"SELECT COUNT(*) AS cnt FROM {fq_quoted}", spark, **_sql_kw,
+        )
+        row_count = int(count_df.iloc[0]["cnt"]) if not count_df.empty else 0
+    except Exception as exc:
+        if is_metric_view_error(str(exc)):
+            logger.debug(
+                "Metric-view profile: COUNT(*) blocked on %s — using -1",
+                mv_fqn,
+            )
+        else:
+            logger.debug(
+                "Metric-view profile: COUNT(*) failed for %s",
+                mv_fqn, exc_info=True,
+            )
+        row_count = -1
+
+    _NUMERIC_TYPES = frozenset({
+        "int", "integer", "bigint", "smallint", "tinyint",
+        "float", "double", "decimal", "numeric", "long", "short",
+    })
+    _DATE_TYPES = frozenset({"date", "timestamp", "timestamp_ntz"})
+    _COMPLEX_TYPES = frozenset({"map", "array", "struct", "binary"})
+
+    def _parse_collect_set(raw_vals: Any) -> list[str]:
+        if raw_vals is None:
+            return []
+        if isinstance(raw_vals, str):
+            try:
+                raw_vals = _json.loads(raw_vals)
+            except (ValueError, TypeError):
+                return [raw_vals]
+        return sorted(str(v) for v in raw_vals)
+
+    columns_profile: dict[str, dict] = {}
+    low_card_dims: list[tuple[str, str]] = []
+
+    for name, dtype in dim_meta:
+        escaped = f"`{name}`"
+        # The inner GROUP BY is the only construct the MV planner
+        # accepts as a ``FROM`` argument for further aggregation.
+        query = (
+            f"SELECT count(distinct {escaped}) AS `_card_{name}`, "
+            f"min({escaped}) AS `_min_{name}`, "
+            f"max({escaped}) AS `_max_{name}` "
+            f"FROM (SELECT {escaped} FROM {fq_quoted} GROUP BY {escaped})"
+        )
+        try:
+            stats_df = _exec_sql(query, spark, **_sql_kw)
+        except Exception as exc:
+            logger.debug(
+                "Metric-view profile: dimension query failed for %s.%s: %s",
+                mv_fqn, name, str(exc)[:200],
+            )
+            continue
+        if stats_df.empty:
+            continue
+        row = stats_df.iloc[0]
+        card = row.get(f"_card_{name}")
+        col_info: dict[str, Any] = {
+            "cardinality": int(card) if card is not None else 0,
+        }
+        if dtype in _NUMERIC_TYPES or dtype in _DATE_TYPES:
+            min_val = row.get(f"_min_{name}")
+            max_val = row.get(f"_max_{name}")
+            if min_val is not None:
+                col_info["min"] = str(min_val)
+            if max_val is not None:
+                col_info["max"] = str(max_val)
+        if (
+            col_info["cardinality"] > 0
+            and col_info["cardinality"] <= low_cardinality_threshold
+            and dtype not in _NUMERIC_TYPES
+            and dtype not in _DATE_TYPES
+            and not any(dtype.startswith(ct) for ct in _COMPLEX_TYPES)
+        ):
+            low_card_dims.append((name, dtype))
+        columns_profile[name] = col_info
+
+    # 3. Distinct values for low-cardinality string dims — same
+    #    GROUP-BY-then-aggregate envelope.
+    for name, _dtype in low_card_dims:
+        escaped = f"`{name}`"
+        dv_query = (
+            f"SELECT collect_set({escaped}) AS vals "
+            f"FROM (SELECT {escaped} FROM {fq_quoted} GROUP BY {escaped}) "
+            f"WHERE {escaped} IS NOT NULL"
+        )
+        try:
+            dv_df = _exec_sql(dv_query, spark, **_sql_kw)
+            if not dv_df.empty and dv_df.iloc[0].get("vals") is not None:
+                parsed = _parse_collect_set(dv_df.iloc[0]["vals"])
+                if parsed:
+                    columns_profile[name]["distinct_values"] = parsed
+        except Exception:
+            logger.debug(
+                "Metric-view profile: collect_set failed for %s.%s",
+                mv_fqn, name, exc_info=True,
+            )
+
+    # 4. Measures — record YAML expressions for the prompt builder. No
+    #    value profiling: cardinality / min / max over a measure is
+    #    meaningless once ``MEASURE()`` resolves it.
+    measures: dict[str, dict] = {}
+    if isinstance(mv_yaml, dict):
+        for m in mv_yaml.get("measures") or []:
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get("name") or "").strip()
+            if not name:
+                continue
+            expr = m.get("expr") or m.get("expression")
+            measures[name] = {
+                "expression": str(expr) if expr is not None else None,
+                "kind": "measure",
+            }
+
+    logger.info(
+        "Metric-view profile: %s — %d rows, %d dimensions, %d measures",
+        mv_fqn, row_count, len(columns_profile), len(measures),
+    )
+
+    return {
+        "row_count": row_count,
+        "columns": columns_profile,
+        "measures": measures,
+        "kind": "metric_view",
+    }
+
+
 def _collect_data_profile(
     spark: "SparkSession",
     tables: list[str],
@@ -174,11 +519,12 @@ def _collect_data_profile(
     sample_size: int = 0,
     low_cardinality_threshold: int = 0,
     metric_view_names: frozenset[str] = frozenset(),
+    metric_view_yaml: dict[str, dict] | None = None,
     w: Any = None,
     warehouse_id: str = "",
     catalog: str = "",
     schema: str = "",
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], list[str]]:
     """Profile actual data values for Genie Space tables.
 
     For each table (up to *max_tables*) runs a single TABLESAMPLE-bounded
@@ -189,8 +535,16 @@ def _collect_data_profile(
     the SQL warehouse Statement Execution API; otherwise Spark SQL is used
     as a fallback.
 
-    Returns ``{table_fqn: {"row_count": N, "columns": {col: {...}}}}``.
-    Failures on individual tables are logged and skipped.
+    Returns ``(profile, reclassified_mvs)`` where:
+      * ``profile`` maps ``{table_fqn: {"row_count": N, "columns": {col: ...}}}``
+        for each ref that was successfully profiled.
+      * ``reclassified_mvs`` lists fully-qualified identifiers of refs whose
+        profile query Spark rejected with a metric-view error
+        (``METRIC_VIEW_UNSUPPORTED_USAGE`` etc.). The caller merges these
+        back into the effective MV set and the MV YAML cache so all
+        downstream gates treat them as MVs for the rest of the run.
+
+    Failures on individual tables (non-MV) are logged and skipped.
     """
     import json as _json
 
@@ -234,10 +588,33 @@ def _collect_data_profile(
         return sorted(str(v) for v in raw_vals)
 
     profile: dict[str, dict] = {}
+    reclassified_mvs: list[str] = []
+    yaml_cache = metric_view_yaml or {}
+    from genie_space_optimizer.optimization.evaluation import is_metric_view_error
     for table_fqn in tables[:max_tables]:
         _leaf = table_fqn.split(".")[-1].strip("`").lower()
-        if _leaf in metric_view_names or table_fqn.strip().lower() in metric_view_names:
-            logger.info("Data profiling: %s is a metric view, skipping", table_fqn)
+        _fq_lower = table_fqn.strip().lower()
+        if _leaf in metric_view_names or _fq_lower in metric_view_names:
+            # Tier-B #5: dispatch to the MV-aware profile path. The YAML
+            # may be empty (runtime reclassification) — _profile_metric_view
+            # falls back to UC column rows when so.
+            mv_yaml = (
+                yaml_cache.get(_fq_lower) or yaml_cache.get(table_fqn) or None
+            )
+            mv_profile = _profile_metric_view(
+                spark, table_fqn, mv_yaml, uc_columns,
+                sample_size=sample_size,
+                low_cardinality_threshold=low_cardinality_threshold,
+                w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema,
+            )
+            if mv_profile is not None:
+                profile[table_fqn] = mv_profile
+            else:
+                logger.info(
+                    "Data profiling: %s is a metric view but no dimensions "
+                    "could be resolved — skipping",
+                    table_fqn,
+                )
             continue
 
         tbl_key = table_fqn.strip().lower()
@@ -293,14 +670,38 @@ def _collect_data_profile(
 
         try:
             stats_df = _exec_sql(query, spark, **_sql_kw)
-        except Exception:
+        except Exception as exc:
+            # Tier-A #2: reactive reclassification. If Spark rejects the
+            # aggregate with a metric-view error, the ref is actually a
+            # metric view (catalog detection didn't catch it — perhaps
+            # the DESCRIBE call returned a non-YAML envelope, or the
+            # YAML lacked the ``source`` key). Record the ref so the
+            # caller can merge it into ``_metric_view_yaml`` for the
+            # rest of the run, and skip the table-shape fallback (which
+            # would also fail and just adds log noise).
+            if is_metric_view_error(str(exc)):
+                logger.info(
+                    "Data profiling: %s reclassified as metric view "
+                    "(Spark rejected: %s)",
+                    table_fqn, str(exc)[:200],
+                )
+                reclassified_mvs.append(table_fqn)
+                continue
             fallback_query = (
                 f"SELECT {select_clause} "
                 f"FROM (SELECT * FROM {fq_table} LIMIT {sample_size})"
             )
             try:
                 stats_df = _exec_sql(fallback_query, spark, **_sql_kw)
-            except Exception:
+            except Exception as fallback_exc:
+                if is_metric_view_error(str(fallback_exc)):
+                    logger.info(
+                        "Data profiling: %s reclassified as metric view "
+                        "(fallback also rejected: %s)",
+                        table_fqn, str(fallback_exc)[:200],
+                    )
+                    reclassified_mvs.append(table_fqn)
+                    continue
                 logger.info("Data profiling: stats query failed for %s, skipping", table_fqn, exc_info=True)
                 continue
 
@@ -374,7 +775,7 @@ def _collect_data_profile(
             table_fqn, row_count, len(columns_profile), len(low_card_cols),
         )
 
-    return profile
+    return profile, reclassified_mvs
 
 
 def _compute_join_overlaps(
@@ -665,6 +1066,195 @@ def preflight_fetch_config(
     }
 
 
+# ── Preflight Sub-Step 1.5: IQ SCAN ─────────────────────────────────
+# Flag-gated by GSO_ENABLE_IQ_SCAN_PREFLIGHT. When enabled, a fresh IQ Scan
+# runs between preflight_fetch_config and preflight_collect_uc_metadata and:
+#
+#   - HARD-BLOCKS when Check 1 (data sources exist) fails. The optimizer has
+#     nothing to do without data sources, and the error message is more
+#     actionable than waiting for _validate_core_access to surface a schema
+#     access failure on zero tables.
+#   - WARNS (never blocks) when Check 10 (10+ benchmark questions) fails.
+#     MIN_VALID_BENCHMARKS at line 1119 remains the authoritative
+#     post-validation gate; hard-blocking here would kill synthetic benchmark
+#     generation for fresh spaces.
+#   - Persists a phase='preflight' row to genie_opt_scan_snapshots so the
+#     run-detail view can diff pre vs post.
+#   - Returns a recommended_levers list (union of CTA pre-selection and
+#     levers implied by failing/warning checks via SCAN_CHECK_TO_LEVERS) for
+#     the lever loop's cluster-ranking tiebreaker.
+
+def _iq_scan_preflight_enabled() -> bool:
+    """Return True when the preflight IQ Scan sub-step is enabled via env var."""
+    import os as _os
+    return _os.getenv("GSO_ENABLE_IQ_SCAN_PREFLIGHT", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _build_scan_summary_for_strategist(scan_result: dict, recommended_levers: list[int]) -> dict:
+    """Narrow the 12-check scan result to the 4 signals the strategist consumes.
+
+    - score / maturity — overall readiness headline
+    - ceilings — warnings about space-wide limits (data source count >8,
+      entity matching nearing 120/space, text instruction length)
+    - rls_tables — tables flagged as row-level-security-governed, because
+      entity matching is silently disabled there
+    - coverage_gaps — the short list of failing checks (findings)
+    - recommended_levers — which levers the scan thinks can fix the gaps
+    """
+    ceilings: list[str] = []
+    rls_tables: list[str] = []
+    warnings = scan_result.get("warnings") or []
+    for warning in warnings:
+        text = str(warning)
+        if "row-level security" in text.lower():
+            # Warning format: "Tables with row-level security (a, b, c) — entity matching is silently disabled for these"
+            # Extract the parenthesized list if present.
+            if "(" in text and ")" in text:
+                inner = text[text.index("(") + 1:text.index(")")]
+                rls_tables.extend(
+                    [t.strip() for t in inner.split(",") if t.strip()]
+                )
+        else:
+            ceilings.append(text)
+
+    return {
+        "score": scan_result.get("score"),
+        "total": scan_result.get("total"),
+        "maturity": scan_result.get("maturity"),
+        "ceilings": ceilings[:6],
+        "rls_tables": sorted(set(rls_tables))[:10],
+        "coverage_gaps": list(scan_result.get("findings") or [])[:6],
+        "recommended_levers": sorted(set(recommended_levers)),
+    }
+
+
+def preflight_run_iq_scan(
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    catalog: str,
+    schema: str,
+    config: dict,
+    *,
+    recommended_levers_from_cta: list[int] | None = None,
+) -> dict:
+    """Sub-step 1.5: Run a fresh IQ Scan against the Genie Space snapshot.
+
+    Enforces the two scan-derived gates (Check 1 hard-block, Check 10 warn),
+    persists a snapshot row, and returns a narrowed summary for the strategist
+    plus the merged ``recommended_levers`` list.
+
+    No-op when ``GSO_ENABLE_IQ_SCAN_PREFLIGHT`` is unset/false — returns a
+    dict with ``scan`` = ``None`` and an empty lever list so callers can use
+    ``.get(...)`` safely.
+    """
+    if not _iq_scan_preflight_enabled():
+        return {
+            "scan": None,
+            "scan_summary_for_strategist": None,
+            "recommended_levers": list(recommended_levers_from_cta or []),
+        }
+
+    from genie_space_optimizer.common.config import SCAN_CHECK_TO_LEVERS
+    from genie_space_optimizer.iq_scan.scoring import calculate_score
+    from genie_space_optimizer.optimization.scan_snapshots import write_scan_snapshot
+
+    parsed = config.get("_parsed_space", config) if isinstance(config, dict) else {}
+    scan_result = calculate_score(parsed or {}, optimization_run=None)
+
+    # Always persist first — if we subsequently hard-block, the scan row still
+    # exists for post-hoc auditing of why the run failed preflight.
+    try:
+        write_scan_snapshot(
+            spark, run_id, space_id, "preflight", scan_result, catalog, schema,
+        )
+    except Exception:
+        logger.warning(
+            "Preflight scan snapshot persist failed for run=%s — continuing",
+            run_id, exc_info=True,
+        )
+
+    checks = scan_result.get("checks") or []
+    check_1 = checks[0] if len(checks) >= 1 else {"passed": True}
+    check_10 = checks[9] if len(checks) >= 10 else {"passed": True}
+
+    findings = scan_result.get("findings") or []
+    next_steps = scan_result.get("next_steps") or []
+
+    _lines = [_pf_section("PREFLIGHT — IQ SCAN")]
+    _lines.append(_pf_kv("Score", f"{scan_result.get('score', 0)}/{scan_result.get('total', 12)}"))
+    _lines.append(_pf_kv("Maturity", scan_result.get("maturity", "Unknown")))
+    _lines.append(_pf_kv("Findings", len(findings)))
+    _lines.append(_pf_kv("Warnings", len(scan_result.get("warnings") or [])))
+    _lines.append(_pf_bar())
+    for finding in findings[:5]:
+        _lines.append(f"    - {finding}")
+    _lines.append(_pf_bar())
+    print("\n".join(_lines))
+
+    # Hard-block: Check 1 (data sources exist).
+    if not check_1.get("passed"):
+        detail = findings[0] if findings else "No tables or metric views configured"
+        step = next_steps[0] if next_steps else "Add at least one table or metric view to your Genie Space"
+        write_stage(
+            spark, run_id, "PREFLIGHT_IQ_SCAN_CHECK1_FAILED", "FAILED",
+            task_key="preflight", catalog=catalog, schema=schema,
+            detail={"finding": detail, "next_step": step},
+        )
+        raise RuntimeError(f"{detail}. {step}")
+
+    # Warn-only: Check 10 (10+ benchmark questions).
+    if not check_10.get("passed"):
+        detail = check_10.get("detail") or ""
+        write_stage(
+            spark, run_id, "PREFLIGHT_IQ_SCAN_BENCHMARK_WARN", "WARNING",
+            task_key="preflight", catalog=catalog, schema=schema,
+            detail={
+                "check": "10+ benchmark questions",
+                "scan_detail": detail,
+                "note": (
+                    "Warning only — MIN_VALID_BENCHMARKS remains the gate. "
+                    "Synthetic benchmark generation will top up to target count."
+                ),
+            },
+        )
+        logger.info(
+            "IQ Scan Check 10 warning for run=%s: %s — continuing, synthetic benchmarks will top up",
+            run_id, detail,
+        )
+
+    # Translate failing/warning config checks (1-10) into recommended levers.
+    cta_levers = list(recommended_levers_from_cta or [])
+    scan_levers: list[int] = []
+    for i, chk in enumerate(checks[:10], start=1):
+        if chk.get("passed") and (chk.get("severity") or "pass") != "warning":
+            continue
+        scan_levers.extend(SCAN_CHECK_TO_LEVERS.get(i, []))
+
+    recommended = sorted(set(cta_levers + scan_levers))
+
+    summary = _build_scan_summary_for_strategist(scan_result, recommended)
+
+    write_stage(
+        spark, run_id, "PREFLIGHT_IQ_SCAN_COMPLETE", "COMPLETE",
+        task_key="preflight", catalog=catalog, schema=schema,
+        detail={
+            "score": scan_result.get("score"),
+            "total": scan_result.get("total"),
+            "maturity": scan_result.get("maturity"),
+            "recommended_levers": recommended,
+        },
+    )
+
+    return {
+        "scan": scan_result,
+        "scan_summary_for_strategist": summary,
+        "recommended_levers": recommended,
+    }
+
+
 def preflight_collect_uc_metadata(
     w: "WorkspaceClient",
     spark: "SparkSession",
@@ -686,6 +1276,7 @@ def preflight_collect_uc_metadata(
 
     Returns a dict with keys: uc_columns, uc_tags, uc_routines, uc_fk.
     """
+    warehouse_id = resolve_warehouse_id(warehouse_id)
     _validate_core_access(w, spark, genie_table_refs)
 
     if apply_mode in ("both", "uc_artifact"):
@@ -820,8 +1411,157 @@ def preflight_collect_uc_metadata(
         for c in uc_columns_dicts if isinstance(c, dict) and c.get("table_name")
     }
 
+    # Tier-A #1: catalog-level MV detection. Genie sometimes serializes a
+    # metric view under ``data_sources.tables`` *without* declaring its
+    # measures in ``column_configs`` (the column-config heuristic relies
+    # on that). Run ``DESCRIBE TABLE EXTENDED ... AS JSON`` per ref to
+    # detect MV-ness at the catalog level so the four downstream gates —
+    # MEASURE auto-wrap, MV ``SELECT *`` guard, MV prompt block, data
+    # profile dispatcher — see the asset for what it really is. Run this
+    # before the UC Refs split / Coverage display so those lines reflect
+    # the *effective* MV count, not the raw config count.
+    _catalog_outcomes: dict[str, str] = {}
+    _catalog_diagnostic_samples: dict[str, str] = {}
+    try:
+        from genie_space_optimizer.common.metric_view_catalog import (
+            detect_metric_views_via_catalog_with_outcomes,
+            summarize_outcomes,
+        )
+        _catalog_mvs, _catalog_mv_yamls, _catalog_outcomes = (
+            detect_metric_views_via_catalog_with_outcomes(
+                spark, list(genie_table_refs),
+                w=w, warehouse_id=warehouse_id,
+                catalog=catalog, schema=schema,
+                diagnostic_samples=_catalog_diagnostic_samples,
+            )
+        )
+    except Exception:
+        logger.debug("MV catalog detection failed — continuing without it", exc_info=True)
+        _catalog_mvs, _catalog_mv_yamls = set(), {}
+    if _catalog_mv_yamls:
+        config["_metric_view_yaml"] = _catalog_mv_yamls
+        _ps_mirror = config.get("_parsed_space")
+        if isinstance(_ps_mirror, dict):
+            _ps_mirror["_metric_view_yaml"] = _catalog_mv_yamls
+        logger.info(
+            "MV catalog detection: %d ref(s) classified as metric views (%s)",
+            len(_catalog_mv_yamls), sorted(_catalog_mv_yamls.keys()),
+        )
+    # PR 23 — Always emit a one-line outcome summary, even when zero
+    # MVs were detected, so log readers can distinguish "no MVs in this
+    # space" from "DESCRIBE silently failed on every ref".
+    _refs_seen = list(genie_table_refs) if genie_table_refs else []
+    if _refs_seen:
+        try:
+            _counts = summarize_outcomes(_catalog_outcomes)
+            logger.info(
+                "MV catalog detection summary: refs=%d, detected=%d, "
+                "describe_error=%d, empty_result=%d, no_envelope=%d, "
+                "no_view_text=%d, yaml_parse_error=%d, not_mv_shape=%d, "
+                "no_warehouse=%d",
+                len(_refs_seen),
+                _counts["detected"],
+                _counts["describe_error"],
+                _counts["empty_result"],
+                _counts["no_envelope"],
+                _counts["no_view_text"],
+                _counts["yaml_parse_error"],
+                _counts["not_mv_shape"],
+                _counts.get("no_warehouse", 0),
+            )
+        except Exception:
+            logger.debug(
+                "MV detection summary aggregation failed", exc_info=True,
+            )
+
+    # PR 27 — Stamp the unified ``_asset_semantics`` contract right after
+    # catalog detection so every downstream consumer (join discovery,
+    # unified synthesis, preflight synthesis, validation/repair) reads
+    # the same source of truth instead of re-deriving MV identity from
+    # ``_metric_view_yaml`` / column flags / data_sources.metric_views
+    # independently. Print a visible banner block via ``print()`` so the
+    # block survives even when package INFO logs are filtered.
+    try:
+        from genie_space_optimizer.common.asset_semantics import (
+            build_and_stamp_from_run,
+            format_semantics_block,
+        )
+        _semantics = build_and_stamp_from_run(
+            config,
+            table_refs=_refs_seen,
+            catalog_yamls=_catalog_mv_yamls if isinstance(_catalog_mv_yamls, dict) else {},
+            catalog_outcomes=_catalog_outcomes,
+            catalog_diagnostic_samples=_catalog_diagnostic_samples,
+            uc_columns=uc_columns_dicts if isinstance(uc_columns_dicts, list) else None,
+        )
+        for _line in format_semantics_block(_semantics):
+            print(f"  [SEMANTICS] {_line}")
+    except Exception:
+        logger.debug(
+            "Asset semantics stamping failed (non-fatal)", exc_info=True,
+        )
+
+    from genie_space_optimizer.optimization.evaluation import (
+        effective_metric_view_identifiers,
+        effective_metric_view_identifiers_with_catalog,
+    )
+    # Effective MV set unions:
+    #   (a) ``data_sources.metric_views`` (flat ``_metric_views`` field
+    #       — Genie's canonical MV shelf),
+    #   (b) ``data_sources.tables`` entries whose column_configs declare
+    #       a measure (column-config heuristic),
+    #   (c) catalog-detected MVs from this run.
+    # The ``_with_catalog`` helper covers (b) + (c) but walks
+    # ``_parsed_space``; some upstream paths populate the flat
+    # ``_metric_views`` list without re-mirroring it into parsed_space,
+    # so we union both representations to keep counts robust.
+    _eff_mvs_set: set[str] = set(effective_metric_view_identifiers_with_catalog(config))
+    _eff_mvs_lower: set[str] = {ident.lower() for ident in _eff_mvs_set}
+    for ident in config.get("_metric_views", []) or []:
+        ident_s = str(ident).strip()
+        if ident_s and ident_s.lower() not in _eff_mvs_lower:
+            _eff_mvs_set.add(ident_s)
+            _eff_mvs_lower.add(ident_s.lower())
+
+    # Reflect the *effective* split rather than the raw config split so
+    # SAs reading the log can reconcile the totals against what GSO is
+    # actually treating as an MV.
+    _n_funcs = len(config.get("_functions", []) or [])
+    _n_total_refs = (
+        len(config.get("_tables", []) or [])
+        + len(config.get("_metric_views", []) or [])
+    )
+    _n_mvs = len(_eff_mvs_set)
+    _n_tables = max(0, _n_total_refs - _n_mvs)
+
+    # The reclassification parenthetical only fires for catalog-driven
+    # detections (column_configs are part of the existing heuristic and
+    # already reflected in the raw config split when populated upstream).
+    _base_mv_lower = {
+        ident.lower() for ident in effective_metric_view_identifiers(config)
+    }
+    for ident in config.get("_metric_views", []) or []:
+        ident_s = str(ident).strip().lower()
+        if ident_s:
+            _base_mv_lower.add(ident_s)
+    _reclassified_count = sum(
+        1
+        for ident in _eff_mvs_set
+        if ident.lower() not in _base_mv_lower
+    )
+
+    _split_payload = (
+        f"tables={_n_tables}, metric_views={_n_mvs}, functions={_n_funcs} "
+        f"(total {_n_tables + _n_mvs + _n_funcs})"
+    )
+    if _reclassified_count > 0:
+        _split_payload += (
+            f" ({_reclassified_count} reclassified from tables via catalog)"
+        )
+
     _lines = [_pf_section("PREFLIGHT — UC METADATA COLLECTION SUMMARY")]
     _lines.append(_pf_kv("UC Columns", f"{len(uc_columns_dicts):>5}  (covering {len(_uc_table_names)} tables, source: {_actual_source.get('uc_columns', 'unknown')})"))
+    _lines.append(_pf_kv("UC Refs split", _split_payload))
     _lines.append(_pf_kv("Genie config", f"{configured_cols:>5}  column_configs entries (descriptions/FA/VD)"))
     _lines.append(_pf_kv("Tags", f"{len(uc_tags_dicts):>5}  (source: {_actual_source.get('uc_tags', 'unknown')})"))
     _lines.append(_pf_kv("Routines", f"{len(uc_routines_dicts):>5}  (source: {_actual_source.get('uc_routines', 'unknown')})"))
@@ -902,10 +1642,15 @@ def preflight_collect_uc_metadata(
         detail=stage_detail,
     )
 
+    # PR 14 + Tier-A #1: data profiling skips effective MVs. The
+    # catalog-detection + column-config heuristic was already evaluated
+    # above (so the UC Refs split could reflect reclassification);
+    # reuse that set here.
+    _eff_mvs = _eff_mvs_set
     table_names = list(config.get("_tables", [])) + list(config.get("_metric_views", []))
     _mv_names = frozenset(
         n.strip().lower().split(".")[-1]
-        for n in config.get("_metric_views", [])
+        for n in _eff_mvs
         if isinstance(n, str) and n.strip()
     )
     if table_names and uc_columns_dicts:
@@ -914,12 +1659,63 @@ def preflight_collect_uc_metadata(
             task_key="preflight", catalog=catalog, schema=schema,
         )
         try:
-            data_profile = _collect_data_profile(
+            data_profile, reclassified_mvs = _collect_data_profile(
                 spark, table_names, uc_columns_dicts,
                 metric_view_names=_mv_names,
+                metric_view_yaml=config.get("_metric_view_yaml") or {},
                 w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema,
             )
+            # Tier-A #2: merge runtime-reclassified MVs into the YAML cache
+            # (with empty payloads — we have no YAML, just the fact that
+            # Spark told us they're MVs) so all four downstream gates
+            # (MEASURE auto-wrap, MV ``SELECT *`` guard, MV prompt block,
+            # data-profile skip-list) immediately treat them as MVs.
+            if reclassified_mvs:
+                _yaml_cache = config.get("_metric_view_yaml")
+                if not isinstance(_yaml_cache, dict):
+                    _yaml_cache = {}
+                    config["_metric_view_yaml"] = _yaml_cache
+                for _fqn in reclassified_mvs:
+                    _yaml_cache.setdefault(_fqn.lower(), {})
+                _ps_for_mirror = config.get("_parsed_space")
+                if isinstance(_ps_for_mirror, dict):
+                    _ps_for_mirror["_metric_view_yaml"] = dict(_yaml_cache)
+                try:
+                    from genie_space_optimizer.common.asset_semantics import (
+                        build_and_stamp_from_run as _restamp_asset_semantics,
+                    )
+
+                    _restamp_asset_semantics(
+                        config,
+                        table_refs=_refs_seen,
+                        catalog_yamls=dict(_yaml_cache),
+                        catalog_outcomes=(
+                            _catalog_outcomes
+                            if isinstance(_catalog_outcomes, dict)
+                            else {}
+                        ),
+                        catalog_diagnostic_samples=(
+                            _catalog_diagnostic_samples
+                            if isinstance(_catalog_diagnostic_samples, dict)
+                            else {}
+                        ),
+                        profile_reclassified_mvs=reclassified_mvs,
+                        uc_columns=(
+                            uc_columns_dicts
+                            if isinstance(uc_columns_dicts, list)
+                            else None
+                        ),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Asset semantics re-stamp after MV reclassification failed",
+                        exc_info=True,
+                    )
+                # Refresh the local effective-MV set so the Coverage line
+                # below sees the runtime reclassifications.
+                _eff_mvs = effective_metric_view_identifiers_with_catalog(config)
             config["_data_profile"] = data_profile
+            config["_data_profile_reclassified_mvs"] = list(reclassified_mvs)
             _ps = config.get("_parsed_space")
             if isinstance(_ps, dict):
                 _ps["_data_profile"] = data_profile
@@ -933,14 +1729,40 @@ def preflight_collect_uc_metadata(
                 for c in t.get("columns", {}).values()
                 if c.get("distinct_values")
             )
+            # Coverage reflects effective MVs (column-config heuristic +
+            # catalog detection) so the "metric_views skipped" tally
+            # matches the UC Refs split above. Without this the two
+            # lines disagreed when Genie serialized an MV under
+            # ``data_sources.tables`` without measure column configs.
+            _n_mvs_skipped = len(_eff_mvs)
+            _n_funcs_excluded = len(config.get("_functions", []) or [])
+            _n_total_refs = len(table_names) + _n_funcs_excluded
+
             _dp_lines = [_pf_section("PREFLIGHT — DATA PROFILE")]
             _dp_lines.append(_pf_kv("Tables profiled", profiled_tables))
             _dp_lines.append(_pf_kv("Columns profiled", total_cols_profiled))
             _dp_lines.append(_pf_kv("Low-cardinality cols", low_card_count))
+            _dp_lines.append(_pf_kv(
+                "Coverage",
+                f"Profiled {profiled_tables} of {_n_total_refs} UC refs "
+                f"(metric_views skipped: {_n_mvs_skipped}, "
+                f"functions excluded: {_n_funcs_excluded})",
+            ))
             _dp_lines.append(_pf_bar())
             for _dp_table_fqn, _dp_tinfo in sorted(data_profile.items()):
-                _dp_row_count = _dp_tinfo.get("row_count", "?")
-                _dp_lines.append(f"  {_dp_table_fqn} (~{_dp_row_count} rows)")
+                _dp_row_count = _dp_tinfo.get("row_count")
+                _dp_is_mv = _dp_tinfo.get("kind") == "metric_view"
+                if isinstance(_dp_row_count, int) and _dp_row_count >= 0:
+                    _dp_row_label = (
+                        f"(metric view, {_dp_row_count} rows)" if _dp_is_mv
+                        else f"({_dp_row_count} rows)"
+                    )
+                else:
+                    _dp_row_label = (
+                        "(metric view, row count unavailable)" if _dp_is_mv
+                        else "(row count unavailable)"
+                    )
+                _dp_lines.append(f"  {_dp_table_fqn} {_dp_row_label}")
                 for _dp_col, _dp_cinfo in sorted(_dp_tinfo.get("columns", {}).items()):
                     _dp_card = _dp_cinfo.get("cardinality", "?")
                     _dp_vals = _dp_cinfo.get("distinct_values")
@@ -954,17 +1776,98 @@ def preflight_collect_uc_metadata(
                     if _dp_minv is not None:
                         _dp_parts.append(f"range=[{_dp_minv}, {_dp_maxv}]")
                     _dp_lines.append(f"    {_dp_col}: {', '.join(_dp_parts)}")
+                # Render the measures block for metric-view profiles so
+                # the synthesis prompt builder, evaluators, and humans
+                # reading the preflight output can see what each measure
+                # actually computes — the YAML expression is the only
+                # source of truth (the column itself is opaque post-MEASURE).
+                _dp_measures = _dp_tinfo.get("measures") or {}
+                if _dp_measures:
+                    _dp_lines.append("    measures:")
+                    for _mname, _minfo in sorted(_dp_measures.items()):
+                        _expr = (_minfo or {}).get("expression") or "(no expression)"
+                        _dp_lines.append(f"      {_mname}: {_expr}")
                 _dp_lines.append("")
             _dp_lines.append(_pf_bar())
             print("\n".join(_dp_lines))
+
+            # Tier-C #7: enrich the DATA_PROFILING stage detail with
+            # MV-specific telemetry so MLflow + the persisted run
+            # snapshot capture the failure mode the GSO terminal output
+            # surfaces. ``metric_view_profile_outcomes`` lists one
+            # entry per effective MV with its outcome
+            # (``profiled`` / ``skipped`` / ``reclassified``), the
+            # number of dimensions actually queried, and any error
+            # truncated to 200 chars.
+            _eff_mvs_for_detail: set[str] = set()
+            try:
+                _eff_mvs_for_detail = set(
+                    effective_metric_view_identifiers_with_catalog(config)
+                )
+            except Exception:
+                _eff_mvs_for_detail = set()
+            _eff_mvs_for_detail |= {
+                str(n).strip().lower()
+                for n in (config.get("_metric_views") or [])
+                if isinstance(n, str) and n.strip()
+            }
+            _eff_mvs_for_detail |= {str(r).strip().lower() for r in reclassified_mvs}
+
+            _reclassified_set_lower = {
+                str(r).strip().lower() for r in reclassified_mvs
+            }
+            _profile_keys_lower = {
+                str(k).strip().lower(): k for k in data_profile.keys()
+            }
+
+            mv_outcomes: list[dict] = []
+            for _mv_lower in sorted(_eff_mvs_for_detail):
+                _outcome: str
+                _dims_profiled = 0
+                _err: str | None = None
+                if _mv_lower in _reclassified_set_lower:
+                    _outcome = "reclassified"
+                elif _mv_lower in _profile_keys_lower:
+                    _key = _profile_keys_lower[_mv_lower]
+                    _entry = data_profile.get(_key) or {}
+                    if _entry.get("kind") == "metric_view":
+                        _outcome = "profiled"
+                        _dims_profiled = len(_entry.get("columns") or {})
+                    else:
+                        # The ref landed in the profile dict via the
+                        # table path — treat as profiled for
+                        # observability but don't claim dim count.
+                        _outcome = "profiled"
+                        _dims_profiled = len(_entry.get("columns") or {})
+                else:
+                    _outcome = "skipped"
+                mv_outcomes.append({
+                    "fqn": _mv_lower,
+                    "outcome": _outcome,
+                    "dimensions_profiled": _dims_profiled,
+                    "error": _err,
+                })
+
+            _stage_detail = {
+                "tables_profiled": profiled_tables,
+                "columns_profiled": total_cols_profiled,
+                "low_cardinality_columns": low_card_count,
+                "metric_views_detected_via_catalog": len(_catalog_mvs),
+                "metric_views_reclassified_at_runtime": len(reclassified_mvs),
+                "metric_view_profile_outcomes": mv_outcomes,
+            }
+            # Mirror the same fields onto the persisted run-status
+            # snapshot so the harness's resume / re-run paths see them
+            # without re-reading the stage history.
+            config["_data_profile_stage_detail"] = _stage_detail
+            _ps_stage_mirror = config.get("_parsed_space")
+            if isinstance(_ps_stage_mirror, dict):
+                _ps_stage_mirror["_data_profile_stage_detail"] = dict(_stage_detail)
+
             write_stage(
                 spark, run_id, "DATA_PROFILING", "COMPLETE",
                 task_key="preflight", catalog=catalog, schema=schema,
-                detail={
-                    "tables_profiled": profiled_tables,
-                    "columns_profiled": total_cols_profiled,
-                    "low_cardinality_columns": low_card_count,
-                },
+                detail=_stage_detail,
             )
         except Exception:
             logger.warning("Data profiling failed — continuing without profile", exc_info=True)
@@ -1057,13 +1960,15 @@ def preflight_generate_benchmarks(
             exc_info=True,
         )
 
-    with mlflow.start_run(run_name="benchmark_generation") as _bench_run:
-        mlflow.set_tags({
-            "genie.space_id": space_id,
-            "genie.domain": domain,
-            "genie.stage": "benchmark_generation",
-            "genie.run_id": run_id,
-        })
+    with mlflow.start_run(run_name=preflight_run_name(run_id)) as _bench_run:
+        _pf_tags = default_tags(
+            run_id,
+            space_id=space_id,
+            stage="benchmark_generation",
+            iteration=0,
+        )
+        _pf_tags["genie.domain"] = domain
+        mlflow.set_tags(_pf_tags)
 
         benchmarks, _benchmarks_regenerated = _load_or_generate_benchmarks(
             w, spark, config, uc_columns, uc_tags, uc_routines,
@@ -1436,15 +2341,11 @@ def preflight_validate_benchmarks(
                 "gap": gap,
             },
         )
-        genie_benchmarks_topup = extract_genie_space_benchmarks(
-            config, spark, catalog=catalog, schema=schema,
-            w=w, warehouse_id=warehouse_id,
-        )
         topped_up = generate_benchmarks(
             w, config, uc_columns, uc_tags, uc_routines,
             domain, catalog, schema, spark,
             target_count=target_benchmark_count,
-            genie_space_benchmarks=genie_benchmarks_topup,
+            genie_space_benchmarks=[],
             existing_benchmarks=benchmarks,
             warehouse_id=warehouse_id,
             max_benchmark_count=max_benchmark_count,
@@ -1640,18 +2541,21 @@ def preflight_setup_experiment(
     )
     _drop_benchmark_table(spark, _uc_table)
 
-    create_evaluation_dataset(
+    eval_dataset_write = create_evaluation_dataset(
         spark, benchmarks, uc_schema, domain,
         space_id=space_id, catalog=catalog, gold_schema=schema,
         experiment_id=experiment_id,
         max_benchmark_count=max_benchmark_count,
     )
+    if not isinstance(eval_dataset_write, dict):
+        eval_dataset_write = {}
+    benchmark_count = int(eval_dataset_write.get("record_count", len(benchmarks)))
 
     _lines = [_pf_section("PREFLIGHT — EXPERIMENT & MODEL SETUP")]
     _lines.append(_pf_kv("Experiment", experiment_name))
     _lines.append(_pf_kv("Experiment ID", experiment_id))
     _lines.append(_pf_kv("Model creation", "deferred to baseline eval"))
-    _lines.append(_pf_kv("Eval dataset", f"synced ({len(benchmarks)} benchmarks)"))
+    _lines.append(_pf_kv("Eval dataset", f"synced ({benchmark_count} persisted valid benchmarks)"))
     _lines.append(_pf_kv("Instructions", "registered" if initial_instructions else "none to register"))
     _lines.append(_pf_bar())
     print("\n".join(_lines))
@@ -1671,7 +2575,7 @@ def preflight_setup_experiment(
         detail={
             "table_count": len(genie_table_refs) if genie_table_refs else 0,
             "instruction_count": _instr_count,
-            "benchmark_count": len(benchmarks),
+            "benchmark_count": benchmark_count,
             "experiment_name": experiment_name,
             "model_id": None,
         },
@@ -1682,6 +2586,8 @@ def preflight_setup_experiment(
         "model_id": None,
         "experiment_name": experiment_name,
         "experiment_id": experiment_id,
+        "benchmark_count": benchmark_count,
+        "evaluation_dataset": eval_dataset_write,
     }
 
 
@@ -1773,11 +2679,19 @@ def run_preflight(
     domain: str,
     experiment_name: str | None = None,
     apply_mode: str = "genie_config",
+    warehouse_id: str = "",
 ) -> tuple[dict, list[dict], str | None, str, list[dict]]:
     """Execute the full preflight sequence (Stage 1).
 
-    Wrapper that calls 6 sub-steps in sequence. Each sub-step is individually
+    Wrapper that calls the sub-steps in sequence. Each sub-step is individually
     callable from a notebook cell for transparency.
+
+    When ``GSO_ENABLE_IQ_SCAN_PREFLIGHT`` is set, an IQ Scan sub-step runs
+    between ``preflight_fetch_config`` and ``preflight_collect_uc_metadata``
+    and can hard-block on Check 1 (data sources exist). Recommended levers
+    and the strategist-facing scan summary are attached to ``config`` under
+    ``_gso_iq_scan_recommended_levers`` and ``_gso_iq_scan_summary`` so they
+    flow through to the lever loop via the existing config pipe.
 
     Returns:
         (config, benchmarks, model_id, experiment_name, human_corrections)
@@ -1790,16 +2704,33 @@ def run_preflight(
     genie_table_refs = ctx1["genie_table_refs"]
     domain = ctx1["domain"]
 
+    scan_ctx = preflight_run_iq_scan(
+        spark, run_id, space_id, catalog, schema, config,
+    )
+    if scan_ctx.get("recommended_levers"):
+        config["_gso_iq_scan_recommended_levers"] = list(scan_ctx["recommended_levers"])
+    if scan_ctx.get("scan_summary_for_strategist"):
+        config["_gso_iq_scan_summary"] = scan_ctx["scan_summary_for_strategist"]
+
     ctx2 = preflight_collect_uc_metadata(
         w, spark, run_id, catalog, schema, config, snapshot,
         genie_table_refs, apply_mode=apply_mode,
         configured_cols=ctx1.get("configured_cols", 0),
+        warehouse_id=warehouse_id,
     )
+
+    # C3: advisory calendar-drift check. Never blocks preflight; log-only.
+    try:
+        dim_date_status = check_dim_date_staleness(spark, catalog, schema)
+        config["_gso_dim_date_status"] = dim_date_status
+    except Exception:  # pragma: no cover - defensive; check_* is already safe
+        logger.debug("DIM_DATE staleness check raised unexpectedly", exc_info=True)
 
     ctx3 = preflight_generate_benchmarks(
         w, spark, run_id, catalog, schema, config,
         ctx2["uc_columns"], ctx2["uc_tags"], ctx2["uc_routines"],
         domain,
+        warehouse_id=warehouse_id,
     )
     benchmarks = ctx3["benchmarks"]
 
@@ -1807,6 +2738,7 @@ def run_preflight(
         w, spark, run_id, catalog, schema, config, benchmarks,
         ctx2["uc_columns"], ctx2["uc_tags"], ctx2["uc_routines"],
         domain,
+        warehouse_id=warehouse_id,
     )
     benchmarks = ctx4["benchmarks"]
 
@@ -1860,8 +2792,10 @@ def _load_or_generate_benchmarks(
         the stale UC table before persisting) and ``False`` for REUSE / TOP-UP.
 
     Strategy:
-      1. Extract curated benchmarks from the Genie Space config (example_question_sqls,
-         sample_questions). These are always included as the authoritative ground truth.
+      1. Extract benchmark questions from the Genie Space config
+         (``benchmarks.questions`` and ``config.sample_questions``).
+         ``example_question_sqls`` are training examples and are excluded
+         from the benchmark corpus.
       2. Try loading previously persisted benchmarks from UC dataset.
          If enough exist AND they already include the curated ones, reuse them.
       3. Otherwise, generate synthetic benchmarks via LLM to augment the curated set.
@@ -1899,6 +2833,10 @@ def _load_or_generate_benchmarks(
             b for b, v in zip(existing, validation_results)
             if v.get("valid")
         ]
+        from genie_space_optimizer.optimization.evaluation import (
+            _filter_example_sql_mirrored_benchmarks,
+        )
+        valid_existing = _filter_example_sql_mirrored_benchmarks(valid_existing, config)
         invalid_existing = [
             (b, v) for b, v in zip(existing, validation_results)
             if not v.get("valid")
@@ -2007,6 +2945,8 @@ def _load_or_generate_benchmarks(
                     if len(valid_existing) > max_benchmark_count:
                         from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
                         valid_existing = _truncate_benchmarks(valid_existing, max_benchmark_count)
+                    from genie_space_optimizer.optimization.benchmarks import assign_splits
+                    valid_existing = assign_splits(valid_existing)
                     return valid_existing, False
                 else:
                     gap = target_benchmark_count - len(valid_existing)

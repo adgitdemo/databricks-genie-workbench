@@ -12,15 +12,20 @@ from typing import TYPE_CHECKING
 from mlflow.entities import Feedback
 from mlflow.genai.scorers import scorer
 
-from genie_space_optimizer.common.config import LLM_ENDPOINT
+from genie_space_optimizer.common.config import LLM_ENDPOINT, scoring_v2_is_legacy
 from genie_space_optimizer.common.genie_client import resolve_sql, sanitize_sql
 from genie_space_optimizer.optimization.evaluation import (
+    CODE_SOURCE,
     LLM_SOURCE,
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
     format_asi_markdown,
     get_registered_prompt_name,
+    slim_comparison,
+)
+from genie_space_optimizer.optimization.genie_eval_taxonomy import (
+    with_genie_equivalent_eval,
 )
 from genie_space_optimizer.optimization.scorers import build_scorer_context
 
@@ -42,6 +47,30 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
         question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
+        if (
+            cmp.get("error_type") == "genie_result_unavailable"
+            and not scoring_v2_is_legacy()
+            and genie_sql
+        ):
+            return Feedback(
+                name="completeness",
+                value="excluded",
+                rationale=format_asi_markdown(
+                    judge_name="completeness",
+                    value="excluded",
+                    rationale=(
+                        "Genie returned valid SQL but the result set could not "
+                        "be retrieved (no-result defense under GSO_SCORING_V2). "
+                        "Completeness requires comparing result shape; this "
+                        "judge is blocked. SQL-shape judges still evaluate "
+                        "the SQL."
+                    ),
+                    extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
+                ),
+                source=CODE_SOURCE,
+            )
+
         context = build_scorer_context(
             question=question, genie_sql=genie_sql, gt_sql=gt_sql, cmp=cmp,
             include_column_note=True,
@@ -59,7 +88,7 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
             "3. Defensive IS NOT NULL or ORDER BY clauses are NOT completeness issues.\n"
             "4. GROUP BY ALL is semantically identical to explicit GROUP BY.\n\n"
             f"{context}\n\n"
-            'Respond with JSON only: {"complete": true/false, "failure_type": "<missing_column|missing_filter|missing_temporal_filter|missing_aggregation|partial_answer>", '
+            'Respond with JSON only: {"complete": true/false, "failure_type": "<missing_column|missing_filter|missing_temporal_filter|missing_aggregation|partial_answer|missing_instruction|business_logic_missing>", '
             '"blame_set": ["<missing_element>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
             '"rationale": "<brief explanation>"}\n'
@@ -102,6 +131,11 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
                 severity="info",
                 confidence=0.0,
                 counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
+            metadata = with_genie_equivalent_eval(
+                metadata,
+                judge_name="completeness",
+                value="unknown",
             )
             return Feedback(
                 name="completeness",
@@ -196,6 +230,13 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
                 f"Fix {result.get('failure_type', 'completeness issue')} "
                 f"involving {', '.join(result.get('blame_set', ['unknown']))}"
             ),
+        )
+        metadata = with_genie_equivalent_eval(
+            metadata,
+            judge_name="completeness",
+            value="no",
+            failure_type=result.get("failure_type", "missing_column"),
+            comparison=cmp,
         )
         return Feedback(
             name="completeness",

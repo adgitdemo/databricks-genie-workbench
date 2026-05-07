@@ -501,6 +501,14 @@ def test_derived_accuracy_handles_zero_evaluated() -> None:
     assert _derived_accuracy(row) == 0.0
 
 
+def test_iteration_select_includes_rolled_back_for_score_selection() -> None:
+    """Run score derivation can only exclude rejected iterations when the
+    lightweight iteration query carries the rollback marker through."""
+    from backend.routers.auto_optimize import _ITER_COLS_V2
+
+    assert "rolled_back" in _ITER_COLS_V2
+
+
 # ── Bug #2 regression — pre-migration Delta schema fallback ──────────────
 
 

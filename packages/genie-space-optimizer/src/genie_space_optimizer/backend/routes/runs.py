@@ -13,7 +13,11 @@ from fastapi import HTTPException
 from ..constants import ACTIVE_RUN_STATUSES, TERMINAL_JOB_STATES
 from ..core import Dependencies, create_router
 from ..utils import ensure_utc_iso, safe_finite, safe_float, safe_int, safe_json_parse, scrub_nan_inf
-from ...common.accuracy import derived_accuracy as _canonical_derived_accuracy
+from ...common.accuracy import (
+    RunScores,
+    compute_run_scores,
+    derived_accuracy as _canonical_derived_accuracy,
+)
 from .spaces import _genie_client
 from ..models import (
     ActionResponse,
@@ -266,7 +270,7 @@ _STEP_DEFINITIONS: list[_StepDefinition] = [
     {
         "stepNumber": 3,
         "name": "Proactive Enrichment",
-        "stage_prefixes": ["ENRICHMENT", "PROMPT_MATCH", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROACTIVE_INSTRUCTION", "EXAMPLE_SQL"],
+        "stage_prefixes": ["ENRICHMENT", "PROMPT_MATCH", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROACTIVE_INSTRUCTION", "EXAMPLE_SQL", "POST_ENRICHMENT_EVAL"],
         "summary_template": "Applied {total} proactive enrichments: {descriptions} descriptions, {joins} joins, {instructions} instructions, {examples} example SQLs",
     },
     {
@@ -424,6 +428,14 @@ def _extract_proactive_changes(matching: list[dict]) -> dict:
         if "DESCRIPTION_ENRICHMENT" in stage_name:
             proactive["descriptionsEnriched"] = d.get("total_enriched", 0)
             proactive["tablesEnriched"] = d.get("tables_enriched", 0)
+            # Surface eligibility + silent-drop counts so the UI can
+            # distinguish "nothing needed enrichment" from "some batches
+            # failed LLM parsing after retries". Backward-compat: all new
+            # fields default to 0 on older servers.
+            proactive["descriptionsEligible"] = d.get("total_eligible", 0)
+            proactive["descriptionsFailedLlm"] = d.get("total_failed_llm", 0)
+            proactive["tablesEligibleForDescription"] = d.get("tables_eligible", 0)
+            proactive["tablesFailedLlm"] = d.get("tables_failed_llm", 0)
         elif "JOIN_DISCOVERY" in stage_name:
             proactive["joinSpecsDiscovered"] = d.get("total_applied", 0)
         elif "SPACE_METADATA" in stage_name:
@@ -685,6 +697,16 @@ def _build_step_io(
                 "totalEnrichments": detail.get("total_enrichments", 0),
                 "totalConfigChanges": lever_0_count,
                 "enrichmentSkipped": detail.get("enrichment_skipped", False),
+                # Surface the post-enrichment eval delta on the Proactive
+                # Enrichment step card so the per-step view matches the
+                # headline tile when enrichment short-circuits the lever
+                # loop. ``None`` when post-enrichment eval was skipped.
+                "postEnrichmentAccuracy": _safe_float(
+                    detail.get("post_enrichment_accuracy"),
+                ),
+                "postEnrichmentThresholdsMet": detail.get(
+                    "post_enrichment_thresholds_met",
+                ),
                 "stageEvents": timeline,
             },
         )
@@ -1213,7 +1235,16 @@ def _resolve_eval_counts(iter_row: dict | None) -> dict[str, int]:
     Safe against None rows (returns all zeros).
     """
     if not iter_row:
-        return {"total": 0, "evaluated": 0, "correct": 0, "excluded": 0, "quarantined": 0}
+        return {
+            "total": 0, "evaluated": 0, "correct": 0, "excluded": 0, "quarantined": 0,
+            "leakage_count_by_type": {},
+            "firewall_rejection_count_by_type": {},
+            "secondary_mining_blocked": 0,
+            "synthesis_slots_persisted": 0,
+            "arbiter_rejection_count": 0,
+            "cluster_fallback_to_instruction_count": 0,
+            "synthesis_archetype_distribution": {},
+        }
 
     total = _safe_int(iter_row.get("total_questions")) or 0
     correct = _safe_int(iter_row.get("correct_count")) or 0
@@ -1240,12 +1271,55 @@ def _resolve_eval_counts(iter_row: dict | None) -> dict[str, int]:
     elif isinstance(quarantined_raw, list):
         quarantined = len(quarantined_raw)
 
+    # Bug #4 — surface leakage observability. Defensive parsing: accept
+    # either already-decoded dicts (set by mock tests) or JSON strings
+    # written by write_iteration().
+    def _safe_dict_map(raw: Any) -> dict:
+        if isinstance(raw, dict):
+            return {str(k): int(v) for k, v in raw.items() if v is not None}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return {str(k): int(v) for k, v in parsed.items() if v is not None}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        return {}
+
+    leakage_count_by_type = _safe_dict_map(iter_row.get("leakage_count_by_type"))
+    firewall_rejection_count_by_type = _safe_dict_map(
+        iter_row.get("firewall_rejection_count_by_type"),
+    )
+    secondary_mining_blocked = _safe_int(
+        iter_row.get("secondary_mining_blocked"),
+    ) or 0
+
+    synthesis_slots_persisted = _safe_int(
+        iter_row.get("synthesis_slots_persisted"),
+    ) or 0
+    arbiter_rejection_count = _safe_int(
+        iter_row.get("arbiter_rejection_count"),
+    ) or 0
+    cluster_fallback_to_instruction_count = _safe_int(
+        iter_row.get("cluster_fallback_to_instruction_count"),
+    ) or 0
+    synthesis_archetype_distribution = _safe_dict_map(
+        iter_row.get("synthesis_archetype_distribution"),
+    )
+
     return {
         "total": total,
         "evaluated": evaluated,
         "correct": correct,
         "excluded": excluded,
         "quarantined": quarantined,
+        "leakage_count_by_type": leakage_count_by_type,
+        "firewall_rejection_count_by_type": firewall_rejection_count_by_type,
+        "secondary_mining_blocked": secondary_mining_blocked,
+        "synthesis_slots_persisted": synthesis_slots_persisted,
+        "arbiter_rejection_count": arbiter_rejection_count,
+        "cluster_fallback_to_instruction_count": cluster_fallback_to_instruction_count,
+        "synthesis_archetype_distribution": synthesis_archetype_distribution,
     }
 
 
@@ -1332,33 +1406,29 @@ def _get_baseline_and_best_accuracy(
     *,
     run_id: str | None = None,
 ) -> tuple[float | None, float | None]:
-    """Return baseline(full iteration 0) and best full-eval accuracy.
+    """Return ``(baseline, optimized)`` from the canonical
+    :func:`compute_run_scores`.
 
-    Bug #2: both values are derived from `correct_count / evaluated_count`
-    via `_derived_accuracy` so the KPI cards that render these fields agree
-    to the decimal with the tab labels (which are computed from the same
-    counts on the frontend). Legacy rows without counts fall back to the
-    stored `overall_accuracy` so old dashboards don't suddenly go blank.
+    Backward-compat shim. New call sites should use
+    :func:`get_run_scores` (returns the full :class:`RunScores` so callers
+    get ``best_iteration`` for the convergence-reason copy too).
+
+    Existing tests (``test_backend_routes_runs.py``) import this name and
+    assert on the returned tuple — they keep working without changes.
     """
-    full_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "full"]
-    if not full_rows:
-        return None, None
+    scores = compute_run_scores(iters_rows, run_id=run_id, logger=logger)
+    return scores.baseline, scores.optimized
 
-    baseline_row = next((r for r in full_rows if _safe_int(r.get("iteration")) == 0), None)
-    baseline = _derived_accuracy(
-        baseline_row,
-        run_id=run_id,
-        iteration=0 if baseline_row else None,
-    )
 
-    scored = [
-        _derived_accuracy(r, run_id=run_id, iteration=_safe_int(r.get("iteration")))
-        for r in full_rows
-    ]
-    finite_scores = [s for s in scored if s is not None]
-    if not finite_scores:
-        return baseline, None
-    return baseline, max(finite_scores)
+def get_run_scores(
+    iters_rows: list[dict],
+    *,
+    run_id: str | None = None,
+) -> RunScores:
+    """Public alias for :func:`compute_run_scores` with this module's
+    logger pre-bound (so drift messages still appear under
+    ``genie_space_optimizer.backend.routes.runs``)."""
+    return compute_run_scores(iters_rows, run_id=run_id, logger=logger)
 
 
 # ── Route Handlers ──────────────────────────────────────────────────────
@@ -1523,11 +1593,12 @@ def get_run(
     )
     patches_rows = patches_df.to_dict("records") if not patches_df.empty else []
 
-    baseline_iter = next((r for r in iters_rows if r.get("iteration") == 0), None)
-    # Bug #2: derive from correct/evaluated so `PipelineRun.baselineScore`
-    # (what ScoreSummary renders) agrees with the tab labels that compute
-    # the same quantity on the frontend.
-    baseline_accuracy = _derived_accuracy(baseline_iter, run_id=run_id, iteration=0)
+    # Canonical baseline + optimized + best_iteration. See
+    # ``common.accuracy.compute_run_scores`` for the contract — in particular
+    # the floor-at-baseline invariant that closes the "100% Optimized during
+    # Baseline Evaluation" UI bug.
+    run_scores = get_run_scores(iters_rows, run_id=run_id)
+    baseline_accuracy = run_scores.baseline
     run_data["baseline_accuracy"] = baseline_accuracy
 
     steps = map_stages_to_steps(stages_rows, iters_rows, run_data, patches_rows=patches_rows)
@@ -1568,12 +1639,8 @@ def get_run(
         stages_rows, run_data, host,
     )
 
-    # Bug #2: derive optimized score from iteration counts too. Fall back to
-    # the stored `best_accuracy` only if there are no full iterations to
-    # read (legacy runs written before this migration).
-    _, derived_best = _get_baseline_and_best_accuracy(iters_rows, run_id=run_id)
-    stored_best = _safe_float(run_data.get("best_accuracy"))
-    optimized_score = derived_best if derived_best is not None else stored_best
+    optimized_score = run_scores.optimized
+    best_iteration = run_scores.best_iteration
 
     result = PipelineRun(
         runId=run_id,
@@ -1585,6 +1652,8 @@ def get_run(
         initiatedBy=run_data.get("triggered_by") or "system",
         baselineScore=baseline_accuracy,
         optimizedScore=optimized_score,
+        bestIteration=best_iteration,
+        bestEvalScope=run_scores.best_eval_scope,
         steps=steps,
         levers=levers,
         convergenceReason=run_data.get("convergence_reason"),
@@ -1650,30 +1719,47 @@ def get_comparison(
     )
     iters_rows = iters_df.to_dict("records") if not iters_df.empty else []
 
-    baseline_scores = {}
-    optimized_scores = {}
-    baseline_accuracy = 0.0
-    optimized_accuracy = 0.0
+    # Headline scores come from the canonical helper so this endpoint agrees
+    # with /runs/{id}, /runs/{id}/status and the list endpoints to the
+    # decimal. Pre-fix this loop picked the LAST iter>0 row's accuracy
+    # rather than the BEST — easy to drift.
+    run_scores = get_run_scores(iters_rows, run_id=run_id)
+    baseline_accuracy = run_scores.baseline if run_scores.baseline is not None else 0.0
+    optimized_accuracy = run_scores.optimized if run_scores.optimized is not None else baseline_accuracy
 
-    for row in iters_rows:
-        if row.get("eval_scope") != "full":
-            continue
-        scores_raw = row.get("scores_json", {})
-        if isinstance(scores_raw, str):
-            try:
-                scores_raw = json.loads(scores_raw)
-            except (json.JSONDecodeError, TypeError):
-                scores_raw = {}
-        if row.get("iteration") == 0:
-            baseline_scores = scores_raw if isinstance(scores_raw, dict) else {}
-            baseline_accuracy = _finite(row.get("overall_accuracy", 0))
-        else:
-            optimized_scores = scores_raw if isinstance(scores_raw, dict) else {}
-            optimized_accuracy = _finite(row.get("overall_accuracy", 0))
+    # Per-dimension scores are still per-iteration (separate judges). Pull
+    # baseline scores from iter 0 (full scope) and optimized scores from
+    # the row that drove ``run_scores.optimized`` — which may be the
+    # post-enrichment row at iter 0 (``eval_scope == "enrichment"``) when
+    # the lever loop was short-circuited. Falling back to ``"full"`` keeps
+    # the legacy behavior intact.
+    def _scores_for_iter(
+        target: int | None, *, eval_scope: str = "full",
+    ) -> dict[str, Any]:
+        if target is None:
+            return {}
+        scope_norm = (eval_scope or "full").lower()
+        for row in iters_rows:
+            row_scope = str(row.get("eval_scope") or "full").lower()
+            if row_scope != scope_norm:
+                continue
+            if _safe_int(row.get("iteration")) != target:
+                continue
+            scores_raw = row.get("scores_json", {})
+            if isinstance(scores_raw, str):
+                try:
+                    scores_raw = json.loads(scores_raw)
+                except (json.JSONDecodeError, TypeError):
+                    scores_raw = {}
+            return scores_raw if isinstance(scores_raw, dict) else {}
+        return {}
 
-    if not optimized_scores:
-        optimized_scores = baseline_scores
-        optimized_accuracy = baseline_accuracy
+    baseline_scores = _scores_for_iter(
+        run_scores.baseline_iteration, eval_scope="full",
+    )
+    optimized_scores = _scores_for_iter(
+        run_scores.best_iteration, eval_scope=run_scores.best_eval_scope,
+    ) or baseline_scores
 
     dimensions: list[DimensionScore] = []
     all_dims = set(baseline_scores.keys()) | set(optimized_scores.keys())
@@ -1703,6 +1789,8 @@ def get_comparison(
         perDimensionScores=dimensions,
         original=_extract_space_configuration(original_snapshot),
         optimized=_extract_space_configuration(current_ss),
+        bestIteration=run_scores.best_iteration,
+        bestEvalScope=run_scores.best_eval_scope,
     )
 
 
@@ -2190,6 +2278,10 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
     full_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "full"]
     slice_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "slice"]
     p0_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "p0"]
+    enrichment_rows = [
+        r for r in iters_rows
+        if str(r.get("eval_scope", "")).lower() == "enrichment"
+    ]
 
     by_iter: dict[int, dict] = {}
     for row in full_rows:
@@ -2204,6 +2296,14 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
         it = _safe_int(row.get("iteration")) or 0
         by_iter.setdefault(it, {})
         by_iter[it]["p0"] = row
+    # Post-enrichment row (always iter 0). Stored separately so the
+    # iteration-card builder still renders the ``"full"`` baseline at iter
+    # 0 — this partition is read by the Proactive Enrichment step builder
+    # and is available for any future per-card "post-enrichment" surfacing.
+    for row in enrichment_rows:
+        it = _safe_int(row.get("iteration")) or 0
+        by_iter.setdefault(it, {})
+        by_iter[it]["enrichment"] = row
 
     patches_by_iter: dict[int, list[dict]] = {}
     for p in patches_rows:
@@ -2459,7 +2559,7 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
         ))
     iterations.sort(key=lambda it: it.iteration)
 
-    baseline_score, optimized_score = _get_baseline_and_best_accuracy(iters_rows, run_id=run_id)
+    run_scores_iter = get_run_scores(iters_rows, run_id=run_id)
 
     flagged: list[dict] = []
     domain = run_data.get("domain", run_data.get("space_id", ""))
@@ -2479,8 +2579,10 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
     return IterationDetailResponse(
         runId=run_id,
         spaceId=run_data.get("space_id", ""),
-        baselineScore=baseline_score,
-        optimizedScore=optimized_score,
+        baselineScore=run_scores_iter.baseline,
+        optimizedScore=run_scores_iter.optimized,
+        bestIteration=run_scores_iter.best_iteration,
+        bestEvalScope=run_scores_iter.best_eval_scope,
         totalIterations=len(iterations),
         iterations=iterations,
         flaggedQuestions=flagged,

@@ -136,6 +136,14 @@ export function InsightTabs({
 const PROACTIVE_LABELS: Record<keyof ProactiveChanges, string> = {
   descriptionsEnriched: "Column descriptions enriched",
   tablesEnriched: "Table descriptions enriched",
+  // Eligibility + silent-drop counts (F3). Labels are phrased so the
+  // UI reads naturally when the value is interpolated as ": {count}":
+  //   "Column descriptions eligible: 50"
+  //   "Column descriptions skipped (LLM parse failure): 20"
+  descriptionsEligible: "Column descriptions eligible",
+  descriptionsFailedLlm: "Column descriptions skipped (LLM parse failure)",
+  tablesEligibleForDescription: "Table descriptions eligible",
+  tablesFailedLlm: "Table descriptions skipped (LLM parse failure)",
   joinSpecsDiscovered: "Join specs discovered",
   spaceDescriptionGenerated: "Space description generated",
   sampleQuestionsGenerated: "Sample questions generated",
@@ -947,7 +955,7 @@ function JudgesTab({
                 const accDelta = bAcc != null && fAcc != null ? fAcc - bAcc : null;
                 return (
                   <TableRow className="border-b-2 font-semibold">
-                    <TableCell className="text-xs font-semibold">Overall Accuracy</TableCell>
+                    <TableCell className="text-xs font-semibold">Accuracy (arbiter-adjusted)</TableCell>
                     <TableCell className="text-center text-xs font-semibold">
                       {bAcc != null ? `${bAcc.toFixed(1)}%` : "—"}
                     </TableCell>
