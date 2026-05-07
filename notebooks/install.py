@@ -62,17 +62,16 @@ dbutils.widgets.dropdown("grant_genie_spaces", "false", ["false", "true"])
 # MAGIC %md
 # MAGIC ## Before You Run The Installer
 # MAGIC
-# MAGIC <div style="border:1px solid #d0d7de;border-radius:8px;padding:14px 16px;margin:8px 0;">
-# MAGIC   <p style="margin-top:0;"><strong>Confirm these workspace prerequisites manually:</strong></p>
-# MAGIC   <label><input type="checkbox"> Notebook is attached to <strong>Databricks Serverless Environment v5</strong>.</label><br>
-# MAGIC   <label><input type="checkbox"> <strong>Databricks Apps</strong> is enabled in this workspace.</label><br>
-# MAGIC   <label><input type="checkbox"> <strong>Databricks Apps On-Behalf-of-User authorization</strong> Public Preview is enabled.</label><br>
-# MAGIC   <label><input type="checkbox"> <strong>Managed MLflow Prompt Registry</strong> Beta is enabled.</label><br>
-# MAGIC   <label><input type="checkbox"> The selected SQL warehouse exists and you have <code>CAN_USE</code>.</label><br>
-# MAGIC   <label><input type="checkbox"> The selected Unity Catalog exists and you can create/use the target schema.</label><br>
-# MAGIC   <label><input type="checkbox"> The selected model serving endpoint exists and is callable.</label><br>
-# MAGIC   <label><input type="checkbox"> If <code>lakebase_mode</code> is not <code>skip</code>, Lakebase Autoscaling is available.</label>
-# MAGIC </div>
+# MAGIC Confirm these workspace prerequisites manually:
+# MAGIC
+# MAGIC - [ ] Notebook is attached to **Databricks Serverless Environment v5**.
+# MAGIC - [ ] **Databricks Apps** is enabled in this workspace.
+# MAGIC - [ ] **Databricks Apps On-Behalf-of-User authorization** Public Preview is enabled.
+# MAGIC - [ ] **Managed MLflow Prompt Registry** Beta is enabled.
+# MAGIC - [ ] The selected SQL warehouse exists and you have `CAN_USE`.
+# MAGIC - [ ] The selected Unity Catalog exists and you can create/use the target schema.
+# MAGIC - [ ] The selected model serving endpoint exists and is callable.
+# MAGIC - [ ] If `lakebase_mode` is not `skip`, Lakebase Autoscaling is available.
 
 # COMMAND ----------
 from databricks.sdk import WorkspaceClient
