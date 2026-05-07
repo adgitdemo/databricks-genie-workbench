@@ -511,6 +511,33 @@ def test_wait_for_deployment_ignores_old_active_deployment(monkeypatch):
     assert app["pending_deployment"]["status"]["state"] == "SUCCEEDED"
 
 
+def test_wait_for_deployment_polls_submitted_deployment_by_id(monkeypatch):
+    monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): [
+                {"active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}}},
+                {"active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}}},
+            ],
+            ("GET", "/api/2.0/apps/genie-workbench/deployments/new"): [
+                {"deployment_id": "new", "status": {"state": "IN_PROGRESS"}},
+                {"deployment_id": "new", "status": {"state": "SUCCEEDED"}},
+            ],
+        }
+    )
+
+    app = wait_for_deployment(
+        w,
+        "genie-workbench",
+        submitted_deployment={"deployment_id": "new"},
+        timeout_seconds=1,
+        poll_seconds=0,
+    )
+
+    assert app["pending_deployment"]["deployment_id"] == "new"
+    assert app["pending_deployment"]["status"]["state"] == "SUCCEEDED"
+
+
 def test_wait_for_deployment_without_token_waits_for_new_pending(monkeypatch):
     monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
     w = FakeWorkspaceClient(

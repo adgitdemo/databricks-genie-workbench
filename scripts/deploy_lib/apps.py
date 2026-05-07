@@ -34,6 +34,16 @@ def get_app(w, app_name: str) -> dict[str, Any] | None:
         raise
 
 
+def get_app_deployment(w, app_name: str, deployment_id: str) -> dict[str, Any] | None:
+    try:
+        return api_do(w, "GET", f"/api/2.0/apps/{app_name}/deployments/{deployment_id}")
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not_found" in msg or "not found" in msg or "does not exist" in msg:
+            return None
+        raise
+
+
 def ensure_app(w, cfg: InstallConfig) -> dict[str, Any]:
     existing = get_app(w, cfg.app_name)
     if existing:
@@ -284,6 +294,9 @@ def wait_for_deployment(
             baseline_captured = True
 
         if submitted_token:
+            submitted = get_app_deployment(w, app_name, submitted_token)
+            if submitted and deployment_state(submitted) not in DEPLOYMENT_PENDING_STATES:
+                return _selected_app(last_app, submitted)
             for deployment in (pending, active):
                 if deployment_token(deployment) != submitted_token:
                     continue
