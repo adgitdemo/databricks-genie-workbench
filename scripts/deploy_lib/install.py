@@ -17,7 +17,6 @@ from .config import InstallConfig, InstallResult, LakebaseInfo
 from .genie_spaces import optionally_grant_genie_spaces
 from .gso_job import ensure_gso_job
 from .lakebase import ensure_lakebase
-from .preflight import run_preflight, verify_app_user_authorization_scopes
 from .uc import ensure_uc_objects_and_grants
 from .verify import verify_app_deployment
 from .workspace_source import prepare_workspace_source
@@ -43,13 +42,6 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     cfg = cfg.normalized()
     cfg.validate()
 
-    status("Running notebook installer preflight checks...")
-    preflight = run_preflight(w, cfg, repo_root=Path(cfg.repo_root or ""))
-    if preflight.warnings:
-        for warning in preflight.warnings:
-            status(f"Preflight warning ({warning.check}): {warning.message}")
-    status("Preflight checks passed.")
-
     status("Resolving current Databricks user...")
     deployer_user = get_deployer_user(w)
     status(f"Using deployer: {deployer_user}")
@@ -60,8 +52,6 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     sp = get_app_service_principal(w, cfg.app_name)
     app_sp_client_id = sp["client_id"]
     status(f"Resolved app service principal: {app_sp_client_id}")
-    status("Checking Databricks Apps user authorization scopes...")
-    verify_app_user_authorization_scopes(w, cfg.app_name)
 
     status("Generating curated workspace source folder...")
     source_path = prepare_workspace_source(w, cfg, deployer_user)

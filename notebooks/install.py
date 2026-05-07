@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC **Required compute:** attach this notebook to **Databricks Serverless Environment v5**. The installer expects Python 3.11+ and workspace-native Databricks SDK auth.
 # MAGIC
-# MAGIC **Required workspace previews/settings:** Databricks Apps, **Databricks Apps On-Behalf-of-User authorization** (Public Preview), and **MLflow Prompt Registry** (Beta) must be enabled. Workspace admins manage preview toggles from the Databricks **Previews** page.
+# MAGIC **Required workspace previews/settings:** Databricks Apps, **Databricks Apps On-Behalf-of-User authorization** (Public Preview), and **Managed MLflow Prompt Registry** (Beta) must be enabled. Workspace admins manage preview toggles from the Databricks **Previews** page.
 # MAGIC
 # MAGIC **Optional:** Lakebase Autoscaling is recommended for persistent app state. Set `lakebase_mode` to `skip` only when ephemeral in-memory state is acceptable.
 
@@ -59,6 +59,22 @@ dbutils.widgets.text("lakebase_instance", "")
 dbutils.widgets.dropdown("grant_genie_spaces", "false", ["false", "true"])
 
 # COMMAND ----------
+# MAGIC %md
+# MAGIC ## Before You Run The Installer
+# MAGIC
+# MAGIC <div style="border:1px solid #d0d7de;border-radius:8px;padding:14px 16px;margin:8px 0;">
+# MAGIC   <p style="margin-top:0;"><strong>Confirm these workspace prerequisites manually:</strong></p>
+# MAGIC   <label><input type="checkbox"> Notebook is attached to <strong>Databricks Serverless Environment v5</strong>.</label><br>
+# MAGIC   <label><input type="checkbox"> <strong>Databricks Apps</strong> is enabled in this workspace.</label><br>
+# MAGIC   <label><input type="checkbox"> <strong>Databricks Apps On-Behalf-of-User authorization</strong> Public Preview is enabled.</label><br>
+# MAGIC   <label><input type="checkbox"> <strong>Managed MLflow Prompt Registry</strong> Beta is enabled.</label><br>
+# MAGIC   <label><input type="checkbox"> The selected SQL warehouse exists and you have <code>CAN_USE</code>.</label><br>
+# MAGIC   <label><input type="checkbox"> The selected Unity Catalog exists and you can create/use the target schema.</label><br>
+# MAGIC   <label><input type="checkbox"> The selected model serving endpoint exists and is callable.</label><br>
+# MAGIC   <label><input type="checkbox"> If <code>lakebase_mode</code> is not <code>skip</code>, Lakebase Autoscaling is available.</label>
+# MAGIC </div>
+
+# COMMAND ----------
 from databricks.sdk import WorkspaceClient
 
 import scripts.deploy_lib.app_yaml
@@ -68,7 +84,6 @@ import scripts.deploy_lib.genie_spaces
 import scripts.deploy_lib.gso_job
 import scripts.deploy_lib.install
 import scripts.deploy_lib.lakebase
-import scripts.deploy_lib.preflight
 import scripts.deploy_lib.uc
 import scripts.deploy_lib.verify
 import scripts.deploy_lib.workspace_source
@@ -80,7 +95,6 @@ for module in [
     scripts.deploy_lib.config,
     scripts.deploy_lib.genie_spaces,
     scripts.deploy_lib.lakebase,
-    scripts.deploy_lib.preflight,
     scripts.deploy_lib.uc,
     scripts.deploy_lib.verify,
     scripts.deploy_lib.gso_job,

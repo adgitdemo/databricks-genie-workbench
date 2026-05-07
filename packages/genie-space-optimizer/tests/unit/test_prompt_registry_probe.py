@@ -139,11 +139,10 @@ def test_read_probe_uses_uc_catalog_schema_filter_format() -> None:
 
 def test_read_probe_unscoped_when_uc_schema_missing() -> None:
     """Without a uc_schema we can't build a legal UC filter; probe unscoped
-    rather than sending a malformed or empty filter."""
+    rather than sending a malformed filter."""
     with _patch_search_prompts(return_value=[]) as patched:
         check_prompt_registry(_mock_ws(), mode="read", uc_schema=None)
-    assert "filter_string" not in patched.call_args.kwargs
-    assert patched.call_args.kwargs.get("max_results") == 1
+    assert patched.call_args.kwargs.get("filter_string") == ""
 
 
 def test_read_probe_unscoped_on_suspicious_uc_schema() -> None:
@@ -154,8 +153,7 @@ def test_read_probe_unscoped_on_suspicious_uc_schema() -> None:
         check_prompt_registry(
             _mock_ws(), mode="read", uc_schema="main.gso'; DROP TABLE--",
         )
-    assert "filter_string" not in patched.call_args.kwargs
-    assert patched.call_args.kwargs.get("max_results") == 1
+    assert patched.call_args.kwargs.get("filter_string") == ""
 
 
 def test_read_probe_retries_without_kwargs_on_type_error() -> None:

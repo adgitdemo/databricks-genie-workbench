@@ -505,17 +505,16 @@ def _probe_read(uc_schema: str | None) -> ProbeResult:
             },
         )
 
-    # Scope the search to our target catalog.schema when we can build a
-    # legal filter. Do not pass an empty filter_string: some workspaces
-    # reject that as INVALID_PARAMETER_VALUE even though an unfiltered
-    # search is accepted.
+    # Scope the search to our target catalog.schema. Unity Catalog prompt
+    # registries REQUIRE a filter_string of exactly the shape
+    # ``catalog = 'X' AND schema = 'Y'`` — anything else (including
+    # ``name LIKE 'X.Y.%'``) returns INVALID_PARAMETER_VALUE. We learned
+    # this the hard way; see tests/unit/test_prompt_registry_probe.py::
+    # test_read_probe_uses_uc_catalog_schema_filter_format.
     filter_string = _build_uc_filter_string(uc_schema)
-    search_kwargs = {"max_results": 1}
-    if filter_string:
-        search_kwargs["filter_string"] = filter_string
 
     try:
-        search_fn(**search_kwargs)
+        search_fn(filter_string=filter_string, max_results=1)
     except TypeError:
         # Older/newer SDK signatures may not accept filter_string or
         # max_results. Retry with no kwargs before giving up — we still
