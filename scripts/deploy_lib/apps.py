@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import timedelta
 from typing import Any
 
 from .config import InstallConfig, LakebaseInfo
@@ -191,14 +192,26 @@ def patch_app_resources(
     return payload
 
 
-def deploy_app_from_workspace(w, app_name: str, source_path: str) -> dict[str, Any]:
+def deploy_app_from_workspace(
+    w,
+    app_name: str,
+    source_path: str,
+    *,
+    timeout_seconds: int = 1200,
+) -> dict[str, Any]:
     start_app_if_needed(w, app_name)
-    return api_do(
-        w,
-        "POST",
-        f"/api/2.0/apps/{app_name}/deployments",
-        {"source_code_path": source_path},
+    from databricks.sdk.service.apps import AppDeployment, AppDeploymentMode
+
+    deployment = w.apps.deploy_and_wait(
+        app_name,
+        AppDeployment(source_code_path=source_path, mode=AppDeploymentMode.SNAPSHOT),
+        timeout=timedelta(seconds=timeout_seconds),
     )
+    if hasattr(deployment, "as_dict"):
+        return deployment.as_dict()
+    if isinstance(deployment, dict):
+        return deployment
+    return {}
 
 
 DEPLOYMENT_SUCCESS_STATES = {"SUCCEEDED", "SUCCESS"}

@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 
 from scripts.deploy_lib.app_yaml import render_text
-from scripts.deploy_lib.apps import get_app_service_principal, patch_app_resources, require_successful_deployment, wait_for_deployment
+from scripts.deploy_lib.apps import (
+    deploy_app_from_workspace,
+    get_app_service_principal,
+    patch_app_resources,
+    require_successful_deployment,
+    wait_for_deployment,
+)
 from scripts.deploy_lib.config import InstallConfig, LakebaseInfo
 from scripts.deploy_lib.genie_spaces import optionally_grant_genie_spaces
 from scripts.deploy_lib.gso_job import build_job_settings, find_existing_job, upsert_job
@@ -36,6 +42,24 @@ class FakeApiClient:
 class FakeWorkspaceClient:
     def __init__(self, responses=None):
         self.api_client = FakeApiClient(responses)
+
+
+class FakeApps:
+    def __init__(self):
+        self.deployments = []
+
+    def deploy_and_wait(self, app_name, app_deployment, timeout):
+        self.deployments.append((app_name, app_deployment.as_dict(), timeout.total_seconds()))
+        return type(
+            "Deployment",
+            (),
+            {
+                "as_dict": lambda _self: {
+                    "deployment_id": "dep-1",
+                    "status": {"state": "SUCCEEDED"},
+                }
+            },
+        )()
 
 
 class FakeOp:
@@ -224,6 +248,37 @@ def test_patch_app_resources_preserves_existing_and_adds_postgres():
     assert "keep-me" in resources
     assert "iam.access-control:read" not in payload["user_api_scopes"]
     assert any(call[0] == "PATCH" and call[1] == "/api/2.0/apps/genie-workbench" for call in w.api_client.calls)
+
+
+def test_deploy_app_from_workspace_uses_sdk_waiter():
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): {
+                "compute_status": {"state": "ACTIVE"}
+            }
+        }
+    )
+    w.apps = FakeApps()
+
+    deployment = deploy_app_from_workspace(
+        w,
+        "genie-workbench",
+        "/Workspace/Users/me/.genie-workbench-deploy/app",
+        timeout_seconds=30,
+    )
+
+    assert deployment["deployment_id"] == "dep-1"
+    assert deployment["status"]["state"] == "SUCCEEDED"
+    assert w.apps.deployments == [
+        (
+            "genie-workbench",
+            {
+                "mode": "SNAPSHOT",
+                "source_code_path": "/Workspace/Users/me/.genie-workbench-deploy/app",
+            },
+            30.0,
+        )
+    ]
 
 
 def test_get_app_service_principal_waits_for_async_app_create(monkeypatch):
