@@ -71,6 +71,21 @@ Local terminal installer additionally requires:
 
 Auto-Optimize requires MLflow Prompt Registry to be enabled in the workspace. Lakebase is optional, but without it scan history, starred spaces, and agent sessions are stored in memory only.
 
+### Installer permissions
+
+The installer creates a Databricks App, UC schema/volume/tables, a Lakebase Autoscaling project, an optional MLflow experiment, and a Jobs-managed optimization job, and grants the app's service principal across all of them. **Most installers will need workspace-admin equivalents.** At minimum, the installer needs:
+
+- Apps create entitlement and `CAN_MANAGE` on the resulting app
+- `CAN_USE` on the SQL warehouse
+- `USE CATALOG` + `CREATE SCHEMA` on the target catalog (and ownership / `MANAGE` to grant the SP)
+- Lakebase Autoscaling project creation and ownership (to create the Postgres role and run database `GRANT`s)
+- Workspace files write for `databricks sync` and the MLflow experiment path
+- Jobs create entitlement and `CAN_MANAGE` on the GSO job
+- `CAN_MANAGE` on any Genie Spaces being granted to the app SP (optional step)
+- Workspace admin to enable MLflow Prompt Registry, if it is not already on
+
+For the full list and a step-by-step mapping (install action → required permission → code reference), see [docs/03-authentication-and-permissions.md → Installer Permissions](docs/03-authentication-and-permissions.md#installer-permissions).
+
 ## Documentation
 
 Start with [docs/00-index.md](docs/00-index.md) for the full documentation map.

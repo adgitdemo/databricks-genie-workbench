@@ -9,14 +9,25 @@ Both paths deploy the same app and provision the same core resources. The local 
 
 ## Prerequisites
 
+### Workspace resources
+
 - A Databricks workspace with:
   - Apps enabled
   - A SQL Warehouse (Serverless recommended)
-  - A Unity Catalog with CREATE SCHEMA permission
-  - Permission to create or use a Lakebase Autoscaling project for persistent scan history and sessions
+  - A Unity Catalog where the GSO schema can be created
+  - Lakebase Autoscaling available (optional but recommended for persistent scan history, starred spaces, and agent sessions)
   - MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
+  - The configured LLM model serving endpoint exists and is callable
 
-For the local terminal installer:
+### Installer permissions
+
+The installer creates apps, UC objects, Lakebase projects, MLflow experiments, and jobs, and grants the app SP across all of them. **The person running the installer typically needs workspace-admin equivalents.** Non-admins can install only if they hold every entitlement listed in [Authentication & Permissions — Installer Permissions](03-authentication-and-permissions.md#installer-permissions), which also maps each install step to the specific permission it needs.
+
+If you are uncertain, the safest path is to have a workspace admin run the installer (or pair with you while you run it).
+
+### Local terminal installer
+
+Additional local tooling:
 
 - [Databricks CLI](https://docs.databricks.com/dev-tools/cli/install.html) **v0.297.2+** (validated by preflight)
 - [uv](https://docs.astral.sh/uv/) - Python package manager
@@ -24,7 +35,9 @@ For the local terminal installer:
 - Python 3.11+
 - Network access to your configured npm registry. Databricks internal users can use `npm config set registry https://npm-proxy.dev.databricks.com/`; external users should use `npm config set registry https://registry.npmjs.org/`.
 
-For the Databricks notebook installer:
+### Databricks notebook installer
+
+Additional requirements:
 
 - Repo cloned into a Databricks Git folder
 - A Databricks compute session that can run `%pip install`
@@ -90,6 +103,8 @@ Use this path when you are already working inside Databricks and do not want a l
 | `lakebase_mode` | Yes | `create`, `existing`, or `skip` |
 | `lakebase_instance` | Conditional | Lakebase project name for `create` or `existing` |
 | `grant_genie_spaces` | No | Whether to grant visible Genie Spaces to the app SP |
+
+The notebook user must hold the same permissions listed in [Authentication & Permissions — Installer Permissions](03-authentication-and-permissions.md#installer-permissions). In particular, granting Genie Spaces requires `CAN_MANAGE` on each selected space.
 
 4. Run the notebook from the top.
 
