@@ -155,23 +155,35 @@ def run_preflight(w, cfg: InstallConfig, *, repo_root: Path | None = None) -> Pr
     probe = check_prompt_registry(w, mode="read", uc_schema=None, bypass_cache=True)
     if not probe.available:
         if getattr(probe, "reason_code", "") == REASON_FEATURE_NOT_ENABLED:
-            remediation = (
-                "Ask a workspace admin to enable the MLflow Prompt Registry beta "
-                "from the Databricks Previews page."
+            issues.append(
+                PreflightIssue(
+                    check="mlflow-prompt-registry",
+                    message=(
+                        probe.user_message
+                        or probe.raw_error
+                        or "MLflow Prompt Registry is not enabled."
+                    ),
+                    remediation=(
+                        "Ask a workspace admin to enable the MLflow Prompt Registry beta "
+                        "from the Databricks Previews page."
+                    ),
+                )
             )
         else:
-            remediation = (
-                "Prompt Registry appears enabled but the availability probe failed. "
-                "Retry the installer after pulling the latest notebook code; if it still fails, "
-                "share the trace ID and error code with Databricks support."
+            warnings.append(
+                PreflightIssue(
+                    check="mlflow-prompt-registry",
+                    message=(
+                        probe.user_message
+                        or probe.raw_error
+                        or "MLflow Prompt Registry availability probe failed."
+                    ),
+                    remediation=(
+                        "Continuing installation. Auto-Optimize still runs its own write-path "
+                        "Prompt Registry preflight after the installer creates the target UC schema."
+                    ),
+                )
             )
-        issues.append(
-            PreflightIssue(
-                check="mlflow-prompt-registry",
-                message=probe.user_message or probe.raw_error or "MLflow Prompt Registry probe failed.",
-                remediation=remediation,
-            )
-        )
 
     if cfg.lakebase_mode == "skip":
         warnings.append(

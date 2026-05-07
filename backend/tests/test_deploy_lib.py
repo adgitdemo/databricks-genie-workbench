@@ -333,6 +333,7 @@ def test_run_preflight_fails_when_prompt_registry_disabled(monkeypatch):
         "scripts.deploy_lib.preflight.check_prompt_registry",
         lambda *_args, **_kwargs: SimpleNamespace(
             available=False,
+            reason_code="feature_not_enabled",
             user_message="MLflow Prompt Registry is not enabled on this workspace.",
             raw_error="FEATURE_DISABLED",
         ),
@@ -340,6 +341,29 @@ def test_run_preflight_fails_when_prompt_registry_disabled(monkeypatch):
 
     with pytest.raises(PreflightError, match="MLflow Prompt Registry"):
         run_preflight(w, cfg, repo_root=Path.cwd())
+
+
+def test_run_preflight_warns_when_prompt_registry_probe_hits_platform_error(monkeypatch):
+    w = FakeWorkspaceClient(_preflight_responses())
+    cfg = InstallConfig(
+        app_name="genie-workbench",
+        catalog="main",
+        warehouse_id="warehouse-1",
+        repo_root=str(Path.cwd()),
+    )
+    monkeypatch.setattr(
+        "scripts.deploy_lib.preflight.check_prompt_registry",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            available=False,
+            reason_code="vendor_bug",
+            user_message="MLflow Prompt Registry returned INVALID_PARAMETER_VALUE.",
+            raw_error="INVALID_PARAMETER_VALUE",
+        ),
+    )
+
+    result = run_preflight(w, cfg, repo_root=Path.cwd())
+
+    assert [warning.check for warning in result.warnings] == ["mlflow-prompt-registry"]
 
 
 def test_verify_app_user_authorization_scopes_preserves_resources():
