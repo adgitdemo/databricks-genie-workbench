@@ -240,6 +240,7 @@ def wait_for_deployment(
     app_name: str,
     *,
     submitted_deployment: dict[str, Any] | None = None,
+    baseline_active_token: str | None = None,
     timeout_seconds: int = 180,
     poll_seconds: int = 10,
 ) -> dict[str, Any]:
@@ -248,13 +249,14 @@ def wait_for_deployment(
     deadline = time.time() + timeout_seconds
     last_app: dict[str, Any] = {}
     observed_pending = False
-    baseline_active_token: str | None = None
+    baseline_captured = baseline_active_token is not None
     while time.time() < deadline:
         last_app = get_app(w, app_name) or {}
         pending = last_app.get("pending_deployment") or {}
         active = last_app.get("active_deployment") or {}
-        if wait_for_submitted and not observed_pending and baseline_active_token is None:
+        if wait_for_submitted and not baseline_captured:
             baseline_active_token = deployment_token(active)
+            baseline_captured = True
 
         if submitted_token:
             for deployment in (pending, active):
@@ -263,6 +265,18 @@ def wait_for_deployment(
                 if deployment_state(deployment) not in DEPLOYMENT_PENDING_STATES:
                     return _selected_app(last_app, deployment)
                 break
+            if pending:
+                observed_pending = True
+                if deployment_state(pending) not in DEPLOYMENT_PENDING_STATES:
+                    return _selected_app(last_app, pending)
+            elif active:
+                active_token = deployment_token(active)
+                if (
+                    active_token
+                    and active_token != (baseline_active_token or "")
+                    and deployment_state(active) not in DEPLOYMENT_PENDING_STATES
+                ):
+                    return _selected_app(last_app, active)
         elif wait_for_submitted:
             if pending:
                 observed_pending = True
