@@ -10,7 +10,7 @@ import tempfile
 from typing import Any
 from urllib.parse import quote
 
-from .config import GsoJobInfo, InstallConfig
+from .config import GSO_JOB_BASENAME, GsoJobInfo, InstallConfig
 from .workspace_source import (
     default_gso_path,
     mkdirs,
@@ -152,6 +152,7 @@ def _task_payload(task_key: str, notebook_stem: str, depends_on: str | None, not
 
 
 def build_job_settings(cfg: InstallConfig, notebooks_path: str, wheel_path: str) -> dict[str, Any]:
+    cfg = cfg.normalized()
     tasks = [_task_payload(*task, notebooks_path) for task in TASKS]
     tasks.append(
         {
@@ -187,12 +188,20 @@ def build_job_settings(cfg: InstallConfig, notebooks_path: str, wheel_path: str)
     }
 
 
-def _job_matches_settings(job: dict[str, Any], settings: dict[str, Any]) -> bool:
+def _job_matches_settings(
+    job: dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    allow_legacy_name: bool = False,
+) -> bool:
     job_settings = job.get("settings") or {}
     job_tags = job_settings.get("tags") or {}
     tags = settings.get("tags") or {}
+    job_name = job_settings.get("name")
+    expected_name = settings.get("name")
+    name_matches = job_name == expected_name or (allow_legacy_name and job_name == GSO_JOB_BASENAME)
     return (
-        job_settings.get("name") == settings.get("name")
+        name_matches
         and job_tags.get("app") == tags.get("app")
         and job_tags.get("managed-by") == tags.get("managed-by")
         and job_tags.get("pattern") == tags.get("pattern")
@@ -201,6 +210,7 @@ def _job_matches_settings(job: dict[str, Any], settings: dict[str, Any]) -> bool
 
 def find_existing_job(w, settings: dict[str, Any]) -> int | None:
     page_token: str | None = None
+    legacy_id: int | None = None
     while True:
         path = "/api/2.1/jobs/list?limit=100&expand_tasks=false"
         if page_token:
@@ -209,10 +219,12 @@ def find_existing_job(w, settings: dict[str, Any]) -> int | None:
         for job in data.get("jobs") or []:
             if _job_matches_settings(job, settings):
                 return int(job["job_id"])
+            if legacy_id is None and _job_matches_settings(job, settings, allow_legacy_name=True):
+                legacy_id = int(job["job_id"])
         page_token = data.get("next_page_token")
         if not page_token:
             break
-    return None
+    return legacy_id
 
 
 def upsert_job(w, settings: dict[str, Any]) -> int:
@@ -266,6 +278,7 @@ def grant_directory_permissions(w, workspace_dir: str, app_sp_client_id: str) ->
 
 
 def ensure_gso_job(w, cfg: InstallConfig, app_sp_client_id: str, deployer_user: str) -> GsoJobInfo:
+    cfg = cfg.normalized()
     notebooks_path = upload_job_notebooks(w, cfg, deployer_user)
     wheel_path = upload_gso_wheel(w, cfg)
     settings = build_job_settings(cfg, notebooks_path, wheel_path)

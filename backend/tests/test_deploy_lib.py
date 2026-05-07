@@ -130,6 +130,7 @@ def test_config_validation_normalizes_lakebase_defaults():
     ).normalized()
 
     assert cfg.lakebase_instance == "genie-workbench-lakebase"
+    assert cfg.gso_job_name == "genie-workbench-gso-optimization-job"
     cfg.validate()
 
     with pytest.raises(ValueError, match="app_name"):
@@ -317,7 +318,7 @@ def test_gso_job_settings_match_persistent_dag_shape():
         "/Volumes/main/genie_space_optimizer/app_artifacts/genie_space_optimizer-0.0.0-py3-none-any.whl",
     )
 
-    assert settings["name"] == "gso-optimization-job"
+    assert settings["name"] == "genie-workbench-gso-optimization-job"
     assert settings["queue"]["enabled"] is True
     assert settings["tags"]["app"] == "genie-workbench"
     assert settings["tags"]["managed-by"] == "notebook-installer"
@@ -343,6 +344,7 @@ def test_gso_job_settings_tag_with_actual_app_name():
 
     assert settings["tags"]["app"] == "genie-workbench-dh2"
     assert settings["tags"]["managed-by"] == "notebook-installer"
+    assert settings["name"] == "genie-workbench-dh2-gso-optimization-job"
 
 
 def test_genie_space_grant_patches_can_manage_without_replacing_acl():
@@ -436,7 +438,7 @@ def test_find_existing_job_scopes_reuse_to_current_notebook_app():
                     {
                         "job_id": 102,
                         "settings": {
-                            "name": "gso-optimization-job",
+                            "name": settings["name"],
                             "tags": settings["tags"],
                         },
                     },
@@ -446,6 +448,67 @@ def test_find_existing_job_scopes_reuse_to_current_notebook_app():
     )
 
     assert find_existing_job(w, settings) == 102
+
+
+def test_find_existing_job_prefers_prefixed_name_over_legacy_same_app_job():
+    cfg = InstallConfig(
+        app_name="genie-workbench-dh2",
+        catalog="main",
+        warehouse_id="wh",
+        repo_root="/tmp",
+    )
+    settings = build_job_settings(cfg, "/Workspace/Users/me/gso/jobs", "/Volumes/main/schema/wheel.whl")
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.1/jobs/list?limit=100&expand_tasks=false"): {
+                "jobs": [
+                    {
+                        "job_id": 101,
+                        "settings": {
+                            "name": "gso-optimization-job",
+                            "tags": settings["tags"],
+                        },
+                    },
+                    {
+                        "job_id": 102,
+                        "settings": {
+                            "name": settings["name"],
+                            "tags": settings["tags"],
+                        },
+                    },
+                ]
+            }
+        }
+    )
+
+    assert find_existing_job(w, settings) == 102
+
+
+def test_find_existing_job_reuses_legacy_same_app_job_for_rename():
+    cfg = InstallConfig(
+        app_name="genie-workbench-dh2",
+        catalog="main",
+        warehouse_id="wh",
+        repo_root="/tmp",
+    )
+    settings = build_job_settings(cfg, "/Workspace/Users/me/gso/jobs", "/Volumes/main/schema/wheel.whl")
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.1/jobs/list?limit=100&expand_tasks=false"): {
+                "jobs": [
+                    {
+                        "job_id": 101,
+                        "settings": {
+                            "name": "gso-optimization-job",
+                            "tags": settings["tags"],
+                        },
+                    }
+                ]
+            }
+        }
+    )
+
+    assert find_existing_job(w, settings) == 101
 
 
 def test_find_existing_job_paginates_to_matching_job():
@@ -479,7 +542,7 @@ def test_find_existing_job_paginates_to_matching_job():
                     {
                         "job_id": 200,
                         "settings": {
-                            "name": "gso-optimization-job",
+                            "name": settings["name"],
                             "tags": settings["tags"],
                         },
                     }
@@ -506,7 +569,7 @@ def test_upsert_job_creates_when_same_name_job_is_not_current_app():
                     {
                         "job_id": 100,
                         "settings": {
-                            "name": "gso-optimization-job",
+                            "name": settings["name"],
                             "tags": {
                                 "app": "genie-workbench",
                                 "managed-by": "notebook-installer",

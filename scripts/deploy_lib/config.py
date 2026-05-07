@@ -10,6 +10,14 @@ from typing import Any, Literal
 LakebaseMode = Literal["create", "existing", "skip"]
 
 APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+GSO_JOB_BASENAME = "gso-optimization-job"
+
+
+def default_gso_job_name(app_name: str) -> str:
+    app_name = (app_name or "").strip()
+    if not app_name:
+        return GSO_JOB_BASENAME
+    return f"{app_name}-{GSO_JOB_BASENAME}"
 
 
 @dataclass(frozen=True)
@@ -43,17 +51,19 @@ class InstallConfig:
     deploy_workspace_path: str | None = None
     grant_genie_spaces: bool = False
     update_only: bool = False
-    gso_job_name: str = "gso-optimization-job"
+    gso_job_name: str = ""
     gso_wheel_path: str | None = None
 
     def normalized(self) -> "InstallConfig":
+        app_name = self.app_name.strip()
         lakebase_instance = (self.lakebase_instance or "").strip() or None
         if self.lakebase_mode == "create" and not lakebase_instance:
-            lakebase_instance = f"{self.app_name}-lakebase"
+            lakebase_instance = f"{app_name}-lakebase"
         if self.lakebase_mode == "skip":
             lakebase_instance = None
+        gso_job_name = (self.gso_job_name or "").strip() or default_gso_job_name(app_name)
         return InstallConfig(
-            app_name=self.app_name.strip(),
+            app_name=app_name,
             catalog=self.catalog.strip(),
             warehouse_id=self.warehouse_id.strip(),
             llm_model=(self.llm_model or "databricks-claude-sonnet-4-6").strip(),
@@ -65,7 +75,7 @@ class InstallConfig:
             deploy_workspace_path=(self.deploy_workspace_path or "").strip() or None,
             grant_genie_spaces=bool(self.grant_genie_spaces),
             update_only=bool(self.update_only),
-            gso_job_name=(self.gso_job_name or "gso-optimization-job").strip(),
+            gso_job_name=gso_job_name,
             gso_wheel_path=(self.gso_wheel_path or "").strip() or None,
         )
 
@@ -107,4 +117,3 @@ class InstallResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-
