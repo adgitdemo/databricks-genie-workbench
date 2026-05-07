@@ -82,6 +82,8 @@ def should_copy(path: Path, repo_root: Path) -> bool:
 
     if rel == "backend/references/schema.md":
         return True
+    if name == ".env" or name.startswith(".env."):
+        return False
     if name in EXCLUDE_NAMES:
         return False
     if path.suffix in EXCLUDE_SUFFIXES:

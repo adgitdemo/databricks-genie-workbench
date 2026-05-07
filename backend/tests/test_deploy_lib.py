@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 
 from scripts.deploy_lib.app_yaml import render_text
-from scripts.deploy_lib.apps import get_app_service_principal, patch_app_resources, require_successful_deployment
+from scripts.deploy_lib.apps import get_app_service_principal, patch_app_resources, require_successful_deployment, wait_for_deployment
 from scripts.deploy_lib.config import InstallConfig, LakebaseInfo
 from scripts.deploy_lib.genie_spaces import optionally_grant_genie_spaces
 from scripts.deploy_lib.gso_job import build_job_settings, find_existing_job, upsert_job
-from scripts.deploy_lib.lakebase import get_database_resource
+from scripts.deploy_lib.lakebase import ensure_lakebase, get_database_resource
 from scripts.deploy_lib.uc import update_grants
 from scripts.deploy_lib.workspace_source import mkdirs, should_copy, upload_source_notebook, workspace_api_path
 
@@ -36,6 +36,37 @@ class FakeApiClient:
 class FakeWorkspaceClient:
     def __init__(self, responses=None):
         self.api_client = FakeApiClient(responses)
+
+
+class FakeOp:
+    def wait(self):
+        return None
+
+
+class FakePostgres:
+    def __init__(self, *, project_exists=True):
+        self.project_exists = project_exists
+        self.created_projects = []
+        self.created_roles = []
+
+    def get_project(self, *, name):
+        if not self.project_exists:
+            from databricks.sdk.errors import NotFound
+
+            raise NotFound(f"{name} not found")
+        return {"name": name}
+
+    def create_project(self, *, project, project_id):
+        self.created_projects.append(project_id)
+        self.project_exists = True
+        return FakeOp()
+
+    def create_role(self, **kwargs):
+        self.created_roles.append(kwargs)
+        return FakeOp()
+
+    def get_endpoint(self, *, name):
+        raise RuntimeError(f"{name} unavailable")
 
 
 def test_render_text_replaces_placeholders_and_fails_on_unresolved():
@@ -98,6 +129,9 @@ def test_workspace_source_inclusion_rules(tmp_path):
         "README.md",
         "requirements.txt",
         ".env.deploy",
+        ".env.local",
+        ".env.production",
+        "backend/.env.local",
         "scripts/deploy.sh",
         "notebooks/install.py",
         "frontend/package.json",
@@ -120,6 +154,9 @@ def test_workspace_source_inclusion_rules(tmp_path):
     assert not should_copy(repo / "README.md", repo)
     assert not should_copy(repo / "requirements.txt", repo)
     assert not should_copy(repo / ".env.deploy", repo)
+    assert not should_copy(repo / ".env.local", repo)
+    assert not should_copy(repo / ".env.production", repo)
+    assert not should_copy(repo / "backend/.env.local", repo)
     assert not should_copy(repo / "scripts/deploy.sh", repo)
     assert not should_copy(repo / "notebooks/install.py", repo)
     assert not should_copy(repo / "frontend/node_modules/pkg/index.js", repo)
@@ -446,6 +483,83 @@ def test_require_successful_deployment_returns_successful_deployment():
     ) == deployment
 
 
+def test_wait_for_deployment_ignores_old_active_deployment(monkeypatch):
+    monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): [
+                {"active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}}},
+                {
+                    "pending_deployment": {"deployment_id": "new", "status": {"state": "RUNNING"}},
+                    "active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}},
+                },
+                {"active_deployment": {"deployment_id": "new", "status": {"state": "SUCCEEDED"}}},
+            ]
+        }
+    )
+
+    app = wait_for_deployment(
+        w,
+        "genie-workbench",
+        submitted_deployment={"deployment_id": "new"},
+        timeout_seconds=1,
+        poll_seconds=0,
+    )
+
+    assert app["pending_deployment"]["deployment_id"] == "new"
+    assert app["pending_deployment"]["status"]["state"] == "SUCCEEDED"
+
+
+def test_wait_for_deployment_without_token_waits_for_new_pending(monkeypatch):
+    monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): [
+                {"active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}}},
+                {
+                    "pending_deployment": {"deployment_id": "new", "status": {"state": "RUNNING"}},
+                    "active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}},
+                },
+                {"active_deployment": {"deployment_id": "new", "status": {"state": "SUCCEEDED"}}},
+            ]
+        }
+    )
+
+    app = wait_for_deployment(
+        w,
+        "genie-workbench",
+        submitted_deployment={},
+        timeout_seconds=1,
+        poll_seconds=0,
+    )
+
+    assert app["pending_deployment"]["deployment_id"] == "new"
+    assert app["pending_deployment"]["status"]["state"] == "SUCCEEDED"
+
+
+def test_wait_for_deployment_selects_failed_submitted_deployment(monkeypatch):
+    monkeypatch.setattr("scripts.deploy_lib.apps.time.sleep", lambda _seconds: None)
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): {
+                "pending_deployment": {"deployment_id": "new", "status": {"state": "FAILED"}},
+                "active_deployment": {"deployment_id": "old", "status": {"state": "SUCCEEDED"}},
+            }
+        }
+    )
+
+    app = wait_for_deployment(
+        w,
+        "genie-workbench",
+        submitted_deployment={"deployment_id": "new"},
+        timeout_seconds=1,
+        poll_seconds=0,
+    )
+
+    with pytest.raises(RuntimeError, match="genie-workbench.*FAILED"):
+        require_successful_deployment("genie-workbench", app)
+
+
 def test_uc_update_grants_uses_permissions_api():
     w = FakeWorkspaceClient()
     update_grants(
@@ -481,3 +595,51 @@ def test_lakebase_get_database_resource_reads_first_database_name():
         get_database_resource(w, "lb")
         == "projects/lb/branches/production/databases/databricks_postgres"
     )
+
+
+def test_lakebase_existing_mode_requires_existing_project():
+    w = FakeWorkspaceClient()
+    w.postgres = FakePostgres(project_exists=False)
+    cfg = InstallConfig(
+        app_name="genie-workbench",
+        catalog="main",
+        warehouse_id="wh",
+        repo_root="/tmp",
+        lakebase_mode="existing",
+        lakebase_instance="missing-lakebase",
+    )
+
+    with pytest.raises(RuntimeError, match="missing-lakebase.*does not exist"):
+        ensure_lakebase(w, cfg, "sp-client-id")
+
+    assert w.postgres.created_projects == []
+
+
+def test_lakebase_create_mode_creates_missing_project():
+    w = FakeWorkspaceClient(
+        {
+            (
+                "GET",
+                "/api/2.0/postgres/projects/new-lakebase/branches/production/databases",
+            ): {
+                "databases": [
+                    {"name": "projects/new-lakebase/branches/production/databases/databricks_postgres"}
+                ]
+            }
+        }
+    )
+    w.config = type("Config", (), {"client_id": None})()
+    w.postgres = FakePostgres(project_exists=False)
+    cfg = InstallConfig(
+        app_name="genie-workbench",
+        catalog="main",
+        warehouse_id="wh",
+        repo_root="/tmp",
+        lakebase_mode="create",
+        lakebase_instance="new-lakebase",
+    )
+
+    lakebase = ensure_lakebase(w, cfg, "sp-client-id")
+
+    assert w.postgres.created_projects == ["new-lakebase"]
+    assert lakebase.database_resource == "projects/new-lakebase/branches/production/databases/databricks_postgres"

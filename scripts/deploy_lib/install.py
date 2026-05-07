@@ -88,9 +88,15 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     status("Configuring app scopes and resources...")
     resources_payload = patch_app_resources(w, cfg, lakebase)
     status("Triggering Databricks App deployment...")
-    deploy_app_from_workspace(w, cfg.app_name, source_path)
+    submitted_deployment = deploy_app_from_workspace(w, cfg.app_name, source_path)
     status("Waiting for app deployment status...")
-    deployed_app = wait_for_deployment(w, cfg.app_name, timeout_seconds=180, poll_seconds=10)
+    deployed_app = wait_for_deployment(
+        w,
+        cfg.app_name,
+        submitted_deployment=submitted_deployment,
+        timeout_seconds=180,
+        poll_seconds=10,
+    )
     deployment = require_successful_deployment(cfg.app_name, deployed_app)
 
     status("Processing optional Genie Space grants...")

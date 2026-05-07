@@ -194,13 +194,37 @@ DEPLOYMENT_SUCCESS_STATES = {"SUCCEEDED", "SUCCESS"}
 DEPLOYMENT_PENDING_STATES = {"", "UNKNOWN", "IN_PROGRESS", "PENDING", "QUEUED", "RUNNING"}
 
 
+def deployment_token(deployment: dict[str, Any] | None) -> str:
+    if not isinstance(deployment, dict):
+        return ""
+    direct = deployment.get("deployment_id") or deployment.get("id") or ""
+    if direct:
+        return str(direct)
+    nested = deployment.get("deployment")
+    if isinstance(nested, dict):
+        return str(nested.get("deployment_id") or nested.get("id") or "")
+    return ""
+
+
+def deployment_state(deployment: dict[str, Any] | None) -> str:
+    if not isinstance(deployment, dict):
+        return "UNKNOWN"
+    return str(((deployment.get("status") or {}).get("state") or "UNKNOWN")).upper()
+
+
+def _selected_app(app: dict[str, Any], deployment: dict[str, Any]) -> dict[str, Any]:
+    selected = dict(app)
+    selected["pending_deployment"] = deployment
+    selected.pop("active_deployment", None)
+    return selected
+
+
 def app_deployment(app: dict[str, Any]) -> dict[str, Any]:
     return app.get("pending_deployment") or app.get("active_deployment") or {}
 
 
 def app_deployment_state(app: dict[str, Any]) -> str:
-    deployment = app_deployment(app)
-    return str(((deployment.get("status") or {}).get("state") or "UNKNOWN")).upper()
+    return deployment_state(app_deployment(app))
 
 
 def require_successful_deployment(app_name: str, app: dict[str, Any]) -> dict[str, Any]:
@@ -215,15 +239,52 @@ def wait_for_deployment(
     w,
     app_name: str,
     *,
+    submitted_deployment: dict[str, Any] | None = None,
     timeout_seconds: int = 180,
     poll_seconds: int = 10,
 ) -> dict[str, Any]:
+    submitted_token = deployment_token(submitted_deployment)
+    wait_for_submitted = submitted_deployment is not None
     deadline = time.time() + timeout_seconds
     last_app: dict[str, Any] = {}
+    observed_pending = False
+    baseline_active_token: str | None = None
     while time.time() < deadline:
         last_app = get_app(w, app_name) or {}
-        state = app_deployment_state(last_app)
-        if state not in DEPLOYMENT_PENDING_STATES:
-            return last_app
+        pending = last_app.get("pending_deployment") or {}
+        active = last_app.get("active_deployment") or {}
+        if wait_for_submitted and not observed_pending and baseline_active_token is None:
+            baseline_active_token = deployment_token(active)
+
+        if submitted_token:
+            for deployment in (pending, active):
+                if deployment_token(deployment) != submitted_token:
+                    continue
+                if deployment_state(deployment) not in DEPLOYMENT_PENDING_STATES:
+                    return _selected_app(last_app, deployment)
+                break
+        elif wait_for_submitted:
+            if pending:
+                observed_pending = True
+                if deployment_state(pending) not in DEPLOYMENT_PENDING_STATES:
+                    return _selected_app(last_app, pending)
+            elif observed_pending and active:
+                active_token = deployment_token(active)
+                if (
+                    active_token
+                    and active_token != baseline_active_token
+                    and deployment_state(active) not in DEPLOYMENT_PENDING_STATES
+                ):
+                    return _selected_app(last_app, active)
+        else:
+            state = app_deployment_state(last_app)
+            if state not in DEPLOYMENT_PENDING_STATES:
+                return last_app
+
         time.sleep(poll_seconds)
+    if wait_for_submitted:
+        pending = last_app.get("pending_deployment") or {}
+        if pending:
+            return _selected_app(last_app, pending)
+        return _selected_app(last_app, {})
     return last_app

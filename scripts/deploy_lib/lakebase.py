@@ -30,6 +30,21 @@ def ensure_project(w, project_name: str) -> str:
     return resource_name
 
 
+def require_project(w, project_name: str) -> str:
+    from databricks.sdk.errors import NotFound
+
+    resource_name = f"projects/{project_name}"
+    try:
+        w.postgres.get_project(name=resource_name)
+    except NotFound as exc:
+        raise RuntimeError(
+            f"Lakebase project '{project_name}' does not exist. "
+            "Choose lakebase_mode=create to create a new project, or fix the "
+            "lakebase_instance widget to an existing project name."
+        ) from exc
+    return resource_name
+
+
 def ensure_role(w, project_name: str, sp_client_id: str) -> None:
     from databricks.sdk.errors import AlreadyExists
     from databricks.sdk.service.postgres import (
@@ -128,7 +143,10 @@ def grant_database_permissions(
 def ensure_lakebase(w, cfg: InstallConfig, app_sp_client_id: str) -> LakebaseInfo:
     if not cfg.lakebase_instance:
         raise ValueError("lakebase_instance is required")
-    ensure_project(w, cfg.lakebase_instance)
+    if cfg.lakebase_mode == "existing":
+        require_project(w, cfg.lakebase_instance)
+    else:
+        ensure_project(w, cfg.lakebase_instance)
     ensure_role(w, cfg.lakebase_instance, app_sp_client_id)
     database_resource = get_database_resource(w, cfg.lakebase_instance)
     grants_applied = grant_database_permissions(w, cfg.lakebase_instance, app_sp_client_id)
@@ -141,4 +159,3 @@ def ensure_lakebase(w, cfg: InstallConfig, app_sp_client_id: str) -> LakebaseInf
         endpoint_resource=endpoint_resource,
         grants_applied=grants_applied,
     )
-
