@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import quote
 
 from genie_space_optimizer.common.prompt_registry import check_prompt_registry
+from genie_space_optimizer.common.prompt_registry import REASON_FEATURE_NOT_ENABLED
 
 from .apps import APP_SCOPES, api_do, get_app
 from .config import InstallConfig
@@ -153,14 +154,22 @@ def run_preflight(w, cfg: InstallConfig, *, repo_root: Path | None = None) -> Pr
     checks.append("mlflow-prompt-registry")
     probe = check_prompt_registry(w, mode="read", uc_schema=None, bypass_cache=True)
     if not probe.available:
+        if getattr(probe, "reason_code", "") == REASON_FEATURE_NOT_ENABLED:
+            remediation = (
+                "Ask a workspace admin to enable the MLflow Prompt Registry beta "
+                "from the Databricks Previews page."
+            )
+        else:
+            remediation = (
+                "Prompt Registry appears enabled but the availability probe failed. "
+                "Retry the installer after pulling the latest notebook code; if it still fails, "
+                "share the trace ID and error code with Databricks support."
+            )
         issues.append(
             PreflightIssue(
                 check="mlflow-prompt-registry",
                 message=probe.user_message or probe.raw_error or "MLflow Prompt Registry probe failed.",
-                remediation=(
-                    "Ask a workspace admin to enable the MLflow Prompt Registry beta "
-                    "from the Databricks Previews page."
-                ),
+                remediation=remediation,
             )
         )
 
