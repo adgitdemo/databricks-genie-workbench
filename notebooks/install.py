@@ -1,4 +1,14 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC # Genie Workbench Notebook Installer
+# MAGIC
+# MAGIC **Required compute:** attach this notebook to **Databricks Serverless Environment v5**. The installer expects Python 3.11+ and workspace-native Databricks SDK auth.
+# MAGIC
+# MAGIC **Required workspace previews/settings:** Databricks Apps, **Databricks Apps On-Behalf-of-User authorization** (Public Preview), and **MLflow Prompt Registry** (Beta) must be enabled. Workspace admins manage preview toggles from the Databricks **Previews** page.
+# MAGIC
+# MAGIC **Optional:** Lakebase Autoscaling is recommended for persistent app state. Set `lakebase_mode` to `skip` only when ephemeral in-memory state is acceptable.
+
+# COMMAND ----------
 # MAGIC %pip install databricks-sdk==0.102.0 pyyaml==6.0.3 "psycopg[binary]==3.3.3" hatchling==1.29.0 uv-dynamic-versioning==0.13.0
 
 # COMMAND ----------
@@ -58,6 +68,7 @@ import scripts.deploy_lib.genie_spaces
 import scripts.deploy_lib.gso_job
 import scripts.deploy_lib.install
 import scripts.deploy_lib.lakebase
+import scripts.deploy_lib.preflight
 import scripts.deploy_lib.uc
 import scripts.deploy_lib.verify
 import scripts.deploy_lib.workspace_source
@@ -69,6 +80,7 @@ for module in [
     scripts.deploy_lib.config,
     scripts.deploy_lib.genie_spaces,
     scripts.deploy_lib.lakebase,
+    scripts.deploy_lib.preflight,
     scripts.deploy_lib.uc,
     scripts.deploy_lib.verify,
     scripts.deploy_lib.gso_job,

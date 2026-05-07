@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,11 @@ from scripts.deploy_lib.config import InstallConfig, LakebaseInfo
 from scripts.deploy_lib.genie_spaces import optionally_grant_genie_spaces
 from scripts.deploy_lib.gso_job import build_job_settings, find_existing_job, upsert_job
 from scripts.deploy_lib.lakebase import ensure_lakebase, get_database_resource
+from scripts.deploy_lib.preflight import (
+    PreflightError,
+    run_preflight,
+    verify_app_user_authorization_scopes,
+)
 from scripts.deploy_lib.uc import update_grants
 from scripts.deploy_lib.workspace_source import mkdirs, should_copy, upload_source_notebook, workspace_api_path
 
@@ -279,6 +285,105 @@ def test_deploy_app_from_workspace_uses_sdk_waiter():
             30.0,
         )
     ]
+
+
+def _preflight_responses():
+    return {
+        ("GET", "/api/2.0/sql/warehouses/warehouse-1"): {"id": "warehouse-1"},
+        ("GET", "/api/2.1/unity-catalog/catalogs/main"): {"name": "main"},
+        ("GET", "/api/2.0/serving-endpoints/databricks-claude-sonnet-4-6"): {
+            "name": "databricks-claude-sonnet-4-6"
+        },
+        ("GET", "/api/2.0/mlflow/experiments/get?experiment_id=123"): {
+            "experiment": {"experiment_id": "123"}
+        },
+    }
+
+
+def test_run_preflight_checks_notebook_prerequisites(monkeypatch):
+    w = FakeWorkspaceClient(_preflight_responses())
+    cfg = InstallConfig(
+        app_name="genie-workbench",
+        catalog="main",
+        warehouse_id="warehouse-1",
+        mlflow_experiment_id="123",
+        repo_root=str(Path.cwd()),
+        lakebase_mode="skip",
+    )
+    monkeypatch.setattr(
+        "scripts.deploy_lib.preflight.check_prompt_registry",
+        lambda *_args, **_kwargs: SimpleNamespace(available=True),
+    )
+
+    result = run_preflight(w, cfg, repo_root=Path.cwd())
+
+    assert "mlflow-prompt-registry" in result.checks
+    assert [warning.check for warning in result.warnings] == ["lakebase"]
+
+
+def test_run_preflight_fails_when_prompt_registry_disabled(monkeypatch):
+    w = FakeWorkspaceClient(_preflight_responses())
+    cfg = InstallConfig(
+        app_name="genie-workbench",
+        catalog="main",
+        warehouse_id="warehouse-1",
+        repo_root=str(Path.cwd()),
+    )
+    monkeypatch.setattr(
+        "scripts.deploy_lib.preflight.check_prompt_registry",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            available=False,
+            user_message="MLflow Prompt Registry is not enabled on this workspace.",
+            raw_error="FEATURE_DISABLED",
+        ),
+    )
+
+    with pytest.raises(PreflightError, match="MLflow Prompt Registry"):
+        run_preflight(w, cfg, repo_root=Path.cwd())
+
+
+def test_verify_app_user_authorization_scopes_preserves_resources():
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): {
+                "resources": [{"name": "keep-me", "secret": {"scope": "s", "key": "k"}}]
+            }
+        }
+    )
+
+    verify_app_user_authorization_scopes(w, "genie-workbench")
+
+    patch_calls = [call for call in w.api_client.calls if call[0] == "PATCH"]
+    assert patch_calls == [
+        (
+            "PATCH",
+            "/api/2.0/apps/genie-workbench",
+            {
+                "user_api_scopes": [
+                    "sql",
+                    "dashboards.genie",
+                    "serving.serving-endpoints",
+                    "catalog.catalogs:read",
+                    "catalog.schemas:read",
+                    "catalog.tables:read",
+                    "files.files",
+                ],
+                "resources": [{"name": "keep-me", "secret": {"scope": "s", "key": "k"}}],
+            },
+        )
+    ]
+
+
+def test_verify_app_user_authorization_scopes_surfaces_preview_error():
+    w = FakeWorkspaceClient(
+        {
+            ("GET", "/api/2.0/apps/genie-workbench"): {"resources": []},
+            ("PATCH", "/api/2.0/apps/genie-workbench"): RuntimeError("preview disabled"),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="On-Behalf-of-User authorization"):
+        verify_app_user_authorization_scopes(w, "genie-workbench")
 
 
 def test_get_app_service_principal_waits_for_async_app_create(monkeypatch):
