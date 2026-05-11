@@ -85,6 +85,8 @@ resources:
           default: ""
         - name: warehouse_id
           default: ""
+        - name: llm_model
+          default: ${var.llm_model}
       tasks:
         - task_key: preflight
           notebook_task:
@@ -101,6 +103,7 @@ resources:
               experiment_name: "{{job.parameters.experiment_name}}"
               deploy_target: "{{job.parameters.deploy_target}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              llm_model: "{{job.parameters.llm_model}}"
           environment_key: default
           timeout_seconds: 7200
           max_retries: 0
@@ -109,6 +112,8 @@ resources:
             - task_key: preflight
           notebook_task:
             notebook_path: ./packages/genie-space-optimizer/src/genie_space_optimizer/jobs/run_baseline.py
+            base_parameters:
+              llm_model: "{{job.parameters.llm_model}}"
           environment_key: default
           timeout_seconds: 7200
           max_retries: 0
@@ -117,6 +122,8 @@ resources:
             - task_key: baseline_eval
           notebook_task:
             notebook_path: ./packages/genie-space-optimizer/src/genie_space_optimizer/jobs/run_enrichment.py
+            base_parameters:
+              llm_model: "{{job.parameters.llm_model}}"
           environment_key: default
           timeout_seconds: 7200
           max_retries: 0
@@ -125,6 +132,8 @@ resources:
             - task_key: enrichment
           notebook_task:
             notebook_path: ./packages/genie-space-optimizer/src/genie_space_optimizer/jobs/run_lever_loop.py
+            base_parameters:
+              llm_model: "{{job.parameters.llm_model}}"
           environment_key: default
           timeout_seconds: 7200
           max_retries: 0
@@ -133,6 +142,8 @@ resources:
             - task_key: lever_loop
           notebook_task:
             notebook_path: ./packages/genie-space-optimizer/src/genie_space_optimizer/jobs/run_finalize.py
+            base_parameters:
+              llm_model: "{{job.parameters.llm_model}}"
           environment_key: default
           timeout_seconds: 7200
           max_retries: 0

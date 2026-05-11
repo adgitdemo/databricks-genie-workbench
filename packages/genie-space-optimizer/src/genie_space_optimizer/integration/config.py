@@ -18,3 +18,4 @@ class IntegrationConfig:
     schema_name: str
     warehouse_id: str
     job_id: int | None = None
+    llm_model: str = ""

@@ -135,9 +135,10 @@ class TestGetOpenaiClientShared:
 
 class TestCallLlm:
     @patch("genie_space_optimizer.optimization.llm_client.get_openai_client")
-    def test_returns_text_and_response(self, mock_get_client):
+    def test_returns_text_and_response(self, mock_get_client, monkeypatch):
         from genie_space_optimizer.optimization.llm_client import call_llm
 
+        monkeypatch.setenv("LLM_MODEL", "custom-endpoint")
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = _make_openai_response('{"ok": true}')
         mock_get_client.return_value = mock_client
@@ -145,6 +146,7 @@ class TestCallLlm:
         text, resp = call_llm(None, messages=[{"role": "user", "content": "hi"}])
         assert text == '{"ok": true}'
         assert resp.usage.prompt_tokens == 100
+        assert mock_client.chat.completions.create.call_args.kwargs["model"] == "custom-endpoint"
 
     @patch("genie_space_optimizer.optimization.llm_client.get_openai_client")
     def test_retries_on_failure(self, mock_get_client):

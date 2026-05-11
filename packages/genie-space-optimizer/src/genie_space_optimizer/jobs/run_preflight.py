@@ -192,6 +192,7 @@ dbutils.widgets.text("deploy_target", "")
 dbutils.widgets.text("warehouse_id", "")
 dbutils.widgets.text("triggered_by", "")
 dbutils.widgets.text("target_benchmark_count", "")
+dbutils.widgets.text("llm_model", "")
 
 run_id = dbutils.widgets.get("run_id")
 space_id = dbutils.widgets.get("space_id")
@@ -206,6 +207,9 @@ deploy_target = dbutils.widgets.get("deploy_target") or None
 triggered_by = dbutils.widgets.get("triggered_by") or ""
 _target_benchmark_count_raw = dbutils.widgets.get("target_benchmark_count").strip()
 target_benchmark_count = int(_target_benchmark_count_raw) if _target_benchmark_count_raw else None
+llm_model = dbutils.widgets.get("llm_model").strip()
+if llm_model:
+    os.environ["LLM_MODEL"] = llm_model
 
 effective_target = target_benchmark_count or TARGET_BENCHMARK_COUNT
 effective_max = (
@@ -229,6 +233,7 @@ _log(
     deploy_target=deploy_target,
     triggered_by=triggered_by,
     target_benchmark_count=target_benchmark_count,
+    llm_model=llm_model or "(default)",
 )
 
 # COMMAND ----------
@@ -629,6 +634,7 @@ dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))
 dbutils.jobs.taskValues.set(key="apply_mode", value=apply_mode)
 dbutils.jobs.taskValues.set(key="deploy_target", value=deploy_target or "")
 dbutils.jobs.taskValues.set(key="warehouse_id", value=warehouse_id)
+dbutils.jobs.taskValues.set(key="llm_model", value=llm_model)
 dbutils.jobs.taskValues.set(key="triggered_by", value=triggered_by)
 dbutils.jobs.taskValues.set(key="human_corrections", value=json.dumps(preflight_out.get("human_corrections", []), default=str))
 dbutils.jobs.taskValues.set(key="max_benchmark_count", value=effective_max)

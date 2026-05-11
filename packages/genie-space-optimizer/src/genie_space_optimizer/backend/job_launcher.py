@@ -365,6 +365,7 @@ def submit_optimization(
     deploy_target: str = "",
     warehouse_id: str = "",
     target_benchmark_count: str = "",
+    llm_model: str = "",
 ) -> tuple[str, int]:
     """Trigger a run on the bundle-managed optimization job.
 
@@ -395,6 +396,7 @@ def submit_optimization(
                 "deploy_target": deploy_target,
                 "warehouse_id": warehouse_id,
                 "target_benchmark_count": target_benchmark_count,
+                "llm_model": llm_model or os.getenv("LLM_MODEL", ""),
             },
         )
 

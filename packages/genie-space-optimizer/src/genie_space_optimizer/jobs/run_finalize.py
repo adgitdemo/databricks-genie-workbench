@@ -166,9 +166,11 @@ configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
 dbutils.widgets.text("run_id", "")
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("schema", "")
+dbutils.widgets.text("llm_model", "")
 _widget_run_id = dbutils.widgets.get("run_id").strip()
 _widget_catalog = dbutils.widgets.get("catalog").strip()
 _widget_schema = dbutils.widgets.get("schema").strip()
+_widget_llm_model = dbutils.widgets.get("llm_model").strip()
 
 from genie_space_optimizer.jobs._handoff import (
     get_baseline_eval_state,
@@ -199,6 +201,12 @@ deploy_target = (
 )
 
 import os as _os
+llm_model = (
+    _widget_llm_model
+    or dbutils.jobs.taskValues.get(taskKey="preflight", key="llm_model", default="").strip()
+)
+if llm_model:
+    _os.environ["LLM_MODEL"] = llm_model
 _warehouse_id = ctx["warehouse_id"].value or ""
 if _warehouse_id:
     _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = _warehouse_id
@@ -248,6 +256,7 @@ _log(
     lever_skipped=bool(lever_skipped),
     prev_model_id=prev_model_id,
     iteration_counter=iteration_counter,
+    llm_model=llm_model or "(default)",
     score_keys=sorted(list(prev_scores.keys())) if isinstance(prev_scores, dict) else [],
 )
 _log(

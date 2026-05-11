@@ -2,8 +2,8 @@
 Metadata Optimizer — failure analysis, proposal generation, conflict detection.
 
 Analyzes evaluation failures (ASI) + current metadata snapshot to produce
-targeted metadata change proposals grouped by lever.  LLM calls use
-Databricks Claude Opus 4.6 via the Foundation Model API.
+targeted metadata change proposals grouped by lever. LLM calls use the
+configured Databricks model serving endpoint via the Foundation Model API.
 """
 
 from __future__ import annotations
@@ -51,7 +51,6 @@ from genie_space_optimizer.common.config import (
     LEVER_5_INSTRUCTION_PROMPT,
     LEVER_6_SQL_EXPRESSION_PROMPT,
     LEVER_NAMES,
-    LLM_ENDPOINT,
     LLM_MAX_RETRIES,
     LLM_TEMPERATURE,
     LOW_RISK_PATCHES,
@@ -72,6 +71,7 @@ from genie_space_optimizer.common.config import (
     STRATEGIST_TRIAGE_PROMPT,
     _LEVER_TO_PATCH_TYPE,
     format_mlflow_template,
+    get_llm_endpoint,
 )
 from genie_space_optimizer.common.genie_schema import ensure_join_spec_fields
 
@@ -225,8 +225,9 @@ def _traced_llm_call(
     from mlflow.entities import SpanEvent, SpanType
 
     with mlflow.start_span(name=span_name, span_type=SpanType.CHAIN) as span:
+        model = get_llm_endpoint()
         span.set_inputs({
-            "model": LLM_ENDPOINT,
+            "model": model,
             "temperature": temperature,
             "prompt_chars": len(prompt),
         })
@@ -248,7 +249,7 @@ def _traced_llm_call(
                     messages.append({"role": "system", "content": system_msg})
                 messages.append({"role": "user", "content": prompt})
                 call_kwargs: dict[str, Any] = {
-                    "model": LLM_ENDPOINT,
+                    "model": model,
                     "messages": messages,
                     "temperature": temperature,
                 }
@@ -8034,7 +8035,7 @@ def _call_llm_for_proposal(
     lever: int,
     w: WorkspaceClient | None = None,
 ) -> dict:
-    """Call Databricks Claude Opus 4.6 to generate proposal text.
+    """Call the configured Databricks LLM endpoint to generate proposal text.
 
     Returns ``{"proposed_value": str, "rationale": str}``.
     For lever 5 the response may also contain ``instruction_type``,

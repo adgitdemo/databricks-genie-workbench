@@ -282,9 +282,11 @@ spark = SparkSession.builder.getOrCreate()
 dbutils.widgets.text("run_id", "")
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("schema", "")
+dbutils.widgets.text("llm_model", "")
 _widget_run_id = dbutils.widgets.get("run_id").strip()
 _widget_catalog = dbutils.widgets.get("catalog").strip()
 _widget_schema = dbutils.widgets.get("schema").strip()
+_widget_llm_model = dbutils.widgets.get("llm_model").strip()
 
 from genie_space_optimizer.jobs._handoff import (
     HandoffSource,
@@ -316,6 +318,12 @@ human_corrections = ctx["human_corrections"].value or []
 max_benchmark_count = ctx["max_benchmark_count"].value
 
 import os as _os
+llm_model = (
+    _widget_llm_model
+    or dbutils.jobs.taskValues.get(taskKey="preflight", key="llm_model", default="").strip()
+)
+if llm_model:
+    _os.environ["LLM_MODEL"] = llm_model
 _warehouse_id = ctx["warehouse_id"].value or ""
 if _warehouse_id:
     _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = _warehouse_id
@@ -395,6 +403,7 @@ _log(
     enrichment_model_id=enrichment_model_id,
     enrichment_skipped=enrichment_skipped,
     triggered_by=triggered_by,
+    llm_model=llm_model or "(default)",
 )
 _log(
     "Handoff sources (TASK_VALUES = healthy, DELTA_FALLBACK = repaired)",

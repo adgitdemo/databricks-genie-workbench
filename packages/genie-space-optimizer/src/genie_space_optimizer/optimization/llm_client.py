@@ -17,9 +17,9 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from genie_space_optimizer.common.config import (
-    LLM_ENDPOINT,
     LLM_MAX_RETRIES,
     LLM_TEMPERATURE,
+    get_llm_endpoint,
 )
 
 if TYPE_CHECKING:
@@ -124,9 +124,10 @@ def call_llm(
     JSON parsing, prompt linking, span wrapping, etc.
     """
     client = get_openai_client(w)
+    model = get_llm_endpoint()
 
     call_kwargs: dict[str, Any] = {
-        "model": LLM_ENDPOINT,
+        "model": model,
         "messages": messages,
         "temperature": temperature,
         "timeout": eval_llm_timeout_seconds(),

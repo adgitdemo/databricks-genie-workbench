@@ -228,6 +228,7 @@ def trigger_optimization(
             experiment_name=experiment_name or "",
             deploy_target=deploy_target or "",
             warehouse_id=config.warehouse_id or "",
+            llm_model=config.llm_model or "",
         )
 
         sql_warehouse_execute(

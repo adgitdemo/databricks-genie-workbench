@@ -687,7 +687,6 @@ def validate_question_sql_alignment(
 
     from genie_space_optimizer.common.config import (
         BENCHMARK_ALIGNMENT_CHECK_PROMPT,
-        LLM_ENDPOINT,
         format_mlflow_template,
     )
 

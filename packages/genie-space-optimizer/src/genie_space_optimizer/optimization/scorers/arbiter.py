@@ -13,11 +13,11 @@ from typing import TYPE_CHECKING
 from mlflow.entities import Feedback
 from mlflow.genai.scorers import scorer
 
-from genie_space_optimizer.common.config import JUDGE_PROMPTS, LLM_ENDPOINT
+from genie_space_optimizer.common.config import JUDGE_PROMPTS, get_llm_endpoint
 from genie_space_optimizer.common.genie_client import resolve_sql, sanitize_sql
 from genie_space_optimizer.optimization.evaluation import (
     CODE_SOURCE,
-    LLM_SOURCE,
+    get_llm_source,
     build_temporal_note,
     slim_comparison,
     _call_llm_for_scoring,
@@ -403,7 +403,7 @@ def _make_arbiter_scorer(
                     extra={"llm_response": result, "comparison": slim_comparison(cmp)},
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
                 metadata=_meta,
             )
         except Exception as e:
@@ -415,7 +415,7 @@ def _make_arbiter_scorer(
                 "│ Prompt len:  %d chars\n"
                 "│ LLM endpoint: %s\n"
                 "└─────────────────────────────────────────────────────────────────────────",
-                question[:80], str(e)[:300], len(prompt), LLM_ENDPOINT,
+                question[:80], str(e)[:300], len(prompt), get_llm_endpoint(),
             )
             metadata = build_asi_metadata(
                 failure_type="other",
@@ -439,7 +439,7 @@ def _make_arbiter_scorer(
                     extra={"comparison": slim_comparison(cmp)},
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
                 metadata=metadata,
             )
 
