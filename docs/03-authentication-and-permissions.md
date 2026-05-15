@@ -154,7 +154,7 @@ If the workspace or user's OAuth consent doesn't grant all scopes, the app degra
 |-----------|---------|
 | `CAN_MANAGE` | API fallback when user token lacks Genie scope; applying optimization patches during the GSO pipeline |
 
-Grant via the Genie Space sharing UI or through an installer. `scripts/install.sh` handles this for the local terminal path, and `notebooks/install.py` can optionally grant visible Genie Spaces for the Databricks notebook path.
+Grant via the Genie Space sharing UI or through an installer. `scripts/install.sh` handles this for the local terminal path, and `notebooks/install.py` grants visible Genie Spaces for the Databricks notebook path.
 
 ### Per referenced data schema
 
@@ -222,12 +222,12 @@ This is distinct from the runtime identities documented above: installer permiss
 | Create the Lakebase Autoscaling project | `scripts/setup_lakebase.py`, `scripts/deploy_lib/lakebase.py` `ensure_project()` | Lakebase project creation entitlement |
 | Create Postgres role for the app SP | `scripts/deploy_lib/lakebase.py` `ensure_role()` | Lakebase project ownership |
 | `GRANT CONNECT, CREATE ON DATABASE databricks_postgres` to the app SP | `scripts/deploy_lib/lakebase.py` `grant_database_permissions()` | Role with `GRANT` on the Lakebase database (effectively project owner / superuser) |
-| Create or look up MLflow experiment for tracing (optional) | `scripts/install.sh` step 6, `notebooks/install.py` `mlflow_experiment_id` widget | Workspace files write at the experiment path |
+| Create or look up MLflow experiment for tracing (optional) | `scripts/install.sh` step 6; dormant in the notebook installer | Workspace files write at the experiment path |
 | Probe / require MLflow Prompt Registry for Auto-Optimize | `backend/routers/auto_optimize.py` (Prompt Registry probe) | Workspace admin to enable Prompt Registry on the workspace if it is not already on |
 | Build and deploy the GSO optimization job | `databricks bundle deploy -t app` (local), `scripts/deploy_lib/gso_job.py` (notebook) | Jobs create entitlement; write on the bundle workspace directory |
 | Set GSO job ACL (owner=installer, SP=`CAN_MANAGE`, users=`CAN_VIEW`) | `scripts/deploy.sh` step 6 (`PUT /api/2.0/permissions/jobs/<id>`) | `CAN_MANAGE` on the job |
 | Grant SP `CAN_MANAGE` on the bundle workspace directory | `scripts/deploy.sh` step 6, `scripts/deploy_lib/gso_job.py` `grant_directory_permissions()` | `CAN_MANAGE` on the directory |
-| Grant SP `CAN_MANAGE` on existing Genie Spaces (optional) | `scripts/install.sh` step 12, `scripts/deploy_lib/genie_spaces.py` `grant_can_manage_on_space()` | `CAN_MANAGE` on each selected space |
+| Grant SP `CAN_MANAGE` on existing Genie Spaces (automatic in notebook, prompted in local installer) | `scripts/install.sh` step 12, `scripts/deploy_lib/genie_spaces.py` `grant_can_manage_on_space()` | `CAN_MANAGE` on each selected space |
 
 ### Pre-flight checks today
 

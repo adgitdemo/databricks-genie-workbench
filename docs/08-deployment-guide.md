@@ -99,12 +99,10 @@ Use this path when you are already working inside Databricks and do not want a l
 | `catalog` | Yes | Unity Catalog for GSO tables and artifacts |
 | `warehouse_id` | Yes | SQL Warehouse ID used by the app and GSO |
 | `llm_model` | No | Model serving endpoint name |
-| `mlflow_experiment_id` | No | MLflow experiment ID for tracing |
 | `lakebase_mode` | Yes | `create`, `existing`, or `skip` |
-| `lakebase_instance` | Conditional | Lakebase project name for `create` or `existing` |
-| `grant_genie_spaces` | No | Whether to grant visible Genie Spaces to the app SP |
+| `lakebase_project_name` | Conditional | Lakebase project name for `create` or `existing`; defaults to `<app-name>-lakebase` for `create` |
 
-The notebook user must hold the same permissions listed in [Authentication & Permissions — Installer Permissions](03-authentication-and-permissions.md#installer-permissions). In particular, granting Genie Spaces requires `CAN_MANAGE` on each selected space.
+The notebook user must hold the same permissions listed in [Authentication & Permissions — Installer Permissions](03-authentication-and-permissions.md#installer-permissions). The notebook installer automatically grants visible Genie Spaces to the app service principal, so the notebook user needs `CAN_MANAGE` on each visible space they want the app to manage.
 
 4. Run the notebook from the top.
 
@@ -121,7 +119,7 @@ The notebook:
 9. Renders a patched `app.yaml` into the generated source folder
 10. Patches app OAuth scopes and resources
 11. Deploys the app from the generated source folder
-12. Optionally grants the app SP access to visible Genie Spaces
+12. Grants the app SP access to visible Genie Spaces
 
 The Git folder remains unchanged. The generated workspace folder is deployment output; do not edit it by hand. To update a notebook-installed app, pull the latest repo changes in Databricks Git and re-run `notebooks/install.py` from the top.
 
@@ -147,7 +145,7 @@ The local terminal installer writes the project name as `GENIE_LAKEBASE_INSTANCE
 `.env.deploy`. The notebook installer reads the Lakebase project from widgets.
 If you skip Lakebase during install, set `GENIE_LAKEBASE_INSTANCE` later and
 run `./scripts/deploy.sh --update` for the local path, or set the notebook
-`lakebase_mode`/`lakebase_instance` widgets and rerun `notebooks/install.py`.
+`lakebase_mode`/`lakebase_project_name` widgets and rerun `notebooks/install.py`.
 Attaching an existing Lakebase project is an advanced path that requires
 explicit confirmation because cross-app reuse can fail on object ownership.
 
