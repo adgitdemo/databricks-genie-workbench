@@ -23,20 +23,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
-
-_info()  { echo -e "${BLUE}ℹ${NC} $*"; }
-_ok()    { echo -e "${GREEN}✓${NC} $*"; }
-_warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
-_error() { echo -e "${RED}✗${NC} $*" >&2; }
-_header() { echo -e "\n${BOLD}${CYAN}── $* ──${NC}\n"; }
+# shellcheck source=preflight.sh
+# Provides shared color vars (RED, GREEN, ...), status helpers
+# (_info, _ok, _warn, _error, _header), and _preflight_check_tools.
+source "$SCRIPT_DIR/preflight.sh"
 
 _prompt() {
     local varname="$1"
@@ -142,57 +132,9 @@ echo ""
 # ══════════════════════════════════════════════════════════════════════════
 _header "Step 1: Checking prerequisites"
 
-MISSING=()
-
-if command -v databricks &>/dev/null; then
-    DB_VERSION=$(databricks --version 2>/dev/null || echo "unknown")
-    _ok "databricks CLI ($DB_VERSION)"
-else
-    MISSING+=("databricks CLI — https://docs.databricks.com/dev-tools/cli/install.html")
-fi
-
-if command -v node &>/dev/null; then
-    NODE_VERSION=$(node --version 2>/dev/null || echo "unknown")
-    if node -e '
-const [major, minor] = process.versions.node.split(".").map(Number);
-const supported = (major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22;
-process.exit(supported ? 0 : 1);
-'; then
-        _ok "Node.js ($NODE_VERSION)"
-    else
-        MISSING+=("Node.js ^20.19.0 or >=22.12.0 — https://nodejs.org/ (found $NODE_VERSION)")
-    fi
-else
-    MISSING+=("Node.js ^20.19.0 or >=22.12.0 — https://nodejs.org/")
-fi
-
-if command -v python3 &>/dev/null; then
-    PY_VERSION=$(python3 --version 2>/dev/null || echo "unknown")
-    _ok "Python ($PY_VERSION)"
-else
-    MISSING+=("Python 3.11+ — https://python.org/")
-fi
-
-if command -v npm &>/dev/null; then
-    _ok "npm ($(npm --version 2>/dev/null))"
-else
-    MISSING+=("npm — installed with Node.js")
-fi
-
-if command -v uv &>/dev/null; then
-    _ok "uv ($(uv --version 2>/dev/null))"
-else
-    MISSING+=("uv — https://docs.astral.sh/uv/  (curl -LsSf https://astral.sh/uv/install.sh | sh)")
-fi
-
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo ""
-    _error "Missing prerequisites:"
-    for dep in "${MISSING[@]}"; do
-        echo "    - $dep"
-    done
-    exit 1
-fi
+# _preflight_check_tools verifies presence + minimum versions for every
+# required tool in a single pass and exits if anything is wrong.
+_preflight_check_tools
 
 # ══════════════════════════════════════════════════════════════════════════
 # Step 2: Databricks profile
