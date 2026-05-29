@@ -69,7 +69,7 @@ Auto-Optimize requires MLflow Prompt Registry for versioned judge prompts. If Pr
   value: "<your-experiment-id>"
 ```
 
-The experiment ID is workspace-specific. The local terminal installer can create one during setup; the notebook installer accepts an existing experiment ID in the `mlflow_experiment_id` widget. You can also create one manually and redeploy with the updated value.
+The experiment ID is workspace-specific. The local terminal installer can create one during setup. The notebook installer leaves Create Agent tracing dormant and deploys with no app-level experiment ID. You can still enable tracing manually by setting `MLFLOW_EXPERIMENT_ID` in `app.yaml` before deploying.
 
 ## Monitoring
 

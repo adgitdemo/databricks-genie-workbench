@@ -40,7 +40,7 @@ def require_project(w, project_name: str) -> str:
         raise RuntimeError(
             f"Lakebase project '{project_name}' does not exist. "
             "Choose lakebase_mode=create to create a new project, or fix the "
-            "lakebase_instance widget to an existing project name."
+            "lakebase_project_name widget to an existing project name."
         ) from exc
     return resource_name
 

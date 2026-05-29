@@ -133,6 +133,16 @@ def test_config_validation_normalizes_lakebase_defaults():
     assert cfg.gso_job_name == "genie-workbench-gso-optimization-job"
     cfg.validate()
 
+    explicit_cfg = InstallConfig(
+        app_name="genie-workbench",
+        catalog="main",
+        warehouse_id="abc",
+        repo_root="/Workspace/Repos/me/repo",
+        lakebase_mode="create",
+        lakebase_instance="custom-lakebase",
+    ).normalized()
+    assert explicit_cfg.lakebase_instance == "custom-lakebase"
+
     with pytest.raises(ValueError, match="app_name"):
         InstallConfig(app_name="Bad Name", catalog="main", warehouse_id="abc", repo_root="/tmp").validate()
 
@@ -144,6 +154,24 @@ def test_config_validation_normalizes_lakebase_defaults():
             repo_root="/tmp",
             lakebase_mode="existing",
         ).validate()
+
+
+def test_notebook_installer_uses_streamlined_widgets_and_defaults():
+    notebook_source = Path("notebooks/install.py").read_text()
+
+    assert 'dbutils.widgets.text("lakebase_project_name", "")' in notebook_source
+    assert 'dbutils.widgets.get("lakebase_project_name").strip()' in notebook_source
+    assert 'lakebase_instance = f"{app_name}-lakebase"' in notebook_source
+    assert 'dbutils.widgets.text("lakebase_instance"' not in notebook_source
+    assert 'dbutils.widgets.get("lakebase_instance")' not in notebook_source
+
+    assert 'dbutils.widgets.text("mlflow_experiment_id"' not in notebook_source
+    assert 'dbutils.widgets.get("mlflow_experiment_id")' not in notebook_source
+    assert "mlflow_experiment_id=None" in notebook_source
+
+    assert 'dbutils.widgets.dropdown("grant_genie_spaces"' not in notebook_source
+    assert 'dbutils.widgets.get("grant_genie_spaces")' not in notebook_source
+    assert "grant_genie_spaces=True" in notebook_source
 
 
 def test_workspace_source_inclusion_rules(tmp_path):

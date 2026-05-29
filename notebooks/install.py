@@ -60,10 +60,8 @@ dbutils.widgets.text("app_name", "genie-workbench")
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("warehouse_id", "")
 dbutils.widgets.text("llm_model", "databricks-claude-sonnet-4-6")
-dbutils.widgets.text("mlflow_experiment_id", "")
 dbutils.widgets.dropdown("lakebase_mode", "create", ["create", "existing", "skip"])
-dbutils.widgets.text("lakebase_instance", "")
-dbutils.widgets.dropdown("grant_genie_spaces", "false", ["false", "true"])
+dbutils.widgets.text("lakebase_project_name", "")
 
 # COMMAND ----------
 # MAGIC %md
@@ -119,7 +117,7 @@ def notebook_status(message: str) -> None:
 
 app_name = dbutils.widgets.get("app_name").strip()
 lakebase_mode = dbutils.widgets.get("lakebase_mode").strip()
-explicit_lakebase = dbutils.widgets.get("lakebase_instance").strip()
+explicit_lakebase = dbutils.widgets.get("lakebase_project_name").strip()
 
 if lakebase_mode == "skip":
     lakebase_instance = None
@@ -133,11 +131,11 @@ cfg = InstallConfig(
     catalog=dbutils.widgets.get("catalog").strip(),
     warehouse_id=dbutils.widgets.get("warehouse_id").strip(),
     llm_model=dbutils.widgets.get("llm_model").strip(),
-    mlflow_experiment_id=dbutils.widgets.get("mlflow_experiment_id").strip() or None,
+    mlflow_experiment_id=None,
     lakebase_mode=lakebase_mode,
     lakebase_instance=lakebase_instance,
     repo_root=str(repo_root),
-    grant_genie_spaces=dbutils.widgets.get("grant_genie_spaces").strip().lower() == "true",
+    grant_genie_spaces=True,
 )
 
 w = WorkspaceClient()
