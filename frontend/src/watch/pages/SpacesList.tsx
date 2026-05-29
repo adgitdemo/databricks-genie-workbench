@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Search, RefreshCw, ExternalLink } from 'lucide-react'
+import { Search, RefreshCw, ExternalLink, AlertTriangle } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -153,6 +153,19 @@ export function SpacesList({ onOpenSpace }: Props) {
           className="pl-9"
         />
       </div>
+
+      {health.data?.system_tables_accessible === false && (
+        <Card className="flex items-start gap-2 border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-400">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+          <span>
+            Cost, usage, feedback, and lineage come from Databricks <code className="font-mono">system.*</code> tables,
+            which the app service principal can't currently read — so those panels will be empty
+            (not necessarily "no activity"). A workspace admin must grant the required
+            {' '}<code className="font-mono">SELECT</code>s (see <code className="font-mono">scripts/grant_permissions.py</code>).
+            Space and permission data still load.
+          </span>
+        </Card>
+      )}
 
       {error && (
         <Card className="border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">

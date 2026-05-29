@@ -33,7 +33,7 @@ interface AdminDashboardProps {
   initialSubTab?: AdminSubTab
 }
 
-function StatCard({ label, value, sub, icon }: { label: string; value: string | number; sub?: string; icon: React.ReactNode }) {
+function StatCard({ label, value, sub, icon }: { label: string; value: React.ReactNode; sub?: string; icon: React.ReactNode }) {
   return (
     <div className="bg-surface border border-default rounded-xl p-4">
       <div className="flex items-center justify-between mb-2">
@@ -49,6 +49,13 @@ function StatCard({ label, value, sub, icon }: { label: string; value: string | 
 function ScoreBadge({ score, maturity }: { score: number; maturity?: string }) {
   return <span className={`font-bold text-lg ${getScoreColor(maturity)}`}>{score}</span>
 }
+
+// Maturity states in score order, mirroring scanner tiers + MATURITY_COLORS.
+const MATURITY_STATES: { label: string; icon: React.ReactNode }[] = [
+  { label: "Not Ready",         icon: <AlertTriangle className="w-4 h-4" /> },
+  { label: "Ready to Optimize", icon: <TrendingUp className="w-4 h-4" /> },
+  { label: "Trusted",           icon: <Award className="w-4 h-4" /> },
+]
 
 const SUB_TABS: { id: AdminSubTab; label: string; icon: React.ReactNode }[] = [
   { id: "overview",  label: "Overview",  icon: <BarChart2 className="w-4 h-4" /> },
@@ -117,13 +124,20 @@ function AdminOverview({ onSelectSpace }: { onSelectSpace?: (spaceId: string, di
         </button>
       </div>
 
-      {/* Stats */}
+      {/* Stats — counts per maturity state tie the cards to the maturity
+          curve, Top Spaces, and Needs Attention below. */}
       {stats && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
           <StatCard label="Total Spaces" value={stats.total_spaces} icon={<BarChart2 className="w-4 h-4" />} />
           <StatCard label="Scanned" value={stats.scanned_spaces} sub={`${stats.total_spaces > 0 ? Math.round(stats.scanned_spaces / stats.total_spaces * 100) : 0}% coverage`} icon={<BarChart2 className="w-4 h-4" />} />
-          <StatCard label="Avg Score" value={stats.avg_score} icon={<TrendingUp className="w-4 h-4" />} />
-          <StatCard label="Critical" value={stats.critical_count} sub="Not Ready" icon={<AlertTriangle className="w-4 h-4" />} />
+          {MATURITY_STATES.map(({ label, icon }) => (
+            <StatCard
+              key={label}
+              label={label}
+              value={<span className={getScoreColor(label)}>{stats.maturity_distribution[label] ?? 0}</span>}
+              icon={icon}
+            />
+          ))}
         </div>
       )}
 
@@ -235,6 +249,19 @@ function SubTabFallback() {
   )
 }
 
+/**
+ * Mounts its children on first activation, then keeps them mounted (hidden via
+ * display:none) so switching sub-tabs preserves component state (filters, scroll,
+ * loaded data) and doesn't re-trigger the lazy import / Suspense fallback. Lazy
+ * on first activation, so unvisited tabs don't load their chunks up front.
+ */
+function KeepAliveTab({ active, children }: { active: boolean; children: React.ReactNode }) {
+  const [mounted, setMounted] = useState(active)
+  if (active && !mounted) setMounted(true)
+  if (!mounted) return null
+  return <div hidden={!active}>{children}</div>
+}
+
 export function AdminDashboard({ onSelectSpace, initialSubTab }: AdminDashboardProps) {
   const [subTab, setSubTab] = useState<AdminSubTab>(initialSubTab || "overview")
   // Watch-only drill-down: when a user clicks a row inside the watch SpacesList,
@@ -269,9 +296,11 @@ export function AdminDashboard({ onSelectSpace, initialSubTab }: AdminDashboardP
         ))}
       </div>
 
-      {subTab === "overview" && <AdminOverview onSelectSpace={onSelectSpace} />}
+      <KeepAliveTab active={subTab === "overview"}>
+        <AdminOverview onSelectSpace={onSelectSpace} />
+      </KeepAliveTab>
 
-      {subTab === "spaces" && (
+      <KeepAliveTab active={subTab === "spaces"}>
         <Suspense fallback={<SubTabFallback />}>
           {watchDrillId ? (
             <WatchSpaceDetail
@@ -283,31 +312,31 @@ export function AdminDashboard({ onSelectSpace, initialSubTab }: AdminDashboardP
             <WatchSpacesList onOpenSpace={(sid) => setWatchDrillId(sid)} />
           )}
         </Suspense>
-      )}
+      </KeepAliveTab>
 
-      {subTab === "cost" && (
+      <KeepAliveTab active={subTab === "cost"}>
         <Suspense fallback={<SubTabFallback />}>
           <WatchCostExplorer onOpenSpace={(sid) => { setSubTab("spaces"); setWatchDrillId(sid) }} />
         </Suspense>
-      )}
+      </KeepAliveTab>
 
-      {subTab === "feedback" && (
+      <KeepAliveTab active={subTab === "feedback"}>
         <Suspense fallback={<SubTabFallback />}>
           <WatchFeedback onOpenSpace={(sid) => { setSubTab("spaces"); setWatchDrillId(sid) }} />
         </Suspense>
-      )}
+      </KeepAliveTab>
 
-      {subTab === "resources" && (
+      <KeepAliveTab active={subTab === "resources"}>
         <Suspense fallback={<SubTabFallback />}>
           <WatchResourceRollup />
         </Suspense>
-      )}
+      </KeepAliveTab>
 
-      {subTab === "settings" && (
+      <KeepAliveTab active={subTab === "settings"}>
         <Suspense fallback={<SubTabFallback />}>
           <WatchSettings />
         </Suspense>
-      )}
+      </KeepAliveTab>
     </div>
   )
 }

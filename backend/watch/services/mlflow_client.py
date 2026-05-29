@@ -10,11 +10,12 @@ logger = logging.getLogger(__name__)
 
 
 def _client():
-    import mlflow
     from mlflow.tracking import MlflowClient
 
+    # The process-global tracking URI is set once at startup in backend/main.py.
+    # MlflowClient(tracking_uri=...) sets it per-instance, so we don't re-set the
+    # global on every request.
     tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "databricks")
-    mlflow.set_tracking_uri(tracking_uri)
     return MlflowClient(tracking_uri=tracking_uri)
 
 
@@ -67,6 +68,29 @@ def search_runs(experiment_id: str, max_results: int = 50) -> list[dict[str, Any
             "tags": {k: v for k, v in (data.tags or {}).items() if not k.startswith("mlflow.")},
         })
     return out
+
+
+def find_experiment_by_space_tag(space_id: str) -> Optional[str]:
+    """Return the experiment_id the GSO pipeline created for *space_id*, if any.
+
+    The optimization preflight tags its experiment with ``genie.space_id`` (see
+    packages/genie-space-optimizer .../optimization/preflight.py). We search for a
+    matching experiment so the Evals tab can auto-discover it instead of requiring
+    a manual Settings mapping. Returns the most-recently-updated match.
+    """
+    if not space_id:
+        return None
+    try:
+        exps = _client().search_experiments(
+            filter_string=f"tags.`genie.space_id` = '{space_id}'",
+        )
+    except Exception as e:
+        logger.info("search_experiments(genie.space_id=%s) failed: %s", space_id, e)
+        return None
+    if not exps:
+        return None
+    best = max(exps, key=lambda x: x.last_update_time or x.creation_time or 0)
+    return best.experiment_id
 
 
 def get_run(run_id: str) -> Optional[dict[str, Any]]:

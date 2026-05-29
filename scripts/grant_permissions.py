@@ -25,6 +25,12 @@ _GSO_SRC = os.path.join(_SCRIPT_DIR, os.pardir, "packages", "genie-space-optimiz
 if os.path.isdir(_GSO_SRC) and _GSO_SRC not in sys.path:
     sys.path.insert(0, os.path.abspath(_GSO_SRC))
 
+# Share the GenieWatch system-table grant list with the notebook installer
+# (scripts/deploy_lib/uc.py) so both install paths grant the same tables.
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from deploy_lib.uc import WATCH_SYSTEM_GRANTS
+
 # SP privileges on the GSO optimization schema — the SP runs optimization jobs
 # and needs full write access to state tables, MLflow models, and prompts.
 SP_CATALOG_PRIVILEGES = {"USE_CATALOG"}
@@ -39,27 +45,6 @@ SP_SCHEMA_PRIVILEGES = {
     "EXECUTE",
     "MANAGE",
 }
-
-# GenieWatch (observability) — system table SELECTs the SP needs to power
-# cost / usage / feedback / lineage reads under /api/watch/*. Best-effort:
-# only a workspace admin can issue these grants, so failures degrade to a
-# warning rather than a hard exit (the merged app still works, just with
-# empty cost/usage panels for the SP-side queries).
-_WATCH_SYSTEM_GRANTS: list[tuple[str, str, str]] = [
-    # (securable_type, fully_qualified_name, privilege)
-    ("CATALOG", "system",                        "USE_CATALOG"),
-    ("SCHEMA",  "system.query",                  "USE_SCHEMA"),
-    ("SCHEMA",  "system.billing",                "USE_SCHEMA"),
-    ("SCHEMA",  "system.access",                 "USE_SCHEMA"),
-    ("TABLE",   "system.query.history",          "SELECT"),
-    ("TABLE",   "system.billing.usage",          "SELECT"),
-    ("TABLE",   "system.billing.list_prices",    "SELECT"),
-    ("TABLE",   "system.access.audit",           "SELECT"),
-    ("TABLE",   "system.access.table_lineage",   "SELECT"),
-    # workspaces_latest is optional / newer; absence is handled in code.
-    ("TABLE",   "system.access.workspaces_latest","SELECT"),
-]
-
 
 def _run(cmd: list[str]) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -459,7 +444,7 @@ def _grant_watch_system_tables(*, profile: str, principal: str) -> None:
     table or a permission denial logs a warning and continues.
     """
     failures: list[str] = []
-    for securable_type, full_name, privilege in _WATCH_SYSTEM_GRANTS:
+    for securable_type, full_name, privilege in WATCH_SYSTEM_GRANTS:
         try:
             _update_grants(
                 profile=profile,

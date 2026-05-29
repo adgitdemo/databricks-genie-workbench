@@ -37,6 +37,34 @@ _CACHE_LOCK = threading.Lock()
 _CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
+# ─── System-table accessibility signal ────────────────────────────────────
+# Observational: None until a core query runs, True once one succeeds, False if
+# one fails with a permission error. Surfaced via /api/watch/settings/health so
+# the UI can distinguish "missing SP grants" from "no activity" (which both
+# otherwise return empty results). See `scripts/grant_permissions.py`.
+_SYSTEM_TABLES_ACCESSIBLE: bool | None = None
+
+
+def _looks_like_permission_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(
+        s in m
+        for s in (
+            "permission denied",
+            "does not have",
+            "not authorized",
+            "requires permission",
+            "access denied",
+            "insufficient privileges",
+        )
+    )
+
+
+def system_tables_status() -> bool | None:
+    """Last observed system-table accessibility (None=unknown, False=grants missing)."""
+    return _SYSTEM_TABLES_ACCESSIBLE
+
+
 def _cache_key(sql: str, parameters: list[StatementParameterListItem]) -> str:
     bag = sorted([(p.name, p.value, getattr(p.type, "value", str(p.type))) for p in parameters])
     return f"{hash(sql)}|{json.dumps(bag)}"
@@ -78,7 +106,9 @@ def _run(
     parameters: list[StatementParameterListItem],
     poll_total_seconds: int = 180,
     poll_interval_seconds: float = 2.0,
+    track_health: bool = True,
 ) -> list[dict[str, Any]]:
+    global _SYSTEM_TABLES_ACCESSIBLE
     key = _cache_key(sql, parameters)
     cached = _cache_get(key)
     if cached is not None:
@@ -116,8 +146,13 @@ def _run(
     if state != StatementState.SUCCEEDED:
         err = resp.status.error
         msg = err.message if err else state
+        if track_health and _looks_like_permission_error(str(msg)):
+            _SYSTEM_TABLES_ACCESSIBLE = False
         logger.warning("system-table query %s ended in %s: %s", statement_id, state, msg)
         return []
+
+    if track_health:
+        _SYSTEM_TABLES_ACCESSIBLE = True
 
     if not resp.result or not resp.result.data_array:
         return []
@@ -261,7 +296,9 @@ FROM system.access.workspaces_latest
 WHERE workspace_id IN ({placeholders})
 """
     params = [_p(f"w{i}", wid) for i, wid in enumerate(missing)]
-    rows = _run(sql, params)
+    # workspaces_latest is optional/newer; its absence must not flip the global
+    # system-tables-accessible signal (the core tables may still be readable).
+    rows = _run(sql, params, track_health=False)
     if not rows:
         _WORKSPACE_NAMES_DISABLED = True
         return {}

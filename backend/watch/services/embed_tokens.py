@@ -32,6 +32,24 @@ class EmbedToken:
     issued_at: int
 
 
+def _safe_oidc_error(resp: httpx.Response) -> str:
+    """Summarize a failed OIDC/Lakeview response WITHOUT echoing the raw body.
+
+    OIDC error bodies can carry token values, assertion payloads, or secret
+    echoes in fields like `error_description`. We surface only the status code
+    and the short `error` code (never the full body, which would otherwise land
+    in application logs and the 502 detail returned to the browser).
+    """
+    code = "unknown"
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            code = str(body.get("error") or body.get("error_code") or "unknown")
+    except Exception:
+        pass
+    return f"{resp.status_code} ({code})"
+
+
 def _sp_credentials() -> tuple[str, str]:
     cid = os.environ.get("DATABRICKS_CLIENT_ID")
     csec = os.environ.get("DATABRICKS_CLIENT_SECRET")
@@ -63,6 +81,10 @@ async def mint_embed_token(
     auth_header = {"Authorization": f"Basic {basic}"}
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as http:
+        # `all-apis` is the scope the external-embed flow documents for this
+        # intermediate token (https://docs.databricks.com/aws/en/dashboards/embedding/external-embed).
+        # It is used ONLY to call the tokeninfo endpoint in step 2 and is then
+        # discarded — it is never logged, returned to the browser, or persisted.
         step1 = await http.post(
             f"{host}/oidc/v1/token",
             headers={**auth_header, "Content-Type": "application/x-www-form-urlencoded"},
@@ -70,7 +92,7 @@ async def mint_embed_token(
         )
         if step1.status_code != 200:
             raise RuntimeError(
-                f"OIDC all-apis token request failed: {step1.status_code} {step1.text}"
+                f"OIDC all-apis token request failed: {_safe_oidc_error(step1)}"
             )
         all_apis_token = step1.json()["access_token"]
 
@@ -87,7 +109,7 @@ async def mint_embed_token(
         )
         if step2.status_code != 200:
             raise RuntimeError(
-                f"tokeninfo request failed: {step2.status_code} {step2.text}"
+                f"tokeninfo request failed: {_safe_oidc_error(step2)}"
             )
         token_info = step2.json()
 
@@ -104,7 +126,7 @@ async def mint_embed_token(
         )
         if step3.status_code != 200:
             raise RuntimeError(
-                f"scoped-token request failed: {step3.status_code} {step3.text}"
+                f"scoped-token request failed: {_safe_oidc_error(step3)}"
             )
         scoped = step3.json()
 

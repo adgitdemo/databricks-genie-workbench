@@ -186,6 +186,9 @@ export interface HealthStatus {
   warehouse_id: string | null
   dashboard_cost_id: string | null
   workspace_host: string | null
+  // null = unknown (no system-table query has run yet), true = accessible,
+  // false = a query failed with a permission error (SP grants missing).
+  system_tables_accessible: boolean | null
 }
 
 // ── Feedback tab (workspace-wide aggregation) ───────────────────────────────

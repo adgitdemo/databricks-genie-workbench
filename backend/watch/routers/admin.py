@@ -1,20 +1,21 @@
-"""Watch admin router: manual rollup refresh (SP-only)."""
+"""Watch admin router: manual rollup refresh (workspace-admin only)."""
 
 from __future__ import annotations
 
 import logging
 from datetime import date
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from backend.services import lakebase
+from backend.watch._auth import require_admin
 from backend.watch.services import system_tables
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/watch/admin")
 
 
-@router.post("/refresh-rollup")
+@router.post("/refresh-rollup", dependencies=[Depends(require_admin)])
 async def refresh_rollup(days: int = Query(7, ge=1, le=90)) -> dict:
     usage = system_tables.usage_summary_all_spaces(days=days)
     cost = {r["space_id"]: r for r in system_tables.top_spenders(days=days, limit=2000)}

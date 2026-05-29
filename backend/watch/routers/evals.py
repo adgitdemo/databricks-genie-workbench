@@ -15,19 +15,23 @@ router = APIRouter(prefix="/api/watch")
 @router.get("/spaces/{space_id}/evals")
 async def get_space_evals(space_id: str) -> dict:
     sid = validate_space_id(space_id)
+
+    # A manual Settings mapping takes precedence; otherwise auto-discover the
+    # experiment the GSO optimization pipeline created (tagged genie.space_id).
     mapping = await lakebase.watch_get_eval_mapping(sid)
-    if not mapping:
+    experiment_id = mapping["experiment_id"] if mapping else mlflow_client.find_experiment_by_space_tag(sid)
+    if not experiment_id:
         return EvalSummary(space_id=sid).model_dump(mode="json")
 
-    exp = mlflow_client.get_experiment(mapping["experiment_id"])
+    exp = mlflow_client.get_experiment(experiment_id)
     if exp is None:
         return EvalSummary(
             space_id=sid,
-            experiment_id=mapping["experiment_id"],
+            experiment_id=experiment_id,
             permission_denied=True,
         ).model_dump(mode="json")
 
-    runs_raw = mlflow_client.search_runs(mapping["experiment_id"], max_results=50)
+    runs_raw = mlflow_client.search_runs(experiment_id, max_results=50)
     runs = [EvalRun(**r) for r in runs_raw]
     return EvalSummary(
         space_id=sid,

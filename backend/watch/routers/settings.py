@@ -15,7 +15,12 @@ from backend.watch.models import (
     HealthStatus,
     SetEvalMappingRequest,
 )
-from backend.watch.services import conversations_client, genie_client, mlflow_client
+from backend.watch.services import (
+    conversations_client,
+    genie_client,
+    mlflow_client,
+    system_tables,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/watch/settings")
@@ -33,6 +38,7 @@ async def health() -> dict:
         warehouse_id=os.environ.get("SQL_WAREHOUSE_ID"),
         dashboard_cost_id=os.environ.get("DASHBOARD_COST_ID") or None,
         workspace_host=host,
+        system_tables_accessible=system_tables.system_tables_status(),
     ).model_dump(mode="json")
 
 

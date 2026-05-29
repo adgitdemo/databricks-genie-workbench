@@ -266,3 +266,8 @@ class HealthStatus(BaseModel):
     warehouse_id: Optional[str] = None
     dashboard_cost_id: Optional[str] = None
     workspace_host: Optional[str] = None
+    # Last observed system-table accessibility for the app SP:
+    #   None  → unknown (no system-table query has run yet)
+    #   True  → a query succeeded (SP has the required SELECT grants)
+    #   False → a query failed with a permission error (grants missing)
+    system_tables_accessible: Optional[bool] = None

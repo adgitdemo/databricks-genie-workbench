@@ -75,11 +75,11 @@ export function SpaceDetail({ spaceId, onBack, onOpenSettings }: Props) {
               <TabsTrigger value="evals">Evals</TabsTrigger>
             </TabsList>
 
-            <TabsContent value="overview"><Overview space={space.data} /></TabsContent>
-            <TabsContent value="usage"><UsageTab spaceId={spaceId} /></TabsContent>
-            <TabsContent value="cost"><CostTab spaceId={spaceId} /></TabsContent>
-            <TabsContent value="resources"><ResourcesTab spaceId={spaceId} /></TabsContent>
-            <TabsContent value="evals"><EvalsTab spaceId={spaceId} onOpenSettings={onOpenSettings} /></TabsContent>
+            <TabsContent value="overview" keepAlive><Overview space={space.data} /></TabsContent>
+            <TabsContent value="usage" keepAlive><UsageTab spaceId={spaceId} /></TabsContent>
+            <TabsContent value="cost" keepAlive><CostTab spaceId={spaceId} /></TabsContent>
+            <TabsContent value="resources" keepAlive><ResourcesTab spaceId={spaceId} /></TabsContent>
+            <TabsContent value="evals" keepAlive><EvalsTab spaceId={spaceId} onOpenSettings={onOpenSettings} /></TabsContent>
           </Tabs>
         </>
       )}

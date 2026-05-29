@@ -9,6 +9,29 @@ interface Props {
   height?: number
 }
 
+/** Derive a safe, bounded message for display.
+ *
+ *  Avoids surfacing raw backend bodies, stack traces, or token-bearing URLs:
+ *  reads only a string `detail` (or `detail.detail`) from an ApiError, strips
+ *  anything URL-like, and truncates. Never throws (runs on an error path).
+ */
+function safeErrorMessage(e: unknown): string {
+  let raw = ''
+  if (e instanceof api.ApiError) {
+    const d = e.detail
+    if (typeof d === 'string') raw = d
+    else if (d && typeof d === 'object' && typeof (d as { detail?: unknown }).detail === 'string')
+      raw = String((d as { detail: string }).detail)
+    else raw = e.message
+  } else if (e instanceof Error) {
+    raw = e.message
+  } else {
+    raw = String(e)
+  }
+  raw = raw.replace(/https?:\/\/\S+/gi, '[link]')
+  return raw.length > 200 ? `${raw.slice(0, 197)}…` : raw
+}
+
 /** Embed a published AI/BI Lakeview dashboard via the app-delegated flow.
  *
  *  The backend mints a short-lived scoped embed token (SP-issued, OAuth
@@ -59,8 +82,7 @@ export function DashboardEmbed({ dashboardId, height = 720 }: Props) {
         if (!cancelled) setLoading(false)
       } catch (e) {
         if (cancelled) return
-        const msg = e instanceof Error ? e.message : String(e)
-        setError(msg)
+        setError(safeErrorMessage(e))
         setLoading(false)
       }
     }
