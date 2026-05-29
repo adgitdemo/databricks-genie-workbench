@@ -23,10 +23,8 @@ The recommended install path is the Databricks notebook installer.
    - `catalog`
    - `warehouse_id`
    - `llm_model`
-   - `mlflow_experiment_id`
    - `lakebase_mode`
-   - `lakebase_instance`
-   - `grant_genie_spaces`
+   - `lakebase_project_name`
 4. Run the notebook from the top.
 
 The notebook uses notebook-native `WorkspaceClient()` auth, creates a generated deployment source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app`, patches `app.yaml` there, provisions UC/Lakebase/GSO resources, and deploys the Databricks App from that generated source. The Git folder remains unchanged.
