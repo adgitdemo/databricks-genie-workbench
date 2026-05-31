@@ -299,7 +299,7 @@ export function IQScoreTab({ scanResult, isLoading, onScan, isScanning, onAction
                 {actionLabel}
               </button>
               {actionDescription && (
-                <p className="text-xs text-muted leading-relaxed sm:pt-0.5 max-w-3xl">
+                <p className="min-w-0 flex-1 text-xs text-muted leading-relaxed sm:pt-0.5">
                   {actionDescription}
                 </p>
               )}

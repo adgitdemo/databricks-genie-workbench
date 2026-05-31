@@ -146,6 +146,13 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, initialTab, autoSc
       onAction: () => setActiveTab("optimize"),
       actionLabel: "Run Optimization",
       actionIcon: <Rocket className="w-4 h-4" />,
+      actionDescription: (
+        <>
+          This space passed the configuration checks. Auto-Optimize will benchmark real
+          questions, tune the selected levers, and apply only changes that improve the
+          measured result.
+        </>
+      ),
     }
   } else if (hasRemediationItems) {
     actionProps = {
