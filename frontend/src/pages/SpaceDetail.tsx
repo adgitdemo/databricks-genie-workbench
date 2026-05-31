@@ -1,10 +1,9 @@
 /**
  * SpaceDetail - 3-tab detail view for a Genie Space.
  * Tabs: Score (default) | Optimize | History
- * Score tab includes an inline FixAgentPanel that slides in from the right.
  */
 import { useState, useEffect, useRef } from "react"
-import { ArrowLeft, Star, BarChart2, Clock, ExternalLink, Rocket, Play, Zap, ChevronDown, ChevronRight, Settings, RefreshCw } from "lucide-react"
+import { ArrowLeft, Star, BarChart2, Clock, ExternalLink, Rocket, Play, ChevronDown, ChevronRight, Settings, RefreshCw } from "lucide-react"
 import { scanSpace, toggleStar, getSpaceHistory, getSpaceDetail, getActiveRunForSpace } from "@/lib/api"
 import { MATURITY_COLORS, getOptimizationLabel } from "@/lib/utils"
 import type { ScanResult, ScoreHistoryPoint, OptimizationEvent } from "@/types"
@@ -13,7 +12,6 @@ import { HistoryTab } from "./HistoryTab"
 import { useAnalysis } from "@/hooks/useAnalysis"
 import { SpaceOverview } from "@/components/SpaceOverview"
 import { AutoOptimizeTab } from "@/components/auto-optimize/AutoOptimizeTab"
-import { FixAgentPanel } from "@/components/FixAgentPanel"
 
 type Tab = "score" | "optimize" | "history"
 const VALID_TABS: readonly string[] = ["score", "optimize", "history"]
@@ -37,8 +35,6 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, initialTab, autoSc
   const [hasActiveOptRun, setHasActiveOptRun] = useState(false)
   const [isLoadingScan, setIsLoadingScan] = useState(true)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
-  const [fixPanelOpen, setFixPanelOpen] = useState(false)
-  const [fixFindings, setFixFindings] = useState<string[]>([])
 
   const [configExpanded, setConfigExpanded] = useState(false)
 
@@ -112,33 +108,7 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, initialTab, autoSc
     }
   }
 
-  // Findings that can't or shouldn't be fixed via config patches
-  const isFixable = (f: string) => {
-    const lower = f.toLowerCase()
-    return (
-      !lower.includes("optimization workflow") &&
-      !lower.includes("optimization accuracy") &&
-      !lower.includes("exceeds 120/space limit")  // informational — Genie ignores excess automatically
-    )
-  }
-
-  const openFixPanel = (sr: ScanResult) => {
-    const items: string[] = [
-      ...sr.findings.filter(isFixable),
-      ...(sr.warnings ?? []).filter(isFixable),
-    ]
-    if (items.length === 0) return
-    setFixFindings(items)
-    setFixPanelOpen(true)
-  }
-
-  const handleFixComplete = () => {
-    setFixPanelOpen(false)
-    setFixFindings([])
-    handleScan()
-  }
-
-  // Auto-scan on mount when requested (e.g., returning from fix flow)
+  // Auto-scan on mount when requested (e.g., returning from create/update flows)
   useEffect(() => {
     if (autoScan && !isScanning) {
       handleScan()
@@ -165,24 +135,31 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, initialTab, autoSc
   ]
 
   // Determine contextual action(s) based on scan results
-  const hasFixableItems = scanResult && (
-    scanResult.findings.some(isFixable) || (scanResult.warnings ?? []).some(isFixable)
+  const hasRemediationItems = scanResult && scanResult.maturity !== "Trusted" && (
+    scanResult.findings.length > 0 || (scanResult.warnings ?? []).length > 0
   )
   const maturity = scanResult?.maturity
-  let actionProps: { onAction?: () => void; actionLabel?: string; actionIcon?: React.ReactNode } = {}
-  if (hasFixableItems && scanResult) {
-    // Show "Quick Fix" whenever there are findings or warnings to address
-    actionProps = {
-      onAction: () => openFixPanel(scanResult),
-      actionLabel: "Quick Fix",
-      actionIcon: <Zap className="w-4 h-4" />,
-    }
-  } else if (maturity === "Ready to Optimize") {
-    // No issues/warnings left — show optimization CTA
+  let actionProps: { onAction?: () => void; actionLabel?: string; actionIcon?: React.ReactNode; actionDescription?: React.ReactNode } = {}
+  if (maturity === "Ready to Optimize") {
+    // No failing config checks left — show optimization CTA.
     actionProps = {
       onAction: () => setActiveTab("optimize"),
       actionLabel: "Run Optimization",
       actionIcon: <Rocket className="w-4 h-4" />,
+    }
+  } else if (hasRemediationItems) {
+    actionProps = {
+      onAction: () => setActiveTab("optimize"),
+      actionLabel: "Open Optimize",
+      actionIcon: <Rocket className="w-4 h-4" />,
+      actionDescription: (
+        <>
+          Auto-Optimize is the recommended path for improving spaces that fail IQ checks.
+          It runs benchmarks and applies validated configuration changes. Some issues, such
+          as missing data sources, permissions, or bulk Unity Catalog metadata gaps, may
+          still require manual setup.
+        </>
+      ),
     }
   }
 
@@ -324,27 +301,6 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, initialTab, autoSc
         )}
       </div>
 
-      {/* Fix agent modal overlay */}
-      {fixPanelOpen && fixFindings.length > 0 && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          {/* Backdrop */}
-          <div
-            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
-            onClick={() => { setFixPanelOpen(false); setFixFindings([]) }}
-          />
-          {/* Panel */}
-          <div className="relative w-full max-w-xl mx-4">
-            <FixAgentPanel
-              spaceId={spaceId}
-              displayName={displayName}
-              findings={fixFindings}
-              spaceConfig={state.spaceData ?? {}}
-              onClose={() => { setFixPanelOpen(false); setFixFindings([]) }}
-              onComplete={handleFixComplete}
-            />
-          </div>
-        </div>
-      )}
     </div>
   )
 }

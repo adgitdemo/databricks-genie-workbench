@@ -3,7 +3,6 @@ import {
   Sparkles,
   MessageSquarePlus,
   ShieldCheck,
-  Wrench,
   Zap,
   Lock,
   Layers,
@@ -52,7 +51,6 @@ const stages: Stage[] = [
   { id: "overview", label: "Overview", icon: <Sparkles className="h-4 w-4" />, color: ACCENT },
   { id: "create", label: "Create Agent", icon: <MessageSquarePlus className="h-4 w-4" />, color: CYAN },
   { id: "score", label: "IQ Scanner", icon: <ShieldCheck className="h-4 w-4" />, color: SUCCESS },
-  { id: "fix", label: "Quick Fix", icon: <Wrench className="h-4 w-4" />, color: WARNING },
   { id: "optimize", label: "Auto-Optimize", icon: <Zap className="h-4 w-4" />, color: DANGER },
   { id: "permissions", label: "Permissions", icon: <Lock className="h-4 w-4" />, color: INFO },
   { id: "architecture", label: "Architecture", icon: <Layers className="h-4 w-4" />, color: ACCENT },
@@ -86,7 +84,7 @@ export function HowItWorks() {
             How <span className="text-gradient">Genie Workbench</span> Works
           </h1>
           <p className="text-secondary text-base max-w-2xl mx-auto leading-relaxed">
-            Create, score, fix, and optimize your Genie Spaces — all from one intelligent interface.
+            Create, score, and optimize your Genie Spaces — all from one intelligent interface.
             Explore each capability below.
           </p>
         </div>
@@ -121,10 +119,9 @@ export function HowItWorks() {
         {activeStage === 0 && <OverviewContent />}
         {activeStage === 1 && <CreateAgentContent />}
         {activeStage === 2 && <IQScannerContent />}
-        {activeStage === 3 && <FixAgentContent />}
-        {activeStage === 4 && <AutoOptimizeContent />}
-        {activeStage === 5 && <PermissionsContent />}
-        {activeStage === 6 && <ArchitectureContent />}
+        {activeStage === 3 && <AutoOptimizeContent />}
+        {activeStage === 4 && <PermissionsContent />}
+        {activeStage === 5 && <ArchitectureContent />}
       </div>
 
       {/* Prev / Next navigation */}
@@ -165,10 +162,10 @@ function OverviewContent() {
     <div className="space-y-6">
       <div className="text-center mb-2">
         <h2 className="text-xl font-display font-bold text-primary">Everything You Need for Genie Spaces</h2>
-        <p className="text-sm text-muted mt-1">Four powerful capabilities, one streamlined workflow</p>
+        <p className="text-sm text-muted mt-1">Three core capabilities, one streamlined workflow</p>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 animate-stagger">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 animate-stagger">
         <FeatureCard
           icon={<MessageSquarePlus className="h-6 w-6" />}
           title="Create"
@@ -184,16 +181,9 @@ function OverviewContent() {
           glowColor={`${SUCCESS}15`}
         />
         <FeatureCard
-          icon={<Wrench className="h-6 w-6" />}
-          title="Quick Fix"
-          description="Turn scan findings into config-level fixes. Generates JSON patches and applies them directly — for bulk descriptions, use AI Generate in Unity Catalog."
-          accentColor={WARNING}
-          glowColor={`${WARNING}15`}
-        />
-        <FeatureCard
           icon={<Zap className="h-6 w-6" />}
           title="Optimize"
-          description="Run a full benchmark-driven optimization pipeline. Tests real questions, evaluates with 9 judges, and applies improvements automatically."
+          description="Run a benchmark-driven pipeline for spaces that fail checks or need accuracy validation. Tests real questions and applies validated improvements."
           accentColor={DANGER}
           glowColor={`${DANGER}15`}
         />
@@ -205,7 +195,6 @@ function OverviewContent() {
           steps={[
             { icon: <MessageSquarePlus className="h-5 w-5" />, label: "Create", description: "AI builds your space", color: CYAN },
             { icon: <ShieldCheck className="h-5 w-5" />, label: "Score", description: "12-check quality scan", color: SUCCESS },
-            { icon: <Wrench className="h-5 w-5" />, label: "Quick Fix", description: "Auto-apply patches", color: WARNING },
             { icon: <Zap className="h-5 w-5" />, label: "Optimize", description: "Benchmark & refine", color: DANGER },
             { icon: <CheckCircle2 className="h-5 w-5" />, label: "Trusted", description: "Production-ready", color: SUCCESS },
           ]}
@@ -386,101 +375,7 @@ function IQScannerContent() {
 }
 
 /* ================================================================
-   STAGE 3 — Fix Agent
-   ================================================================ */
-function FixAgentContent() {
-  const fixSteps: PipelineStep[] = [
-    { icon: <ShieldCheck className="h-5 w-5" />, label: "Scan Results", description: "Findings from IQ Scanner", color: SUCCESS },
-    { icon: <Search className="h-5 w-5" />, label: "Analyze", description: "LLM reviews each finding", color: INFO },
-    { icon: <FileText className="h-5 w-5" />, label: "Generate Patches", description: "JSON patches per finding", color: WARNING },
-    { icon: <Target className="h-5 w-5" />, label: "Validate", description: "Check patch safety", color: ACCENT },
-    { icon: <CheckCircle2 className="h-5 w-5" />, label: "Apply", description: "Write to Genie API", color: SUCCESS },
-  ]
-
-  return (
-    <div className="space-y-6">
-      <div className="text-center mb-2">
-        <h2 className="text-xl font-display font-bold text-primary">Quick Fix</h2>
-        <p className="text-sm text-muted mt-1">Automatically generates and applies config-level fixes from IQ Scanner findings</p>
-      </div>
-
-      <StageCard title="Scan → Fix Pipeline" icon={<Wrench className="h-4 w-4" />}>
-        <PipelineDiagram steps={fixSteps} />
-      </StageCard>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <StageCard title="What Gets Fixed" icon={<Target className="h-4 w-4" />}>
-          <div className="space-y-3">
-            {[
-              { label: "Missing instructions", fix: "Generates contextual instructions from table metadata" },
-              { label: "Missing sample questions", fix: "Creates realistic questions users would actually ask" },
-              { label: "Empty table descriptions", fix: "Writes descriptions from column analysis" },
-              { label: "Missing column docs", fix: "Documents columns based on names, types, and samples" },
-              { label: "Weak naming", fix: "Suggests clearer display names" },
-            ].map((item) => (
-              <div key={item.label} className="flex items-start gap-3">
-                <div className="mt-1 h-5 w-5 rounded bg-warning/10 flex items-center justify-center shrink-0">
-                  <Wrench className="h-3 w-3 text-warning" />
-                </div>
-                <div>
-                  <span className="text-sm font-medium text-primary">{item.label}</span>
-                  <p className="text-xs text-muted">{item.fix}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </StageCard>
-
-        <StageCard title="Patch Format" subtitle="JSON Patch (RFC 6902)" icon={<FileText className="h-4 w-4" />}>
-          <div className="rounded-lg bg-sunken border border-default p-4 font-mono text-xs leading-relaxed">
-            <div className="text-muted">{"// Example: adding a table description"}</div>
-            <div className="mt-2">
-              <span className="text-accent">{"{"}</span><br />
-              <span className="ml-3 text-cyan">"op"</span>: <span className="text-success">"replace"</span>,<br />
-              <span className="ml-3 text-cyan">"path"</span>: <span className="text-success">"/tables/0/description"</span>,<br />
-              <span className="ml-3 text-cyan">"value"</span>: <span className="text-success">"Daily sales transactions..."</span><br />
-              <span className="text-accent">{"}"}</span>
-            </div>
-          </div>
-          <div className="mt-4 space-y-2 text-sm">
-            <div className="flex items-center gap-2 text-secondary">
-              <CheckCircle2 className="h-4 w-4 text-success shrink-0" />
-              Patches run in parallel for speed
-            </div>
-            <div className="flex items-center gap-2 text-secondary">
-              <CheckCircle2 className="h-4 w-4 text-success shrink-0" />
-              ID sanitization prevents targeting errors
-            </div>
-            <div className="flex items-center gap-2 text-secondary">
-              <CheckCircle2 className="h-4 w-4 text-success shrink-0" />
-              Applied via Genie Space API — no file editing
-            </div>
-          </div>
-        </StageCard>
-      </div>
-
-      <StageCard title="Limitations" subtitle="What Quick Fix cannot do" icon={<AlertTriangle className="h-4 w-4" />}>
-        <div className="space-y-2.5 text-sm">
-          {[
-            "Column descriptions are capped at 50 per run — use AI Generate in Unity Catalog for bulk coverage",
-            "No data access — descriptions are inferred from column names only, not actual values",
-            "Generated example SQLs are untested — verify them in the Genie Space after applying",
-            "Cannot add or remove tables — manage data sources upstream in Unity Catalog",
-            "Optimization checks (11–12) require running the Optimize pipeline",
-          ].map((item) => (
-            <div key={item} className="flex items-start gap-2.5">
-              <XCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-              <span className="text-secondary">{item}</span>
-            </div>
-          ))}
-        </div>
-      </StageCard>
-    </div>
-  )
-}
-
-/* ================================================================
-   STAGE 4 — Auto-Optimize (GSO)
+   STAGE 3 — Auto-Optimize (GSO)
    ================================================================ */
 function AutoOptimizeContent() {
   const pipelineSteps: PipelineStep[] = [
@@ -493,18 +388,19 @@ function AutoOptimizeContent() {
   ]
 
   const levers = [
-    { name: "Instructions", desc: "Rewrite or enhance space-level instructions", color: ACCENT },
-    { name: "Table Descriptions", desc: "Improve how tables are described to the model", color: CYAN },
-    { name: "Column Descriptions", desc: "Add or refine column-level documentation", color: SUCCESS },
-    { name: "Sample Questions", desc: "Generate better example queries", color: WARNING },
-    { name: "Certified Queries", desc: "Add verified SQL for common questions", color: DANGER },
+    { name: "Tables & Columns", desc: "Improve table descriptions, column descriptions, and synonyms", color: CYAN },
+    { name: "Metric Views", desc: "Tune metric view column descriptions", color: INFO },
+    { name: "SQL Queries & Functions", desc: "Add or update example SQLs and remove underperforming TVFs", color: DANGER },
+    { name: "Join Specifications", desc: "Add, update, or remove join relationships", color: SUCCESS },
+    { name: "Text Instructions", desc: "Rewrite global routing instructions", color: ACCENT },
+    { name: "SQL Expressions", desc: "Add reusable measures, filters, and dimensions", color: WARNING },
   ]
 
   return (
     <div className="space-y-6">
       <div className="text-center mb-2">
         <h2 className="text-xl font-display font-bold text-primary">Auto-Optimize (GSO)</h2>
-        <p className="text-sm text-muted mt-1">Benchmark-driven optimization — tests real questions, picks what actually works</p>
+        <p className="text-sm text-muted mt-1">Benchmark-driven optimization for failed checks and measured accuracy — tests real questions and keeps what works</p>
       </div>
 
       <StageCard title="6-Task Pipeline" icon={<Zap className="h-4 w-4" />}>
@@ -512,7 +408,7 @@ function AutoOptimizeContent() {
       </StageCard>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <StageCard title="5 Lever Categories" subtitle="What gets tuned" icon={<Settings className="h-4 w-4" />}>
+        <StageCard title="6 Lever Categories" subtitle="What gets tuned" icon={<Settings className="h-4 w-4" />}>
           <div className="space-y-3">
             {levers.map((l) => (
               <div key={l.name} className="flex items-center gap-3">
@@ -555,7 +451,7 @@ function AutoOptimizeContent() {
 }
 
 /* ================================================================
-   STAGE 5 — Permissions
+   STAGE 4 — Permissions
    ================================================================ */
 function PermissionsContent() {
   return (
@@ -570,7 +466,7 @@ function PermissionsContent() {
 }
 
 /* ================================================================
-   STAGE 6 — Architecture
+   STAGE 5 — Architecture
    ================================================================ */
 function ArchitectureContent() {
   const layers = [

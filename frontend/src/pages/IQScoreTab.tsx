@@ -17,10 +17,11 @@ interface IQScoreTabProps {
   onAction?: () => void
   actionLabel?: string
   actionIcon?: React.ReactNode
+  actionDescription?: React.ReactNode
   onNavigateToOptimize?: () => void
 }
 
-export function IQScoreTab({ scanResult, isLoading, onScan, isScanning, onAction, actionLabel, actionIcon, onNavigateToOptimize }: IQScoreTabProps) {
+export function IQScoreTab({ scanResult, isLoading, onScan, isScanning, onAction, actionLabel, actionIcon, actionDescription, onNavigateToOptimize }: IQScoreTabProps) {
   const [checksExpanded, setChecksExpanded] = useState(false)
 
   if (isLoading) {
@@ -289,7 +290,7 @@ export function IQScoreTab({ scanResult, isLoading, onScan, isScanning, onAction
 
           {/* Single contextual action */}
           {onAction && actionLabel && (
-            <div className="mt-4 pt-4 border-t border-default flex items-start gap-4">
+            <div className="mt-4 pt-4 border-t border-default flex flex-col sm:flex-row sm:items-start gap-3 sm:gap-4">
               <button
                 onClick={onAction}
                 className="flex items-center gap-2 text-sm font-medium px-4 py-2.5 rounded-lg bg-accent text-white hover:bg-accent/90 transition-colors shrink-0"
@@ -297,12 +298,9 @@ export function IQScoreTab({ scanResult, isLoading, onScan, isScanning, onAction
                 {actionIcon}
                 {actionLabel}
               </button>
-              {actionLabel === "Quick Fix" && (
-                <p className="text-xs text-muted leading-relaxed pt-0.5">
-                  Fixes most config issues automatically. Column descriptions are limited to 50 per
-                  run and inferred from names — use <strong className="text-secondary">AI Generate</strong> in
-                  Unity Catalog for bulk or higher-accuracy results. Adding tables and optimization
-                  require separate workflows.
+              {actionDescription && (
+                <p className="text-xs text-muted leading-relaxed sm:pt-0.5 max-w-3xl">
+                  {actionDescription}
                 </p>
               )}
             </div>
