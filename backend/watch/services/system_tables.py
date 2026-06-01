@@ -172,6 +172,54 @@ def _p(name: str, value: Any, value_type: str = "STRING") -> StatementParameterL
     return StatementParameterListItem(name=name, value=str(value), type=value_type)
 
 
+# ─── Workspace scoping ─────────────────────────────────────────────────────
+# The geniewatch system-table queries were originally account-wide (one deploy
+# monitoring every workspace on the metastore). Genie Workbench deploys per
+# workspace, so the cross-workspace listing queries (top spenders, resource
+# rollup/graph) must be constrained to this app's own workspace.
+#
+# Scoping is done with the `workspace_id` column present on every system table
+# we read (query.history, billing.usage, access.table_lineage, access.audit) —
+# a Genie space's queries always run on a warehouse in the space's own
+# workspace, so `workspace_id` cleanly identifies the owning workspace and also
+# preserves history for spaces that have since been deleted. The Genie API
+# remains the source for the *set* of spaces and their metadata (titles,
+# configured data sources); it has no cost/usage/lineage data of its own.
+
+_CURRENT_WS_ID: str | None = None
+_CURRENT_WS_ID_RESOLVED = False
+
+
+def _current_workspace_id() -> str | None:
+    """This app's own workspace id, resolved once via the SDK (cached).
+
+    Returns None if resolution fails so callers fail *open* (unscoped, i.e.
+    today's behavior) rather than returning an empty dashboard.
+    """
+    global _CURRENT_WS_ID, _CURRENT_WS_ID_RESOLVED
+    if not _CURRENT_WS_ID_RESOLVED:
+        _CURRENT_WS_ID_RESOLVED = True
+        try:
+            _CURRENT_WS_ID = str(_client().get_workspace_id())
+        except Exception as e:  # noqa: BLE001 - never break queries on this
+            logger.warning("could not resolve current workspace id: %s", e)
+            _CURRENT_WS_ID = None
+    return _CURRENT_WS_ID
+
+
+def _ws_clause(params: list[StatementParameterListItem], col: str = "workspace_id") -> str:
+    """Return an `AND <col> = :ws_id` predicate (and append its bind param).
+
+    Substituted into the `{ws}` slot of a listing query. Returns '' when the
+    workspace id can't be resolved, leaving the query unscoped (fail-open).
+    """
+    wid = _current_workspace_id()
+    if not wid:
+        return ""
+    params.append(_p("ws_id", wid))
+    return f"AND {col} = :ws_id"
+
+
 # ─── Cost ─────────────────────────────────────────────────────────────────
 
 _COST_PER_SPACE_SQL = """
@@ -241,6 +289,7 @@ WITH q AS (
     WHERE query_source.genie_space_id IS NOT NULL
       AND start_time >= current_date() - :days
       AND total_task_duration_ms > 0
+      {ws}
     GROUP BY 1, 2, 3, 4
 ), hr_total AS (
     SELECT compute.warehouse_id AS wh,
@@ -310,10 +359,9 @@ WHERE workspace_id IN ({placeholders})
 
 
 def top_spenders(days: int = 7, limit: int = 10) -> list[dict[str, Any]]:
-    rows = _run(_TOP_SPENDERS_SQL, [
-        _p("days", days, "INT"),
-        _p("limit", limit, "INT"),
-    ])
+    params = [_p("days", days, "INT"), _p("limit", limit, "INT")]
+    sql = _TOP_SPENDERS_SQL.format(ws=_ws_clause(params))
+    rows = _run(sql, params)
     workspace_ids = {r.get("workspace_id") for r in rows if r.get("workspace_id")}
     names = _workspace_names(workspace_ids)
     for r in rows:
@@ -594,6 +642,7 @@ FROM system.access.table_lineage
 WHERE entity_metadata.genie_space_id IS NOT NULL
   AND source_table_full_name IS NOT NULL
   AND event_time >= current_date() - :days
+  {ws}
 GROUP BY 1
 ORDER BY space_count DESC, query_count_total DESC
 LIMIT :limit
@@ -601,10 +650,9 @@ LIMIT :limit
 
 
 def resource_rollup(days: int = 30, limit: int = 50) -> list[dict[str, Any]]:
-    return _run(_RESOURCE_ROLLUP_SQL, [
-        _p("days", days, "INT"),
-        _p("limit", limit, "INT"),
-    ])
+    params = [_p("days", days, "INT"), _p("limit", limit, "INT")]
+    sql = _RESOURCE_ROLLUP_SQL.format(ws=_ws_clause(params))
+    return _run(sql, params)
 
 
 _RESOURCE_SPACES_SQL = """
@@ -613,14 +661,14 @@ FROM system.access.table_lineage
 WHERE source_table_full_name = :full_name
   AND entity_metadata.genie_space_id IS NOT NULL
   AND event_time >= current_date() - :days
+  {ws}
 """
 
 
 def spaces_using_resource(full_name: str, days: int = 30) -> list[str]:
-    rows = _run(_RESOURCE_SPACES_SQL, [
-        _p("full_name", full_name),
-        _p("days", days, "INT"),
-    ])
+    params = [_p("full_name", full_name), _p("days", days, "INT")]
+    sql = _RESOURCE_SPACES_SQL.format(ws=_ws_clause(params))
+    rows = _run(sql, params)
     return [r["space_id"] for r in rows if r.get("space_id")]
 
 
@@ -634,6 +682,7 @@ FROM system.access.table_lineage
 WHERE entity_metadata.genie_space_id IS NOT NULL
   AND source_table_full_name IS NOT NULL
   AND event_time >= current_date() - :days
+  {ws}
 GROUP BY 1, 2, 3
 ORDER BY query_count DESC
 LIMIT :limit
@@ -641,7 +690,6 @@ LIMIT :limit
 
 
 def resource_graph_edges(days: int = 30, limit: int = 2000) -> list[dict[str, Any]]:
-    return _run(_RESOURCE_GRAPH_SQL, [
-        _p("days", days, "INT"),
-        _p("limit", limit, "INT"),
-    ])
+    params = [_p("days", days, "INT"), _p("limit", limit, "INT")]
+    sql = _RESOURCE_GRAPH_SQL.format(ws=_ws_clause(params))
+    return _run(sql, params)
