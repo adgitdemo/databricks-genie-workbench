@@ -95,6 +95,15 @@ domain = dbutils.jobs.taskValues.get(taskKey="preflight", key="domain")
 catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
+dbutils.widgets.text("llm_model", "")
+llm_model = (
+    dbutils.widgets.get("llm_model").strip()
+    or dbutils.jobs.taskValues.get(taskKey="preflight", key="llm_model", default="").strip()
+)
+if llm_model:
+    import os
+
+    os.environ["LLM_MODEL"] = llm_model
 
 from genie_space_optimizer.common.warehouse import (
     export_warehouse_id,
@@ -127,6 +136,7 @@ _log(
     baseline_model_id=baseline_model_id,
     thresholds_met=thresholds_met,
     warehouse_id=_warehouse_id or "(not set — detection will run without warehouse)",
+    llm_model=llm_model or "(default)",
 )
 
 # COMMAND ----------

@@ -320,6 +320,7 @@ def test_trigger_proceeds_when_prompt_registry_available(
         auto_optimize, "get_service_principal_client", lambda: mock_sp_ws
     )
     monkeypatch.setattr(auto_optimize, "get_workspace_client", lambda: mock_user_ws)
+    monkeypatch.setenv("LLM_MODEL", "custom-trigger-model")
 
     ok_probe = ProbeResult(
         available=True, reason_code="ok", actionable_by="customer"
@@ -352,6 +353,8 @@ def test_trigger_proceeds_when_prompt_registry_available(
         "status": "QUEUED",
     }
     trigger_mock.assert_called_once()
+    config = trigger_mock.call_args.kwargs["config"]
+    assert config.llm_model == "custom-trigger-model"
 
 
 def test_trigger_blocks_on_probe_error_fail_closed(

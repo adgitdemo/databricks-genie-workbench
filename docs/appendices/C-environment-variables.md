@@ -16,7 +16,8 @@ These variables are defined in `app.yaml` and injected into the app runtime. Pla
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `LLM_MODEL` | `__LLM_MODEL__` | Databricks model serving endpoint for analysis, fix agent, create agent. Default: `databricks-claude-sonnet-4-6` |
+| `LLM_MODEL` | `__LLM_MODEL__` | Databricks model serving endpoint for analysis, fix agent, create agent, and GSO. Default: `databricks-claude-sonnet-4-6` |
+| `GSO_LLM_ENDPOINT` | unset | Optional GSO-only override for emergency/debug use. If unset, GSO uses `LLM_MODEL` |
 
 ### SQL Warehouse
 
@@ -66,7 +67,7 @@ The Databricks notebook path does not write `.env.deploy`; it collects equivalen
 | `GENIE_CATALOG` | Yes | — | Unity Catalog name (you need CREATE SCHEMA permission) |
 | `GENIE_APP_NAME` | No | `genie-workbench` | Databricks App name (must be unique in your workspace) |
 | `GENIE_DEPLOY_PROFILE` | No | `DEFAULT` | Databricks CLI profile name |
-| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM serving endpoint for analysis |
+| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM serving endpoint for the app and GSO optimization job |
 | `GENIE_LAKEBASE_INSTANCE` | No | empty | Lakebase Autoscaling project to use or create; installer defaults new installs to `<app-name>-lakebase`; keep stable for the same app, use a fresh project for a new app instance |
 
 ## How Variables Flow

@@ -689,7 +689,23 @@ def apply_quality_instructions_is_on() -> bool:
 
 # ── 4. LLM Configuration ──────────────────────────────────────────────
 
-LLM_ENDPOINT = "databricks-claude-opus-4-6"
+DEFAULT_LLM_ENDPOINT = "databricks-claude-sonnet-4-6"
+
+
+def get_llm_endpoint() -> str:
+    """Return the Databricks model serving endpoint used by GSO LLM calls.
+
+    ``LLM_MODEL`` is the app-wide source of truth. ``GSO_LLM_ENDPOINT`` is an
+    explicit GSO-only override for emergency/debug use.
+    """
+    return (
+        os.environ.get("GSO_LLM_ENDPOINT")
+        or os.environ.get("LLM_MODEL")
+        or DEFAULT_LLM_ENDPOINT
+    ).strip() or DEFAULT_LLM_ENDPOINT
+
+
+LLM_ENDPOINT = DEFAULT_LLM_ENDPOINT
 LLM_TEMPERATURE = 0
 LLM_MAX_RETRIES = 3
 
@@ -3764,9 +3780,11 @@ MAX_INSTRUCTION_TEXT_CHARS = 2000
 MAX_HOLISTIC_INSTRUCTION_CHARS = 8000
 
 PROMPT_TOKEN_BUDGET = 70_000
-"""Token budget for LLM prompts.  Claude Opus 4.6 supports 200k tokens;
-we target ~70k to stay in the quality sweet-spot while leaving headroom
-for the response."""
+"""Token budget for LLM prompts.
+
+The default endpoint supports large contexts; keep prompts around 70k tokens to
+leave response headroom and remain inside the quality sweet spot.
+"""
 
 RISK_LEVEL_SCORE = {
     "low": 1,

@@ -225,6 +225,13 @@ domain = dbutils.jobs.taskValues.get(taskKey="preflight", key="domain")
 catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
+dbutils.widgets.text("llm_model", "")
+llm_model = (
+    dbutils.widgets.get("llm_model").strip()
+    or dbutils.jobs.taskValues.get(taskKey="preflight", key="llm_model", default="").strip()
+)
+if llm_model:
+    os.environ["LLM_MODEL"] = llm_model
 
 import os as _os
 _warehouse_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="warehouse_id", default="")
@@ -254,6 +261,7 @@ _log(
     catalog=catalog,
     schema=schema,
     experiment_name=exp_name,
+    llm_model=llm_model or "(default)",
 )
 
 # COMMAND ----------

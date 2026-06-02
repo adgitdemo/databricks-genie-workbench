@@ -122,6 +122,7 @@ for j in (jobs if isinstance(jobs, list) else jobs.get('jobs', [])):
     if (cd "$PROJECT_DIR" && databricks bundle destroy -t app \
         --var="catalog=${CATALOG}" \
         --var="warehouse_id=${WAREHOUSE_ID:-placeholder}" \
+        --var="llm_model=${LLM_MODEL}" \
         --profile "$PROFILE" --auto-approve 2>&1 | sed 's/^/  /'); then
         echo "  ✓ Bundle resources destroyed"
     else
@@ -320,6 +321,7 @@ set +e
 BUNDLE_OUTPUT=$(cd "$PROJECT_DIR" && databricks bundle deploy -t app \
     --var="catalog=$CATALOG" \
     --var="warehouse_id=$WAREHOUSE_ID" \
+    --var="llm_model=$LLM_MODEL" \
     --profile "$PROFILE" 2>&1)
 BUNDLE_EXIT=$?
 set -e
@@ -369,6 +371,7 @@ echo "  ✓ Job notebooks verified on workspace"
 JOB_ID=$(cd "$PROJECT_DIR" && databricks bundle summary -t app \
     --var="catalog=$CATALOG" \
     --var="warehouse_id=$WAREHOUSE_ID" \
+    --var="llm_model=$LLM_MODEL" \
     --profile "$PROFILE" -o json 2>/dev/null \
     | python3 -c "
 import sys, json
@@ -380,7 +383,7 @@ if [ -z "$JOB_ID" ]; then
     echo "  ✗ Bundle deployed but could not resolve job ID from Terraform state."
     echo ""
     echo "  Remediation:"
-    echo "    1. Run: databricks bundle summary -t app --profile $PROFILE -o json"
+    echo "    1. Run: databricks bundle summary -t app --var=\"catalog=$CATALOG\" --var=\"warehouse_id=$WAREHOUSE_ID\" --var=\"llm_model=$LLM_MODEL\" --profile $PROFILE -o json"
     echo "    2. Check if resources.jobs.gso-optimization-runner.id exists"
     echo "    3. Re-run: ./scripts/deploy.sh --update"
     exit 1

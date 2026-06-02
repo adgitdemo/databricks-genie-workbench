@@ -55,7 +55,6 @@ from genie_space_optimizer.common.config import (
     INSTRUCTION_PROMPT_NAME_TEMPLATE,
     JUDGE_PROMPTS,
     LEVER_PROMPTS,
-    LLM_ENDPOINT,
     LLM_MAX_RETRIES,
     LLM_SOURCE_ID_TEMPLATE,
     LLM_TEMPERATURE,
@@ -70,6 +69,7 @@ from genie_space_optimizer.common.config import (
     TARGET_BENCHMARK_COUNT,
     TEMPLATE_VARIABLES,
     format_mlflow_template,
+    get_llm_endpoint,
     scoring_v2_is_legacy,
     scoring_v2_is_on,
     scoring_v2_is_shadow,
@@ -106,8 +106,20 @@ logger = logging.getLogger(__name__)
 CODE_SOURCE = AssessmentSource(source_type="CODE", source_id=CODE_SOURCE_ID)
 LLM_SOURCE = AssessmentSource(
     source_type="LLM_JUDGE",
-    source_id=format_mlflow_template(LLM_SOURCE_ID_TEMPLATE, endpoint=LLM_ENDPOINT),
+    source_id=format_mlflow_template(
+        LLM_SOURCE_ID_TEMPLATE, endpoint=get_llm_endpoint(),
+    ),
 )
+
+
+def get_llm_source() -> AssessmentSource:
+    """Return LLM judge metadata using the currently configured endpoint."""
+    return AssessmentSource(
+        source_type="LLM_JUDGE",
+        source_id=format_mlflow_template(
+            LLM_SOURCE_ID_TEMPLATE, endpoint=get_llm_endpoint(),
+        ),
+    )
 
 
 # ── Judge-failure predicates ──────────────────────────────────────────

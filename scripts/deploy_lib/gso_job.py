@@ -41,6 +41,7 @@ JOB_PARAMETERS = {
     "experiment_name": "",
     "deploy_target": "",
     "warehouse_id": "",
+    "llm_model": "",
 }
 
 
@@ -127,6 +128,9 @@ def _task_payload(task_key: str, notebook_stem: str, depends_on: str | None, not
         "notebook_task": {
             "notebook_path": f"{notebooks_path}/{notebook_stem}",
             "source": "WORKSPACE",
+            "base_parameters": {
+                "llm_model": "{{job.parameters.llm_model}}",
+            },
         },
         "environment_key": "default",
         "timeout_seconds": 7200,
@@ -135,7 +139,7 @@ def _task_payload(task_key: str, notebook_stem: str, depends_on: str | None, not
     if depends_on:
         task["depends_on"] = [{"task_key": depends_on}]
     if task_key == "preflight":
-        task["notebook_task"]["base_parameters"] = {
+        task["notebook_task"]["base_parameters"].update({
             "run_id": "{{job.parameters.run_id}}",
             "space_id": "{{job.parameters.space_id}}",
             "domain": "{{job.parameters.domain}}",
@@ -147,7 +151,8 @@ def _task_payload(task_key: str, notebook_stem: str, depends_on: str | None, not
             "experiment_name": "{{job.parameters.experiment_name}}",
             "deploy_target": "{{job.parameters.deploy_target}}",
             "warehouse_id": "{{job.parameters.warehouse_id}}",
-        }
+            "llm_model": "{{job.parameters.llm_model}}",
+        })
     return task
 
 
@@ -174,7 +179,13 @@ def build_job_settings(cfg: InstallConfig, notebooks_path: str, wheel_path: str)
             "managed-by": "notebook-installer",
             "pattern": "persistent-dag",
         },
-        "parameters": [{"name": name, "default": default} for name, default in JOB_PARAMETERS.items()],
+        "parameters": [
+            {
+                "name": name,
+                "default": cfg.llm_model if name == "llm_model" else default,
+            }
+            for name, default in JOB_PARAMETERS.items()
+        ],
         "tasks": tasks,
         "environments": [
             {

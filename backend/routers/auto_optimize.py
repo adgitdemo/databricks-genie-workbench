@@ -248,6 +248,7 @@ def _build_gso_config() -> IntegrationConfig:
         schema_name=os.environ.get("GSO_SCHEMA", "genie_space_optimizer"),
         warehouse_id=os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", ""),
         job_id=int(os.environ["GSO_JOB_ID"]) if os.environ.get("GSO_JOB_ID", "").isdigit() else None,
+        llm_model=os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
     )
 
 

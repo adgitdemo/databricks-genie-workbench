@@ -338,6 +338,7 @@ def test_gso_job_settings_match_persistent_dag_shape():
         app_name="genie-workbench",
         catalog="main",
         warehouse_id="wh",
+        llm_model="custom-gso-model",
         repo_root="/tmp",
     )
     settings = build_job_settings(
@@ -351,8 +352,12 @@ def test_gso_job_settings_match_persistent_dag_shape():
     assert settings["tags"]["app"] == "genie-workbench"
     assert settings["tags"]["managed-by"] == "notebook-installer"
     assert settings["environments"][0]["spec"]["environment_version"] == "4"
+    params = {p["name"]: p["default"] for p in settings["parameters"]}
+    assert params["llm_model"] == "custom-gso-model"
     task_keys = [task["task_key"] for task in settings["tasks"]]
     assert task_keys == ["preflight", "baseline_eval", "enrichment", "lever_loop", "finalize", "deploy"]
+    assert settings["tasks"][0]["notebook_task"]["base_parameters"]["llm_model"] == "{{job.parameters.llm_model}}"
+    assert settings["tasks"][1]["notebook_task"]["base_parameters"]["llm_model"] == "{{job.parameters.llm_model}}"
     assert settings["tasks"][1]["depends_on"] == [{"task_key": "preflight"}]
     assert settings["tasks"][-1]["condition_task"]["right"] == "disabled"
 
