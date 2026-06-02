@@ -415,8 +415,7 @@ export function ResourceGraphView({ days }: Props) {
             <span>Hide spaces with no title</span>
           </label>
           <p className="mt-1 text-[11px] text-muted/80">
-            Excludes trashed and cross-workspace spaces (anything not returned
-            by the Genie API for this workspace).
+            Exclude workspaces in trash or no title
           </p>
         </div>
         <div className="mt-2 border-t border-default pt-3 text-xs text-muted">
