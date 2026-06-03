@@ -59,8 +59,8 @@ def test_list_chat_models_returns_curated_compatible_models(monkeypatch):
         isDefault=True,
     )
     assert "databricks-gpt-5-4" in names
-    assert "databricks-gpt-5-5" in names
-    assert "databricks-gpt-5-5-pro" in names
+    assert "databricks-gpt-5-5" not in names
+    assert "databricks-gpt-5-5-pro" not in names
     assert "databricks-claude-opus-4-8" in names
     assert "databricks-claude-opus-4-7" in names
     assert "chat-default" not in names
@@ -113,6 +113,15 @@ def test_validate_chat_model_rejects_non_curated_model():
 
     try:
         model_catalog.validate_chat_model("databricks-claude-opus-4-1", client=ws)
+    except model_catalog.ModelValidationError as exc:
+        assert "curated list" in str(exc)
+    else:
+        raise AssertionError("expected ModelValidationError")
+
+
+def test_validate_chat_model_rejects_gpt_5_5_until_responses_api():
+    try:
+        model_catalog.validate_chat_model("databricks-gpt-5-5")
     except model_catalog.ModelValidationError as exc:
         assert "curated list" in str(exc)
     else:

@@ -17,8 +17,8 @@ _CURATED_COMPATIBLE_CHAT_MODELS: tuple[tuple[str, str], ...] = (
     ("databricks-claude-sonnet-4-6", "Claude Sonnet 4.6"),
     ("databricks-claude-sonnet-4-5", "Claude Sonnet 4.5"),
     ("databricks-claude-haiku-4-5", "Claude Haiku 4.5"),
-    ("databricks-gpt-5-5-pro", "GPT-5.5 Pro"),
-    ("databricks-gpt-5-5", "GPT-5.5"),
+    # GPT 5.5 currently requires Responses API for function-tool flows.
+    # Create Agent uses Chat Completions tools, so keep it out of the shared picker.
     ("databricks-gpt-5-4", "GPT-5.4"),
     ("databricks-gpt-5-4-mini", "GPT-5.4 Mini"),
     ("databricks-gpt-5-2", "GPT-5.2"),

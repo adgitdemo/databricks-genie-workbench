@@ -257,7 +257,7 @@ def _traced_llm_call(
                     "model": model,
                     "messages": messages,
                 }
-                # Do not send temperature: models such as Claude Opus 4.7/4.8 and GPT 5.5 reject it.
+                # Do not send temperature: Claude Opus 4.7/4.8 and some GPT 5.x endpoints reject it.
                 if max_tokens is not None:
                     call_kwargs["max_tokens"] = max_tokens
 
