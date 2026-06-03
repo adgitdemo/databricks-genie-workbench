@@ -28,7 +28,6 @@ _memory_store: dict = {
     "watch_conversation_cache": {}, # (space_id, conversation_id) -> dict
     "watch_message_cache": {},      # (space_id, conversation_id, message_id) -> dict
     "watch_sync_watermark": {},     # resource -> dict
-    "watch_eval_mappings": {},      # space_id -> dict
     "watch_daily_rollup": {},       # (space_id, day) -> dict
 }
 
@@ -253,15 +252,6 @@ async def _ensure_schema():
                     last_synced_at TIMESTAMPTZ NOT NULL,
                     status         TEXT,
                     error          TEXT
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS genie.watch_eval_mappings (
-                    space_id      VARCHAR(64) PRIMARY KEY,
-                    experiment_id VARCHAR(64) NOT NULL,
-                    created_by    TEXT NOT NULL,
-                    created_at    TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at    TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
             await conn.execute("""
@@ -853,56 +843,6 @@ async def watch_set_watermark(resource: str, status: str, error: str | None = No
             ON CONFLICT (resource) DO UPDATE SET
                 last_synced_at = NOW(), status = EXCLUDED.status, error = EXCLUDED.error
         """, resource, status, error)
-
-
-async def watch_get_eval_mapping(space_id: str) -> Optional[dict]:
-    if not is_available():
-        return _memory_store["watch_eval_mappings"].get(space_id)
-    async with _pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT space_id, experiment_id, created_by, created_at, updated_at "
-            "FROM genie.watch_eval_mappings WHERE space_id = $1",
-            space_id,
-        )
-        if not row:
-            return None
-        return {
-            "space_id": row["space_id"],
-            "experiment_id": row["experiment_id"],
-            "created_by": row["created_by"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
-        }
-
-
-async def watch_upsert_eval_mapping(space_id: str, experiment_id: str, created_by: str) -> dict:
-    record = {
-        "space_id": space_id,
-        "experiment_id": experiment_id,
-        "created_by": created_by,
-        "created_at": datetime.utcnow().isoformat(),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-    if not is_available():
-        _memory_store["watch_eval_mappings"][space_id] = record
-        return record
-    async with _pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO genie.watch_eval_mappings (space_id, experiment_id, created_by)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (space_id) DO UPDATE SET
-                experiment_id = EXCLUDED.experiment_id,
-                updated_at    = NOW()
-        """, space_id, experiment_id, created_by)
-    return record
-
-
-async def watch_delete_eval_mapping(space_id: str) -> None:
-    if not is_available():
-        _memory_store["watch_eval_mappings"].pop(space_id, None)
-        return
-    async with _pool.acquire() as conn:
-        await conn.execute("DELETE FROM genie.watch_eval_mappings WHERE space_id = $1", space_id)
 
 
 async def watch_upsert_daily_rollup(row: dict) -> None:

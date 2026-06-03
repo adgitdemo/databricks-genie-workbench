@@ -223,42 +223,7 @@ class ResourceGraph(BaseModel):
     truncated: bool = False
 
 
-# ─── Evals ────────────────────────────────────────────────────────────────
-
-
-class EvalExperimentMapping(BaseModel):
-    space_id: str
-    experiment_id: str
-    created_by: str
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class EvalRun(BaseModel):
-    run_id: str
-    run_name: Optional[str] = None
-    status: Optional[str] = None
-    start_time: Optional[int] = None
-    end_time: Optional[int] = None
-    user_id: Optional[str] = None
-    metrics: dict[str, float] = Field(default_factory=dict)
-    params: dict[str, str] = Field(default_factory=dict)
-    tags: dict[str, str] = Field(default_factory=dict)
-
-
-class EvalSummary(BaseModel):
-    space_id: str
-    experiment_id: Optional[str] = None
-    experiment_name: Optional[str] = None
-    runs: list[EvalRun] = Field(default_factory=list)
-    permission_denied: bool = False
-
-
 # ─── Settings ─────────────────────────────────────────────────────────────
-
-
-class SetEvalMappingRequest(BaseModel):
-    experiment_id: str
 
 
 class HealthStatus(BaseModel):

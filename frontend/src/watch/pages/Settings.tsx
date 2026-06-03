@@ -2,16 +2,12 @@ import { useEffect, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import * as api from '@/watch/lib/api'
-import type { EvalExperimentMapping, HealthStatus } from '@/watch/types/api'
+import type { HealthStatus } from '@/watch/types/api'
 
 export function Settings() {
   const [health, setHealth] = useState<HealthStatus | null>(null)
-  const [spaceId, setSpaceId] = useState('')
-  const [experimentId, setExperimentId] = useState('')
-  const [mapping, setMapping] = useState<EvalExperimentMapping | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [savedMessage, setSavedMessage] = useState<string | null>(null)
@@ -19,43 +15,6 @@ export function Settings() {
   useEffect(() => {
     api.getHealth().then(setHealth).catch(() => setHealth(null))
   }, [])
-
-  async function loadMapping() {
-    setError(null); setMapping(null); setSavedMessage(null)
-    if (!spaceId) return
-    try {
-      const m = await api.getEvalMapping(spaceId)
-      if ('experiment_id' in m && m.experiment_id) {
-        setMapping(m as EvalExperimentMapping)
-        setExperimentId((m as EvalExperimentMapping).experiment_id)
-      }
-    } catch (e) {
-      setError(String(e))
-    }
-  }
-
-  async function save() {
-    setError(null); setSavedMessage(null)
-    try {
-      const m = await api.setEvalMapping(spaceId, experimentId)
-      setMapping(m)
-      setSavedMessage('Saved.')
-    } catch (e) {
-      setError(String(e))
-    }
-  }
-
-  async function clear() {
-    setError(null); setSavedMessage(null)
-    try {
-      await api.deleteEvalMapping(spaceId)
-      setMapping(null)
-      setExperimentId('')
-      setSavedMessage('Cleared.')
-    } catch (e) {
-      setError(String(e))
-    }
-  }
 
   async function refreshCache() {
     setRefreshing(true); setSavedMessage(null); setError(null)
@@ -96,40 +55,15 @@ export function Settings() {
       </Card>
 
       <Card className="p-4">
-        <h2 className="mb-3 text-sm font-medium uppercase text-muted">
-          Map a Genie Space → MLflow experiment
-        </h2>
-        <div className="grid gap-2 sm:grid-cols-3">
-          <Input
-            value={spaceId}
-            onChange={e => setSpaceId(e.target.value)}
-            placeholder="Genie Space ID (32-char hex)"
-          />
-          <Input
-            value={experimentId}
-            onChange={e => setExperimentId(e.target.value)}
-            placeholder="MLflow experiment ID"
-          />
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={loadMapping}>Lookup</Button>
-            <Button onClick={save} disabled={!spaceId || !experimentId}>Save</Button>
-            <Button variant="ghost" onClick={clear} disabled={!spaceId}>Clear</Button>
-          </div>
-        </div>
-        {mapping && (
-          <p className="mt-3 text-xs text-muted">
-            Currently mapped: <code className="font-mono">{mapping.experiment_id}</code> by {mapping.created_by}
-          </p>
-        )}
-      </Card>
-
-      <Card className="p-4">
-        <h2 className="mb-3 text-sm font-medium uppercase text-muted">Conversation cache</h2>
+        <h2 className="mb-3 text-sm font-medium uppercase text-muted">Genie conversation history</h2>
         <p className="mb-3 text-sm text-muted">
-          Refreshes the conversation/message cache for every visible space. Runs in the background.
+          Re-pulls each space's conversations from the Genie API into the cache that powers the
+          “Recent conversations” list on a space's detail page. Runs in the background across every
+          visible space. Does not affect cost, usage, or feedback metrics — those are read live from
+          Databricks system tables.
         </p>
         <Button onClick={refreshCache} disabled={refreshing}>
-          {refreshing ? 'Queueing…' : 'Refresh now'}
+          {refreshing ? 'Syncing…' : 'Sync conversations'}
         </Button>
       </Card>
 

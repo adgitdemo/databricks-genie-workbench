@@ -5,9 +5,6 @@ import type {
   CostPerConversation,
   CostRollup,
   CostTopSpender,
-  EvalExperimentMapping,
-  EvalRun,
-  EvalSummary,
   FeedbackEvent,
   FeedbackMessageComment,
   FeedbackTabResponse,
@@ -139,33 +136,9 @@ export const getSpacesUsingResource = (fullName: string, days = 30) =>
 export const getResourceGraph = (days = 30, limit = 2000) =>
   fetchJson<ResourceGraph>(`/resources/graph?days=${days}&limit=${limit}`)
 
-// ── Evals ───────────────────────────────────────────────────────────────────
-
-export const getSpaceEvals = (spaceId: string) =>
-  fetchJson<EvalSummary>(`/spaces/${spaceId}/evals`)
-
-export const getEvalRun = (runId: string) =>
-  fetchJson<EvalRun>(`/evals/runs/${runId}`)
-
 // ── Settings ────────────────────────────────────────────────────────────────
 
 export const getHealth = () => fetchJson<HealthStatus>('/settings/health')
-
-export const getEvalMapping = (spaceId: string) =>
-  fetchJson<EvalExperimentMapping | Record<string, never>>(
-    `/settings/eval-mapping/${spaceId}`,
-  )
-
-export const setEvalMapping = (spaceId: string, experimentId: string) =>
-  fetchJson<EvalExperimentMapping>(`/settings/eval-mapping/${spaceId}`, {
-    method: 'POST',
-    body: JSON.stringify({ experiment_id: experimentId }),
-  })
-
-export const deleteEvalMapping = (spaceId: string) =>
-  fetchJson<{ deleted: string }>(`/settings/eval-mapping/${spaceId}`, {
-    method: 'DELETE',
-  })
 
 export const refreshConversationCache = () =>
   fetchJson<{ queued: number }>('/settings/cache/refresh', { method: 'POST' })

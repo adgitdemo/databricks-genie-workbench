@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import * as api from '@/watch/lib/api'
 import type {
-  CostPerConversation, CostRollup, EvalSummary, HealthStatus,
+  CostPerConversation, CostRollup, HealthStatus,
   ResourceUsage, SpaceSummary, UsageRollup,
 } from '@/watch/types/api'
 import { formatDate, formatInt, formatMs, formatUsd, formatDay } from '@/watch/lib/format'
@@ -19,10 +19,9 @@ import { LoadingCard } from '@/watch/components/LoadingCard'
 interface Props {
   spaceId: string
   onBack: () => void
-  onOpenSettings: () => void
 }
 
-export function SpaceDetail({ spaceId, onBack, onOpenSettings }: Props) {
+export function SpaceDetail({ spaceId, onBack }: Props) {
   const space = useCachedFetch<SpaceSummary>(`space:${spaceId}`, () => api.getSpace(spaceId), [spaceId])
   const health = useCachedFetch<HealthStatus>('health', () => api.getHealth())
 
@@ -72,14 +71,12 @@ export function SpaceDetail({ spaceId, onBack, onOpenSettings }: Props) {
               <TabsTrigger value="usage">Usage</TabsTrigger>
               <TabsTrigger value="cost">Cost</TabsTrigger>
               <TabsTrigger value="resources">Resources</TabsTrigger>
-              <TabsTrigger value="evals">Evals</TabsTrigger>
             </TabsList>
 
             <TabsContent value="overview" keepAlive><Overview space={space.data} /></TabsContent>
             <TabsContent value="usage" keepAlive><UsageTab spaceId={spaceId} /></TabsContent>
             <TabsContent value="cost" keepAlive><CostTab spaceId={spaceId} /></TabsContent>
             <TabsContent value="resources" keepAlive><ResourcesTab spaceId={spaceId} /></TabsContent>
-            <TabsContent value="evals" keepAlive><EvalsTab spaceId={spaceId} onOpenSettings={onOpenSettings} /></TabsContent>
           </Tabs>
         </>
       )}
@@ -373,77 +370,6 @@ function ResourcesTab({ spaceId }: { spaceId: string }) {
   )
 }
 
-function EvalsTab({ spaceId, onOpenSettings }: { spaceId: string; onOpenSettings: () => void }) {
-  const { data, error: err } = useCachedFetch<EvalSummary>(
-    `evals:${spaceId}`, () => api.getSpaceEvals(spaceId), [spaceId],
-  )
-
-  if (err) return <Card className="border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">{err}</Card>
-  if (!data) return <LoadingCard />
-
-
-  if (!data.experiment_id) {
-    return (
-      <Card className="p-6 text-center">
-        <h3 className="mb-2 text-lg font-medium">No MLflow experiment mapped</h3>
-        <p className="mb-4 text-sm text-muted">
-          Map this space to an MLflow experiment in Settings to surface eval runs.
-        </p>
-        <Button onClick={onOpenSettings}>Open Settings</Button>
-      </Card>
-    )
-  }
-
-  if (data.permission_denied) {
-    return (
-      <Card className="border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-400">
-        Mapped experiment <code>{data.experiment_id}</code> exists but the app SP cannot read it.
-        Grant <code>CAN_READ</code> to the SP and refresh.
-      </Card>
-    )
-  }
-
-  return (
-    <div className="space-y-3">
-      <Card className="p-4">
-        <p className="text-xs uppercase text-muted">Experiment</p>
-        <p className="font-medium">{data.experiment_name}</p>
-        <p className="font-mono text-xs text-muted">{data.experiment_id}</p>
-      </Card>
-      <Card className="overflow-hidden p-0">
-        <table className="w-full text-sm">
-          <thead className="border-b border-default bg-elevated text-left text-xs uppercase text-muted">
-            <tr>
-              <th className="px-4 py-2">Run</th>
-              <th className="px-4 py-2">Status</th>
-              <th className="px-4 py-2">Started</th>
-              <th className="px-4 py-2">Top metrics</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.runs.map(r => (
-              <tr key={r.run_id} className="border-t border-default/50">
-                <td className="px-4 py-2 font-mono text-xs">{r.run_name || r.run_id.slice(0, 12)}…</td>
-                <td className="px-4 py-2"><Badge>{r.status || '—'}</Badge></td>
-                <td className="px-4 py-2 text-muted">{r.start_time ? new Date(r.start_time).toLocaleString() : '—'}</td>
-                <td className="px-4 py-2 text-xs">
-                  {Object.entries(r.metrics).slice(0, 3).map(([k, v]) => (
-                    <span key={k} className="mr-2">
-                      <span className="text-muted">{k}:</span> {Number(v).toFixed(3)}
-                    </span>
-                  ))}
-                </td>
-              </tr>
-            ))}
-            {!data.runs.length && (
-              <tr><td colSpan={4} className="p-6 text-center text-muted">No runs in this experiment.</td></tr>
-            )}
-          </tbody>
-        </table>
-      </Card>
-    </div>
-  )
-}
 
 
 

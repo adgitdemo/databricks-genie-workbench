@@ -1,24 +1,18 @@
-"""Watch settings router: eval mapping CRUD, conversation cache refresh, health."""
+"""Watch settings router: conversation cache refresh and health."""
 
 from __future__ import annotations
 
 import logging
 import os
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from backend.services import lakebase
 from backend.services.auth import get_databricks_host
-from backend.watch._validators import validate_space_id
-from backend.watch.models import (
-    EvalExperimentMapping,
-    HealthStatus,
-    SetEvalMappingRequest,
-)
+from backend.watch.models import HealthStatus
 from backend.watch.services import (
     conversations_client,
     genie_client,
-    mlflow_client,
     system_tables,
 )
 
@@ -40,38 +34,6 @@ async def health() -> dict:
         workspace_host=host,
         system_tables_accessible=system_tables.system_tables_status(),
     ).model_dump(mode="json")
-
-
-@router.get("/eval-mapping/{space_id}")
-async def get_mapping(space_id: str) -> dict:
-    sid = validate_space_id(space_id)
-    m = await lakebase.watch_get_eval_mapping(sid)
-    if not m:
-        return {}
-    return EvalExperimentMapping(**m).model_dump(mode="json")
-
-
-@router.post("/eval-mapping/{space_id}")
-async def set_mapping(space_id: str, body: SetEvalMappingRequest, request: Request) -> dict:
-    sid = validate_space_id(space_id)
-    exp = mlflow_client.get_experiment(body.experiment_id)
-    if exp is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"experiment_id {body.experiment_id!r} not found or not readable",
-        )
-    user = request.headers.get("X-Forwarded-User") or os.environ.get("DEV_USER_EMAIL", "unknown")
-    record = await lakebase.watch_upsert_eval_mapping(
-        space_id=sid, experiment_id=body.experiment_id, created_by=user,
-    )
-    return EvalExperimentMapping(**record).model_dump(mode="json")
-
-
-@router.delete("/eval-mapping/{space_id}")
-async def delete_mapping(space_id: str) -> dict:
-    sid = validate_space_id(space_id)
-    await lakebase.watch_delete_eval_mapping(sid)
-    return {"deleted": sid}
 
 
 @router.post("/cache/refresh")

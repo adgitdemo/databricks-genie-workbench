@@ -306,7 +306,6 @@ export function AdminDashboard({ onSelectSpace, initialSubTab }: AdminDashboardP
             <WatchSpaceDetail
               spaceId={watchDrillId}
               onBack={() => setWatchDrillId(null)}
-              onOpenSettings={() => { setWatchDrillId(null); setSubTab("settings") }}
             />
           ) : (
             <WatchSpacesList onOpenSpace={(sid) => setWatchDrillId(sid)} />

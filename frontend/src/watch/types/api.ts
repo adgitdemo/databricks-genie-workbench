@@ -153,34 +153,6 @@ export interface ResourceGraph {
   truncated: boolean
 }
 
-export interface EvalRun {
-  run_id: string
-  run_name: string | null
-  status: string | null
-  start_time: number | null
-  end_time: number | null
-  user_id: string | null
-  metrics: Record<string, number>
-  params: Record<string, string>
-  tags: Record<string, string>
-}
-
-export interface EvalSummary {
-  space_id: string
-  experiment_id: string | null
-  experiment_name: string | null
-  runs: EvalRun[]
-  permission_denied: boolean
-}
-
-export interface EvalExperimentMapping {
-  space_id: string
-  experiment_id: string
-  created_by: string
-  created_at: string | null
-  updated_at: string | null
-}
-
 export interface HealthStatus {
   lakebase_available: boolean
   obo_active: boolean
