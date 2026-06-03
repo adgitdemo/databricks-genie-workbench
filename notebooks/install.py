@@ -20,9 +20,7 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 from pathlib import Path
-import importlib
 import sys
-from datetime import datetime
 
 
 def path_exists(path: Path) -> bool:
@@ -77,6 +75,9 @@ dbutils.widgets.text("lakebase_project_name", "")
 # MAGIC - [ ] If `lakebase_mode` is not `skip`, Lakebase Autoscaling is available.
 
 # COMMAND ----------
+from datetime import datetime
+import importlib
+
 from databricks.sdk import WorkspaceClient
 
 import scripts.deploy_lib.app_yaml
