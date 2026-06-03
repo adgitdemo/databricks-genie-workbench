@@ -62,6 +62,7 @@ class CostRollup(BaseModel):
 
 class CostTopSpender(BaseModel):
     space_id: str
+    title: Optional[str] = None
     workspace_id: Optional[str] = None
     workspace_name: Optional[str] = None
     query_count: int

@@ -43,6 +43,7 @@ export interface CostRollup {
 
 export interface CostTopSpender {
   space_id: string
+  title: string | null
   workspace_id: string | null
   workspace_name: string | null
   query_count: number

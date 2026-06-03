@@ -7,6 +7,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Query
 
+from backend.services import lakebase
 from backend.watch._validators import validate_days, validate_space_id
 from backend.watch.models import (
     CostPerConversation,
@@ -75,9 +76,23 @@ async def get_space_cost(space_id: str, days: int = Query(7, ge=1, le=365)) -> d
 async def top_spenders(days: int = Query(7, ge=1, le=365), limit: int = Query(10, ge=1, le=200)) -> list[dict]:
     days = validate_days(days, default=7)
     rows = system_tables.top_spenders(days=days, limit=limit)
+
+    # Genie space titles aren't in the system tables; resolve them from the
+    # space cache (same source SpacesList uses). Best-effort: a missing cache
+    # entry just leaves title=None and the UI falls back to the space id.
+    titles: dict[str, str] = {}
+    try:
+        for s in await lakebase.watch_list_cached_spaces():
+            sid, title = s.get("space_id"), s.get("title")
+            if sid and title:
+                titles[sid] = title
+    except Exception:  # noqa: BLE001 - never fail cost data on a title lookup
+        titles = {}
+
     return [
         CostTopSpender(
             space_id=r["space_id"],
+            title=titles.get(r["space_id"]),
             workspace_id=r.get("workspace_id"),
             workspace_name=r.get("workspace_name"),
             query_count=int(r.get("query_count") or 0),

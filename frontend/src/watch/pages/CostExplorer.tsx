@@ -33,7 +33,7 @@ export function CostExplorer({ onOpenSpace }: Props) {
     return [...top].sort((a, b) => {
       switch (sortKey) {
         case 'space_id':
-          return a.space_id.localeCompare(b.space_id) * dir
+          return ((a.title || '').localeCompare(b.title || '')) * dir
         case 'workspace_name': {
           const av = a.workspace_name ?? a.workspace_id ?? ''
           const bv = b.workspace_name ?? b.workspace_id ?? ''
@@ -110,8 +110,9 @@ export function CostExplorer({ onOpenSpace }: Props) {
                 key={s.space_id}
                 className="cursor-pointer border-t border-default/50 hover:bg-elevated/50"
               >
-                <td className="px-4 py-2 font-mono text-xs" onClick={() => onOpenSpace(s.space_id)}>
-                  {s.space_id}
+                <td className="px-4 py-2" onClick={() => onOpenSpace(s.space_id)}>
+                  <div className="font-medium">{s.title || '(untitled)'}</div>
+                  <div className="font-mono text-xs text-muted">{s.space_id.slice(0, 12)}…</div>
                 </td>
                 <td
                   className="px-4 py-2 text-xs"
