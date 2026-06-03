@@ -1,15 +1,32 @@
-/** Module-scoped result cache for the GenieWatch surface. */
+/** Module-scoped result cache for the GenieWatch surface.
+ *
+ * Entries carry a timestamp and expire after DEFAULT_TTL_MS so cached data
+ * auto-freshens on re-visit (e.g. navigating back into a space) instead of
+ * living for the whole browser session. The manual Refresh buttons remain a
+ * "force refresh now" on top of this. The TTL is aligned with the backend
+ * system-table cache (5 minutes) so the two layers stay roughly in step.
+ */
 
 import { useEffect, useState } from 'react'
 
-const _cache = new Map<string, unknown>()
+const DEFAULT_TTL_MS = 5 * 60 * 1000
 
-export function getCached<T>(key: string): T | undefined {
-  return _cache.get(key) as T | undefined
+interface Entry { value: unknown; ts: number }
+
+const _cache = new Map<string, Entry>()
+
+export function getCached<T>(key: string, ttlMs: number = DEFAULT_TTL_MS): T | undefined {
+  const entry = _cache.get(key)
+  if (entry === undefined) return undefined
+  if (ttlMs > 0 && Date.now() - entry.ts > ttlMs) {
+    _cache.delete(key)
+    return undefined
+  }
+  return entry.value as T
 }
 
 export function putCached<T>(key: string, value: T): void {
-  _cache.set(key, value)
+  _cache.set(key, { value, ts: Date.now() })
 }
 
 export function invalidate(prefix?: string): void {

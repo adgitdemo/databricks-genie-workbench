@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { ArrowLeft, AlertCircle, ExternalLink, Info, RefreshCw } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
@@ -10,7 +11,7 @@ import type {
   ResourceUsage, SpaceSummary, UsageRollup,
 } from '@/watch/types/api'
 import { formatDate, formatInt, formatMs, formatUsd, formatDay } from '@/watch/lib/format'
-import { useCachedFetch } from '@/watch/lib/cache'
+import { invalidate, useCachedFetch } from '@/watch/lib/cache'
 import { genieSpaceUrl } from '@/watch/lib/genie'
 import { Stat } from '@/watch/components/Stat'
 import { SimpleBars } from '@/watch/components/SimpleBars'
@@ -24,9 +25,22 @@ interface Props {
 export function SpaceDetail({ spaceId, onBack }: Props) {
   const space = useCachedFetch<SpaceSummary>(`space:${spaceId}`, () => api.getSpace(spaceId), [spaceId])
   const health = useCachedFetch<HealthStatus>('health', () => api.getHealth())
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [refreshing, setRefreshing] = useState(false)
 
   function refreshAll() {
+    setRefreshing(true)
+    // Clear this space's cached tab data, then bump refreshKey (a fetch dep on
+    // every tab) so the kept-alive tabs re-fetch against the now-empty cache.
+    for (const prefix of ['usage:', 'cost:', 'cost-conv:', 'resources:']) {
+      invalidate(`${prefix}${spaceId}`)
+    }
     space.reload()
+    setRefreshKey(k => k + 1)
+    // Tabs re-fetch in the background (each owns its own loading state); spin
+    // the button briefly so the click gives immediate feedback, mirroring the
+    // Spaces list refresh.
+    setTimeout(() => setRefreshing(false), 800)
   }
 
   return (
@@ -35,8 +49,8 @@ export function SpaceDetail({ spaceId, onBack }: Props) {
         <Button variant="ghost" onClick={onBack} className="gap-1">
           <ArrowLeft size={16} /> Back to spaces
         </Button>
-        <Button variant="outline" onClick={refreshAll} className="gap-1">
-          <RefreshCw size={14} /> Refresh
+        <Button variant="outline" onClick={refreshAll} disabled={refreshing} className="gap-1">
+          <RefreshCw className={refreshing ? 'animate-spin' : ''} size={14} /> Refresh
         </Button>
       </div>
 
@@ -74,9 +88,9 @@ export function SpaceDetail({ spaceId, onBack }: Props) {
             </TabsList>
 
             <TabsContent value="overview" keepAlive><Overview space={space.data} /></TabsContent>
-            <TabsContent value="usage" keepAlive><UsageTab spaceId={spaceId} /></TabsContent>
-            <TabsContent value="cost" keepAlive><CostTab spaceId={spaceId} /></TabsContent>
-            <TabsContent value="resources" keepAlive><ResourcesTab spaceId={spaceId} /></TabsContent>
+            <TabsContent value="usage" keepAlive><UsageTab spaceId={spaceId} refreshKey={refreshKey} /></TabsContent>
+            <TabsContent value="cost" keepAlive><CostTab spaceId={spaceId} refreshKey={refreshKey} /></TabsContent>
+            <TabsContent value="resources" keepAlive><ResourcesTab spaceId={spaceId} refreshKey={refreshKey} /></TabsContent>
           </Tabs>
         </>
       )}
@@ -107,9 +121,9 @@ function Overview({ space }: { space: SpaceSummary }) {
   )
 }
 
-function UsageTab({ spaceId }: { spaceId: string }) {
+function UsageTab({ spaceId, refreshKey }: { spaceId: string; refreshKey: number }) {
   const { data, error: err } = useCachedFetch<UsageRollup>(
-    `usage:${spaceId}:7`, () => api.getSpaceUsage(spaceId, 7), [spaceId],
+    `usage:${spaceId}:7`, () => api.getSpaceUsage(spaceId, 7), [spaceId, refreshKey],
   )
 
   if (err) return <Card className="border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">{err}</Card>
@@ -210,16 +224,16 @@ function UsageTab({ spaceId }: { spaceId: string }) {
   )
 }
 
-function CostTab({ spaceId }: { spaceId: string }) {
+function CostTab({ spaceId, refreshKey }: { spaceId: string; refreshKey: number }) {
   const { data, error: err } = useCachedFetch<CostRollup>(
-    `cost:${spaceId}:7`, () => api.getSpaceCost(spaceId, 7), [spaceId],
+    `cost:${spaceId}:7`, () => api.getSpaceCost(spaceId, 7), [spaceId, refreshKey],
   )
   // Per-conversation breakdown is heavier (correlates with audit logs).
   // It's loaded lazily — only when this tab is visible.
   const conversations = useCachedFetch<CostPerConversation[]>(
     `cost-conv:${spaceId}:7`,
     () => api.getCostPerConversation(spaceId, 7, 50),
-    [spaceId],
+    [spaceId, refreshKey],
   )
 
   if (err) return <Card className="border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">{err}</Card>
@@ -318,9 +332,9 @@ function CostTab({ spaceId }: { spaceId: string }) {
   )
 }
 
-function ResourcesTab({ spaceId }: { spaceId: string }) {
+function ResourcesTab({ spaceId, refreshKey }: { spaceId: string; refreshKey: number }) {
   const { data, error: err } = useCachedFetch<ResourceUsage[]>(
-    `resources:${spaceId}:7`, () => api.getSpaceResources(spaceId, 7), [spaceId],
+    `resources:${spaceId}:7`, () => api.getSpaceResources(spaceId, 7), [spaceId, refreshKey],
   )
 
   if (err) return <Card className="border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">{err}</Card>
