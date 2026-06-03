@@ -41,6 +41,45 @@ _NON_CHAT_MODEL_NAME_HINTS = (
     "bge",
 )
 
+_DATABRICKS_FMAPI_CHAT_MODELS: tuple[tuple[str, str], ...] = (
+    ("databricks-claude-opus-4-8", "Claude Opus 4.8"),
+    ("databricks-claude-opus-4-7", "Claude Opus 4.7"),
+    ("databricks-claude-opus-4-6", "Claude Opus 4.6"),
+    ("databricks-claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("databricks-claude-sonnet-4-5", "Claude Sonnet 4.5"),
+    ("databricks-claude-opus-4-5", "Claude Opus 4.5"),
+    ("databricks-claude-sonnet-4", "Claude Sonnet 4"),
+    ("databricks-claude-opus-4-1", "Claude Opus 4.1"),
+    ("databricks-claude-haiku-4-5", "Claude Haiku 4.5"),
+    ("databricks-gpt-5-5-pro", "GPT-5.5 Pro"),
+    ("databricks-gpt-5-5", "GPT-5.5"),
+    ("databricks-gpt-5-4", "GPT-5.4"),
+    ("databricks-gpt-5-4-mini", "GPT-5.4 Mini"),
+    ("databricks-gpt-5-4-nano", "GPT-5.4 Nano"),
+    ("databricks-gpt-5-2", "GPT-5.2"),
+    ("databricks-gpt-5-1", "GPT-5.1"),
+    ("databricks-gpt-5", "GPT-5"),
+    ("databricks-gpt-5-mini", "GPT-5 Mini"),
+    ("databricks-gpt-5-nano", "GPT-5 Nano"),
+    ("databricks-gpt-oss-120b", "GPT OSS 120B"),
+    ("databricks-gpt-oss-20b", "GPT OSS 20B"),
+    ("databricks-gemini-3-1-flash-lite", "Gemini 3.1 Flash Lite"),
+    ("databricks-gemini-3-1-pro", "Gemini 3.1 Pro"),
+    ("databricks-gemini-3-5-flash", "Gemini 3.5 Flash"),
+    ("databricks-gemini-3-flash", "Gemini 3 Flash"),
+    ("databricks-gemini-2-5-pro", "Gemini 2.5 Pro"),
+    ("databricks-gemini-2-5-flash", "Gemini 2.5 Flash"),
+    ("databricks-qwen35-122b-a10b", "Qwen3.5 122B A10B"),
+    ("databricks-llama-4-maverick", "Llama 4 Maverick"),
+    ("databricks-meta-llama-3-3-70b-instruct", "Llama 3.3 70B Instruct"),
+    ("databricks-meta-llama-3-1-8b-instruct", "Llama 3.1 8B Instruct"),
+    ("databricks-gemma-3-12b", "Gemma 3 12B"),
+    ("databricks-qwen3-next-80b-a3b-instruct", "Qwen3 Next 80B A3B Instruct"),
+)
+_DATABRICKS_FMAPI_CHAT_MODEL_NAMES = {
+    name for name, _display_name in _DATABRICKS_FMAPI_CHAT_MODELS
+}
+
 
 class ModelCatalogError(RuntimeError):
     """Raised when model catalog metadata cannot be read."""
@@ -149,6 +188,37 @@ def _to_model_info(endpoint: Any, default_model: str) -> LLMModelInfo | None:
     )
 
 
+def _fmapi_model_infos(default_model: str) -> list[LLMModelInfo]:
+    """Databricks-hosted pay-per-token chat endpoints.
+
+    These endpoint names are callable through Foundation Model APIs but are
+    not consistently returned by ``serving_endpoints.list()`` in every
+    workspace/runtime identity. Keep them as a fallback so new installs still
+    expose model choices without requiring custom serving endpoints.
+    """
+    return [
+        LLMModelInfo(
+            name=name,
+            displayName=display_name,
+            isDefault=name == default_model,
+        )
+        for name, display_name in _DATABRICKS_FMAPI_CHAT_MODELS
+    ]
+
+
+def _merge_models(
+    listed_models: list[LLMModelInfo],
+    default_model: str,
+) -> list[LLMModelInfo]:
+    by_name = {model.name: model for model in _fmapi_model_infos(default_model)}
+    for model in listed_models:
+        by_name[model.name] = model
+    return sorted(
+        by_name.values(),
+        key=lambda m: (not m.isDefault, m.displayName.lower(), m.name.lower()),
+    )
+
+
 def list_chat_models(
     *,
     client: WorkspaceClient | None = None,
@@ -167,12 +237,12 @@ def list_chat_models(
         else:
             raise ModelCatalogError(f"Could not list serving endpoints: {exc}") from exc
 
-    models = [
+    listed_models = [
         info
         for endpoint in endpoints
         if (info := _to_model_info(endpoint, default_model)) is not None
     ]
-    return sorted(models, key=lambda m: (not m.isDefault, m.displayName.lower(), m.name.lower()))
+    return _merge_models(listed_models, default_model)
 
 
 def validate_chat_model(
@@ -184,6 +254,8 @@ def validate_chat_model(
     selected = (model_name or "").strip()
     if not selected:
         return None
+    if selected in _DATABRICKS_FMAPI_CHAT_MODEL_NAMES:
+        return selected
 
     try:
         models = list_chat_models(client=client, allow_sp_fallback=False)

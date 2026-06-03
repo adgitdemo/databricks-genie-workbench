@@ -52,7 +52,9 @@ def test_list_chat_models_filters_ready_chat_endpoints(monkeypatch):
 
     models = model_catalog.list_chat_models(client=ws)
 
-    assert [m.name for m in models] == ["chat-default", "chat-alt"]
+    names = [m.name for m in models]
+    assert names[:2] == ["chat-default", "chat-alt"]
+    assert "databricks-claude-sonnet-4-6" in names
     assert models[0].displayName == "Default Chat"
     assert models[0].isDefault is True
     assert models[1].isDefault is False
@@ -69,8 +71,35 @@ def test_list_chat_models_falls_back_to_sp_on_scope_error(monkeypatch):
 
     models = model_catalog.list_chat_models(allow_sp_fallback=True)
 
-    assert [m.name for m in models] == ["sp-chat"]
+    names = [m.name for m in models]
+    assert names[0] == "sp-chat"
+    assert "databricks-claude-sonnet-4-6" in names
     sp_ws.serving_endpoints.list.assert_called_once()
+
+
+def test_list_chat_models_includes_fmapi_fallback_when_endpoint_list_is_empty(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "databricks-claude-sonnet-4-6")
+    ws = MagicMock()
+    ws.serving_endpoints.list.return_value = []
+
+    models = model_catalog.list_chat_models(client=ws)
+
+    assert models[0] == LLMModelInfo(
+        name="databricks-claude-sonnet-4-6",
+        displayName="Claude Sonnet 4.6",
+        isDefault=True,
+    )
+    assert any(m.name == "databricks-gpt-5-4" for m in models)
+
+
+def test_validate_chat_model_accepts_known_fmapi_without_listing():
+    ws = MagicMock()
+    ws.serving_endpoints.list.side_effect = AssertionError("should not list")
+
+    assert (
+        model_catalog.validate_chat_model("databricks-claude-sonnet-4-6", client=ws)
+        == "databricks-claude-sonnet-4-6"
+    )
 
 
 def test_validate_chat_model_rejects_non_chat_model():
