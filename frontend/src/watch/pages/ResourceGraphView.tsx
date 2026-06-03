@@ -67,7 +67,6 @@ export function ResourceGraphView({ days }: Props) {
     [data],
   )
   const [selectedSpaceIds, setSelectedSpaceIds] = useState<Set<string> | null>(null)
-  const [selectedWorkspaceIds, setSelectedWorkspaceIds] = useState<Set<string> | null>(null)
   const [minSharedSpaces, setMinSharedSpaces] = useState(1)
   const [hideUnnamedSpaces, setHideUnnamedSpaces] = useState(false)
   const [selectedCatalogs, setSelectedCatalogs] = useState<Set<string> | null>(null)
@@ -77,7 +76,6 @@ export function ResourceGraphView({ days }: Props) {
   // Reset selection when underlying space list changes (e.g. days window).
   useEffect(() => {
     setSelectedSpaceIds(null)
-    setSelectedWorkspaceIds(null)
     setSelectedCatalogs(null)
     setSelectedSchemas(null)
     setSelectedTables(null)
@@ -94,20 +92,6 @@ export function ResourceGraphView({ days }: Props) {
     return m
   }, [data])
 
-  const spaceToWorkspaceLookup = useMemo(() => {
-    const m: Record<string, string | null> = {}
-    for (const s of data?.spaces ?? []) m[s.space_id] = s.workspace_id ?? null
-    return m
-  }, [data])
-
-  const workspaceNameLookup = useMemo(() => {
-    const m: Record<string, string | null> = {}
-    for (const s of data?.spaces ?? []) {
-      if (s.workspace_id && !(s.workspace_id in m)) m[s.workspace_id] = s.workspace_name
-    }
-    return m
-  }, [data])
-
   const namedSpaceIds = useMemo(
     () => new Set((data?.spaces ?? []).filter(s => s.title).map(s => s.space_id)),
     [data],
@@ -118,7 +102,7 @@ export function ResourceGraphView({ days }: Props) {
    * dropdown's options reflect what's still reachable given every other
    * dimension's current selection.
    */
-  type SkipDim = 'workspace' | 'space' | 'catalog' | 'schema' | 'table' | null
+  type SkipDim = 'space' | 'catalog' | 'schema' | 'table' | null
 
   const filterContext = useMemo(() => {
     if (!data) {
@@ -126,7 +110,6 @@ export function ResourceGraphView({ days }: Props) {
         finalEdges: [] as ResourceGraph['edges'],
         droppedResources: 0,
         droppedSpaces: 0,
-        workspaceOpts: [] as { workspace_id: string; workspace_name: string | null }[],
         spaceOpts: [] as ResourceGraph['spaces'],
         catalogOpts: [] as string[],
         schemaOpts: [] as string[],
@@ -138,12 +121,6 @@ export function ResourceGraphView({ days }: Props) {
       let result = data.edges
       if (hideUnnamedSpaces) {
         result = result.filter(e => namedSpaceIds.has(e.space_id))
-      }
-      if (skip !== 'workspace' && selectedWorkspaceIds) {
-        result = result.filter(e => {
-          const ws = spaceToWorkspaceLookup[e.space_id]
-          return !ws || selectedWorkspaceIds.has(ws)
-        })
       }
       if (skip !== 'space' && selectedSpaceIds) {
         result = result.filter(e => selectedSpaceIds.has(e.space_id))
@@ -178,21 +155,6 @@ export function ResourceGraphView({ days }: Props) {
     const droppedSpaces = new Set(preRedundancyEdges.map(e => e.space_id)).size
       - new Set(finalEdges.map(e => e.space_id)).size
 
-    // Distinct workspaces in the cross-section that ignores the workspace filter.
-    const wsEdges = apply('workspace')
-    const wsIds = new Set<string>()
-    for (const e of wsEdges) {
-      const ws = spaceToWorkspaceLookup[e.space_id]
-      if (ws) wsIds.add(ws)
-    }
-    const workspaceOpts = [...wsIds]
-      .map(workspace_id => ({ workspace_id, workspace_name: workspaceNameLookup[workspace_id] ?? null }))
-      .sort((a, b) => {
-        if (a.workspace_name && !b.workspace_name) return -1
-        if (!a.workspace_name && b.workspace_name) return 1
-        return (a.workspace_name ?? a.workspace_id).localeCompare(b.workspace_name ?? b.workspace_id)
-      })
-
     const spEdges = apply('space')
     const spIds = new Set(spEdges.map(e => e.space_id))
     const spaceOpts = sortedSpaces.filter(s => spIds.has(s.space_id))
@@ -215,24 +177,19 @@ export function ResourceGraphView({ days }: Props) {
 
     return {
       finalEdges, droppedResources, droppedSpaces,
-      workspaceOpts, spaceOpts, catalogOpts, schemaOpts, tableOpts,
+      spaceOpts, catalogOpts, schemaOpts, tableOpts,
     }
   }, [
-    data, sortedSpaces, resourcePartsByName, spaceToWorkspaceLookup, workspaceNameLookup,
-    namedSpaceIds, selectedWorkspaceIds, selectedSpaceIds, selectedCatalogs, selectedSchemas,
+    data, sortedSpaces, resourcePartsByName,
+    namedSpaceIds, selectedSpaceIds, selectedCatalogs, selectedSchemas,
     selectedTables, minSharedSpaces, hideUnnamedSpaces,
   ])
 
-  const workspaces = filterContext.workspaceOpts
-  const spacesInActiveWorkspaces = filterContext.spaceOpts
+  const availableSpaces = filterContext.spaceOpts
   const catalogs = filterContext.catalogOpts
   const schemas = filterContext.schemaOpts
   const tables = filterContext.tableOpts
 
-  const activeWorkspaces = useMemo<Set<string>>(
-    () => selectedWorkspaceIds ?? new Set(workspaces.map(w => w.workspace_id)),
-    [selectedWorkspaceIds, workspaces],
-  )
   const activeCatalogs = useMemo<Set<string>>(
     () => selectedCatalogs ?? new Set(catalogs),
     [selectedCatalogs, catalogs],
@@ -246,8 +203,8 @@ export function ResourceGraphView({ days }: Props) {
     [selectedTables, tables],
   )
   const activeSpaces = useMemo<Set<string>>(
-    () => selectedSpaceIds ?? new Set(spacesInActiveWorkspaces.map(s => s.space_id)),
-    [selectedSpaceIds, spacesInActiveWorkspaces],
+    () => selectedSpaceIds ?? new Set(availableSpaces.map(s => s.space_id)),
+    [selectedSpaceIds, availableSpaces],
   )
 
   // Tune d3 forces for clearer spacing whenever data changes.
@@ -330,23 +287,15 @@ export function ResourceGraphView({ days }: Props) {
     <div className="grid gap-4 lg:grid-cols-[260px_1fr]">
       <Card className="flex flex-col gap-3 p-3">
         <div className="text-xs font-medium uppercase text-muted">Filters</div>
-        <WorkspaceFilterDropdown
-          workspaces={workspaces}
-          activeWorkspaces={activeWorkspaces}
-          loading={!data}
-          onChange={setSelectedWorkspaceIds}
-          onAll={() => setSelectedWorkspaceIds(null)}
-          onNone={() => setSelectedWorkspaceIds(new Set())}
-        />
         <SpaceFilterDropdown
-          spaces={spacesInActiveWorkspaces}
+          spaces={availableSpaces}
           activeSpaces={activeSpaces}
           loading={!data}
           onChange={setSelectedSpaceIds}
           onAll={() => setSelectedSpaceIds(null)}
           onNone={() => setSelectedSpaceIds(new Set())}
           selected={filterCount.selected}
-          total={spacesInActiveWorkspaces.length}
+          total={availableSpaces.length}
         />
         <StringFilterDropdown
           label="Catalog"
@@ -438,7 +387,7 @@ export function ResourceGraphView({ days }: Props) {
 
       <Card className="p-0">
         <div className="flex items-center justify-between border-b border-default px-4 py-2 text-xs uppercase text-muted">
-          <span>Bipartite graph — {graph.nodes.length} nodes · {graph.links.length} edges</span>
+          <span>Bipartite graph</span>
           {data?.truncated && (
             <span className="normal-case text-amber-500">
               edges truncated — showing top 2,000
@@ -623,138 +572,6 @@ function SpaceFilterDropdown({
                     <span className="truncate" title={`${s.title}\n${s.space_id}`}>{s.title}</span>
                   ) : (
                     <span className="truncate font-mono text-muted/80" title={s.space_id}>{s.space_id}</span>
-                  )}
-                </label>
-              )
-            })}
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-interface WorkspaceFilterDropdownProps {
-  workspaces: { workspace_id: string; workspace_name: string | null }[]
-  activeWorkspaces: Set<string>
-  loading: boolean
-  onChange: (next: Set<string>) => void
-  onAll: () => void
-  onNone: () => void
-}
-
-function WorkspaceFilterDropdown({
-  workspaces, activeWorkspaces, loading, onChange, onAll, onNone,
-}: WorkspaceFilterDropdownProps) {
-  const [open, setOpen] = useState(false)
-  const [search, setSearch] = useState('')
-  const wrapperRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (!open) return
-    function onClick(e: MouseEvent) {
-      if (!wrapperRef.current?.contains(e.target as Node)) setOpen(false)
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('mousedown', onClick)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onClick)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [open])
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    if (!q) return workspaces
-    return workspaces.filter(
-      w =>
-        (w.workspace_name?.toLowerCase().includes(q) ?? false) ||
-        w.workspace_id.toLowerCase().includes(q),
-    )
-  }, [workspaces, search])
-
-  const total = workspaces.length
-  const selected = activeWorkspaces.size
-  const summary =
-    selected === total
-      ? `All (${total})`
-      : selected === 0
-        ? 'None'
-        : `${selected} of ${total}`
-
-  return (
-    <div ref={wrapperRef} className="relative inline-block">
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="flex w-full items-center gap-2 rounded border border-default bg-elevated px-3 py-1.5 text-sm hover:bg-elevated/80"
-      >
-        <span className="text-xs uppercase text-muted">Workspace</span>
-        <span>{summary}</span>
-        <ChevronDown className="ml-auto h-4 w-4 text-muted" />
-      </button>
-      {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 w-[340px] rounded border border-default bg-surface shadow-lg">
-          <div className="border-b border-default p-2">
-            <input
-              autoFocus
-              type="text"
-              placeholder="Search workspaces…"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              className="w-full rounded border border-default bg-elevated px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-default"
-            />
-          </div>
-          <div className="flex gap-2 border-b border-default px-2 py-2 text-xs">
-            <button
-              className="rounded border border-default px-2 py-1 hover:bg-elevated"
-              onClick={onAll}
-            >
-              Select all
-            </button>
-            <button
-              className="rounded border border-default px-2 py-1 hover:bg-elevated"
-              onClick={onNone}
-            >
-              Clear
-            </button>
-            <span className="ml-auto self-center text-muted">
-              {filtered.length} match{filtered.length === 1 ? '' : 'es'}
-            </span>
-          </div>
-          <div className="max-h-[360px] overflow-y-auto p-1">
-            {loading && <div className="p-4 text-center text-xs text-muted">Loading…</div>}
-            {!loading && !filtered.length && (
-              <div className="p-4 text-center text-xs text-muted">No matches.</div>
-            )}
-            {filtered.map(w => {
-              const checked = activeWorkspaces.has(w.workspace_id)
-              return (
-                <label
-                  key={w.workspace_id}
-                  className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs hover:bg-elevated/50"
-                >
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => {
-                      const next = new Set(activeWorkspaces)
-                      if (checked) next.delete(w.workspace_id)
-                      else next.add(w.workspace_id)
-                      onChange(next)
-                    }}
-                  />
-                  {w.workspace_name ? (
-                    <span className="truncate" title={`${w.workspace_name}\n${w.workspace_id}`}>
-                      {w.workspace_name}
-                    </span>
-                  ) : (
-                    <span className="truncate font-mono text-muted/80" title={w.workspace_id}>
-                      {w.workspace_id}
-                    </span>
                   )}
                 </label>
               )
