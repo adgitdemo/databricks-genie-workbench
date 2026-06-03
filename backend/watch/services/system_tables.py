@@ -193,8 +193,8 @@ _CURRENT_WS_ID_RESOLVED = False
 def _current_workspace_id() -> str | None:
     """This app's own workspace id, resolved once via the SDK (cached).
 
-    Returns None if resolution fails so callers fail *open* (unscoped, i.e.
-    today's behavior) rather than returning an empty dashboard.
+    Returns None if resolution fails; `_ws_clause` then fails *closed*
+    (scopes the query to no rows) rather than leaking other workspaces' data.
     """
     global _CURRENT_WS_ID, _CURRENT_WS_ID_RESOLVED
     if not _CURRENT_WS_ID_RESOLVED:
@@ -210,12 +210,14 @@ def _current_workspace_id() -> str | None:
 def _ws_clause(params: list[StatementParameterListItem], col: str = "workspace_id") -> str:
     """Return an `AND <col> = :ws_id` predicate (and append its bind param).
 
-    Substituted into the `{ws}` slot of a listing query. Returns '' when the
-    workspace id can't be resolved, leaving the query unscoped (fail-open).
+    Substituted into the `{ws}` slot of a scoped query. If the workspace id
+    can't be resolved, returns a predicate that matches no rows (fail-closed)
+    so a resolution failure never leaks other workspaces' data.
     """
     wid = _current_workspace_id()
     if not wid:
-        return ""
+        logger.warning("workspace id unresolved — scoping query to no rows (fail-closed)")
+        return "AND 1=0"
     params.append(_p("ws_id", wid))
     return f"AND {col} = :ws_id"
 
@@ -493,12 +495,15 @@ SELECT
 FROM system.query.history
 WHERE query_source.genie_space_id IS NOT NULL
   AND start_time >= current_date() - :days
+  {ws}
 GROUP BY 1
 """
 
 
 def usage_summary_all_spaces(days: int = 7) -> list[dict[str, Any]]:
-    return _run(_USAGE_SUMMARY_SQL, [_p("days", days, "INT")])
+    params = [_p("days", days, "INT")]
+    sql = _USAGE_SUMMARY_SQL.format(ws=_ws_clause(params))
+    return _run(sql, params)
 
 
 _TOP_QUERIES_SQL = """
@@ -571,12 +576,15 @@ WHERE service_name = 'aibiGenie'
   AND action_name = 'updateConversationMessageFeedback'
   AND request_params.feedback_rating IS NOT NULL
   AND event_time >= current_date() - :days
+  {ws}
 GROUP BY 1
 """
 
 
 def feedback_summary_all_spaces(days: int = 7) -> list[dict[str, Any]]:
-    return _run(_FEEDBACK_SUMMARY_SQL, [_p("days", days, "INT")])
+    params = [_p("days", days, "INT")]
+    sql = _FEEDBACK_SUMMARY_SQL.format(ws=_ws_clause(params))
+    return _run(sql, params)
 
 
 _FEEDBACK_EVENTS_ALL_SQL = """
@@ -597,16 +605,16 @@ WHERE service_name = 'aibiGenie'
   AND request_params.space_id IS NOT NULL
   AND request_params.feedback_rating IS NOT NULL
   AND event_time >= current_date() - :days
+  {ws}
 ORDER BY event_time DESC
 LIMIT :limit
 """
 
 
 def feedback_events_all_spaces(days: int = 7, limit: int = 500) -> list[dict[str, Any]]:
-    return _run(_FEEDBACK_EVENTS_ALL_SQL, [
-        _p("days", days, "INT"),
-        _p("limit", limit, "INT"),
-    ])
+    params = [_p("days", days, "INT"), _p("limit", limit, "INT")]
+    sql = _FEEDBACK_EVENTS_ALL_SQL.format(ws=_ws_clause(params))
+    return _run(sql, params)
 
 
 
