@@ -202,7 +202,7 @@ async def get_settings():
 
 @router.get("/models", response_model=list[LLMModelInfo])
 async def get_models():
-    """List READY chat-compatible serving endpoints for model selection."""
+    """List curated chat models for user selection."""
     try:
         return list_chat_models(allow_sp_fallback=True)
     except ModelCatalogError as exc:

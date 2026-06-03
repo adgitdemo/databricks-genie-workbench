@@ -17,7 +17,7 @@ Both paths deploy the same app and provision the same core resources. The local 
   - A Unity Catalog where the GSO schema can be created
   - Lakebase Autoscaling available (optional but recommended for persistent scan history, starred spaces, and agent sessions)
   - MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
-  - At least one READY chat-compatible model serving endpoint for Create Agent and Auto-Optimize model selection
+  - Databricks Foundation Model APIs enabled for the curated Create Agent and Auto-Optimize model list
 
 ### Installer permissions
 
@@ -240,7 +240,7 @@ For the local terminal installer, set these in `.env.deploy` or as environment v
 | `GENIE_CATALOG` | Yes | — | Unity Catalog name (needs CREATE SCHEMA) |
 | `GENIE_APP_NAME` | No | `genie-workbench` | Databricks App name (unique in workspace) |
 | `GENIE_DEPLOY_PROFILE` | No | `DEFAULT` | Databricks CLI profile name |
-| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | Default LLM serving endpoint; users can override per Create Agent session or Auto-Optimize run |
+| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | Default LLM serving endpoint; users can override per Create Agent session or Auto-Optimize run when the model is in the curated compatibility list |
 | `GENIE_LAKEBASE_INSTANCE` | No | empty | Lakebase Autoscaling project to use or create; installer defaults new installs to `<app-name>-lakebase`; keep stable for the same app, use a fresh project for a new app instance |
 
 ## Manual Setup (without local terminal installer)

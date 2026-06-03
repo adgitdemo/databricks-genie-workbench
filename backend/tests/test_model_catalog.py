@@ -39,8 +39,8 @@ def _endpoint(
     )
 
 
-def test_list_chat_models_filters_ready_chat_endpoints(monkeypatch):
-    monkeypatch.setenv("LLM_MODEL", "chat-default")
+def test_list_chat_models_returns_curated_compatible_models(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "databricks-claude-sonnet-4-6")
     ws = MagicMock()
     ws.serving_endpoints.list.return_value = [
         _endpoint("chat-default", display_name="Default Chat"),
@@ -53,31 +53,34 @@ def test_list_chat_models_filters_ready_chat_endpoints(monkeypatch):
     models = model_catalog.list_chat_models(client=ws)
 
     names = [m.name for m in models]
-    assert names[:2] == ["chat-default", "chat-alt"]
-    assert "databricks-claude-sonnet-4-6" in names
-    assert models[0].displayName == "Default Chat"
+    assert models[0] == LLMModelInfo(
+        name="databricks-claude-sonnet-4-6",
+        displayName="Claude Sonnet 4.6",
+        isDefault=True,
+    )
+    assert "databricks-gpt-5-4" in names
+    assert "databricks-gpt-5-5" in names
+    assert "databricks-gpt-5-5-pro" in names
+    assert "databricks-claude-opus-4-8" in names
+    assert "databricks-claude-opus-4-7" in names
+    assert "chat-default" not in names
+    assert "chat-alt" not in names
     assert models[0].isDefault is True
-    assert models[1].isDefault is False
 
 
-def test_list_chat_models_falls_back_to_sp_on_scope_error(monkeypatch):
-    monkeypatch.setenv("LLM_MODEL", "sp-chat")
-    user_ws = MagicMock()
-    user_ws.serving_endpoints.list.side_effect = RuntimeError("insufficient_scope")
-    sp_ws = MagicMock()
-    sp_ws.serving_endpoints.list.return_value = [_endpoint("sp-chat")]
-    monkeypatch.setattr(model_catalog, "get_workspace_client", lambda: user_ws)
-    monkeypatch.setattr(model_catalog, "get_service_principal_client", lambda: sp_ws)
+def test_list_chat_models_does_not_require_endpoint_listing(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "databricks-claude-sonnet-4-6")
+    ws = MagicMock()
+    ws.serving_endpoints.list.side_effect = AssertionError("should not list")
 
-    models = model_catalog.list_chat_models(allow_sp_fallback=True)
+    models = model_catalog.list_chat_models(client=ws)
 
     names = [m.name for m in models]
-    assert names[0] == "sp-chat"
-    assert "databricks-claude-sonnet-4-6" in names
-    sp_ws.serving_endpoints.list.assert_called_once()
+    assert names[0] == "databricks-claude-sonnet-4-6"
+    assert "databricks-gpt-5-4" in names
 
 
-def test_list_chat_models_includes_fmapi_fallback_when_endpoint_list_is_empty(monkeypatch):
+def test_list_chat_models_uses_default_when_curated(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "databricks-claude-sonnet-4-6")
     ws = MagicMock()
     ws.serving_endpoints.list.return_value = []
@@ -92,26 +95,26 @@ def test_list_chat_models_includes_fmapi_fallback_when_endpoint_list_is_empty(mo
     assert any(m.name == "databricks-gpt-5-4" for m in models)
 
 
-def test_validate_chat_model_accepts_known_fmapi_without_listing():
+def test_validate_chat_model_accepts_curated_model_without_listing():
     ws = MagicMock()
     ws.serving_endpoints.list.side_effect = AssertionError("should not list")
 
     assert (
-        model_catalog.validate_chat_model("databricks-claude-sonnet-4-6", client=ws)
-        == "databricks-claude-sonnet-4-6"
+        model_catalog.validate_chat_model("databricks-claude-opus-4-8", client=ws)
+        == "databricks-claude-opus-4-8"
     )
 
 
-def test_validate_chat_model_rejects_non_chat_model():
+def test_validate_chat_model_rejects_non_curated_model():
     ws = MagicMock()
     ws.serving_endpoints.list.return_value = [
-        _endpoint("embed", task="embedding"),
+        _endpoint("databricks-claude-opus-4-1", task="chat.completion"),
     ]
 
     try:
-        model_catalog.validate_chat_model("embed", client=ws)
+        model_catalog.validate_chat_model("databricks-claude-opus-4-1", client=ws)
     except model_catalog.ModelValidationError as exc:
-        assert "READY chat-compatible" in str(exc)
+        assert "curated list" in str(exc)
     else:
         raise AssertionError("expected ModelValidationError")
 

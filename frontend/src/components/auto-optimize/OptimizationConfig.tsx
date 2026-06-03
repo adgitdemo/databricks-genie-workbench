@@ -91,7 +91,7 @@ export function OptimizationConfig({ spaceId, onStarted, onTriggerStart, onTrigg
             onChange={setSelectedModel}
             disabled={loading || hasActiveRun}
             className="w-full max-w-xs"
-            helper="We recommend the latest frontier models (e.g. Claude Opus / Sonnet) for the most reliable optimization results."
+            helper="We recommend Claude Opus, Claude Sonnet, or GPT frontier models for the most reliable optimization results."
           />
 
           {/* Lever Selection */}

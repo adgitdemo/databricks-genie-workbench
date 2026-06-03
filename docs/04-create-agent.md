@@ -104,7 +104,7 @@ These sections are generated concurrently using a `ThreadPoolExecutor` with 3 wo
 
 ## Model Selection
 
-Create Agent can use any READY chat-compatible Databricks Model Serving endpoint returned by `GET /api/models`. The workspace-wide `LLM_MODEL` value remains the default when the request omits `model`.
+Create Agent can use a curated set of Databricks-hosted FMAPI chat endpoints returned by `GET /api/models`. The workspace-wide `LLM_MODEL` value remains the default when the request omits `model`, as long as it is in the curated compatibility list.
 
 The UI disables model switching while an SSE stream is active. A change made between turns is saved on the `CreateAgentSession` and applies to the next non-continuation request; auto-continuation rounds keep the session's current model so a single logical turn does not mix models.
 

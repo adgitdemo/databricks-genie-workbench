@@ -16,7 +16,7 @@ These variables are defined in `app.yaml` and injected into the app runtime. Pla
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `LLM_MODEL` | `__LLM_MODEL__` | Default Databricks model serving endpoint for LLM-backed features. Create Agent sessions and Auto-Optimize runs can override it with a user-selected READY chat endpoint. Default: `databricks-claude-sonnet-4-6` |
+| `LLM_MODEL` | `__LLM_MODEL__` | Default Databricks model serving endpoint for LLM-backed features. Create Agent sessions and Auto-Optimize runs can override it with a user-selected endpoint from the curated compatibility list. Default: `databricks-claude-sonnet-4-6` |
 | `GSO_LLM_ENDPOINT` | unset | Optional GSO-only override for emergency/debug use. If unset, GSO uses `LLM_MODEL` |
 
 ### SQL Warehouse

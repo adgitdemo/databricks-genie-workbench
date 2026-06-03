@@ -136,9 +136,9 @@ Users trigger optimization from the **Optimize** tab in the Space Detail view:
 
 ## Model Selection
 
-Auto-Optimize can run with a per-run `llm_model` selected from `GET /api/models`. If the trigger request omits `llm_model`, the backend uses the workspace-wide `LLM_MODEL` default.
+Auto-Optimize can run with a per-run `llm_model` selected from the curated compatibility list returned by `GET /api/models`. If the trigger request omits `llm_model`, the backend uses the workspace-wide `LLM_MODEL` default.
 
-Selected models are validated with serving endpoint metadata before job submission: the endpoint must exist, be READY, and be chat-compatible. Validation uses the service principal identity because the GSO job runs as the app SP. The chosen model is stored on `genie_opt_runs.llm_model`, passed through the GSO job widgets, and shown in optimization history.
+Selected models are validated against the curated compatibility list before job submission. The chosen model is stored on `genie_opt_runs.llm_model`, passed through the GSO job widgets, and shown in optimization history.
 
 ## Source Files
 

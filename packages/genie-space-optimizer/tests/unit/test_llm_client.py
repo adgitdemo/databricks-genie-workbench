@@ -143,10 +143,16 @@ class TestCallLlm:
         mock_client.chat.completions.create.return_value = _make_openai_response('{"ok": true}')
         mock_get_client.return_value = mock_client
 
-        text, resp = call_llm(None, messages=[{"role": "user", "content": "hi"}])
+        text, resp = call_llm(
+            None,
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.0,
+        )
         assert text == '{"ok": true}'
         assert resp.usage.prompt_tokens == 100
-        assert mock_client.chat.completions.create.call_args.kwargs["model"] == "custom-endpoint"
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert kwargs["model"] == "custom-endpoint"
+        assert "temperature" not in kwargs
 
     @patch("genie_space_optimizer.optimization.llm_client.get_openai_client")
     def test_retries_on_failure(self, mock_get_client):
@@ -331,10 +337,13 @@ class TestTracedLlmCallTokenUsage:
             "Say hello",
             span_name="test_span",
             max_retries=1,
+            temperature=0.0,
         )
 
         assert text == "hello"
         assert resp.usage.prompt_tokens == 42
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "temperature" not in kwargs
 
     @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
     def test_no_usage_no_crash(self, mock_get_client):
