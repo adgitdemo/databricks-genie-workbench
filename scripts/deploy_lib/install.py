@@ -14,6 +14,7 @@ from .apps import (
     require_successful_deployment,
 )
 from .config import InstallConfig, InstallResult, LakebaseInfo
+from .dashboard import ensure_cost_dashboard
 from .genie_spaces import optionally_grant_genie_spaces
 from .gso_job import ensure_gso_job
 from .lakebase import ensure_lakebase
@@ -76,6 +77,23 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     gso_job = ensure_gso_job(w, cfg, app_sp_client_id, deployer_user)
     status(f"GSO job ready: {gso_job.job_id}")
 
+    status("Provisioning GenieWatch cost overview dashboard...")
+    # Optional: the Cost-tab embed is a nice-to-have. A failure here must not
+    # fail the install — fall back to an empty DASHBOARD_COST_ID (embed hidden),
+    # matching deploy.sh's behavior when no dashboard ID resolves.
+    try:
+        dashboard = ensure_cost_dashboard(w, cfg, app_sp_client_id, deployer_user)
+        dashboard_cost_id = dashboard.dashboard_id
+        if not dashboard.sp_grant_applied:
+            status(
+                f"⚠ Could not grant CAN_RUN on dashboard {dashboard_cost_id} to the app SP — "
+                "grant it manually if the Cost embed stays blank."
+            )
+        status(f"Cost dashboard ready: {dashboard_cost_id} (published, embed credentials on).")
+    except Exception as e:  # noqa: BLE001 - dashboard is optional; never fail install
+        dashboard_cost_id = ""
+        status(f"⚠ Cost dashboard provisioning failed ({e}) — Cost embed will be hidden.")
+
     status("Rendering patched app.yaml into generated workspace source...")
     render_app_yaml(
         template_path=Path(cfg.repo_root or "") / "app.yaml",
@@ -87,10 +105,10 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
             "LAKEBASE_INSTANCE": cfg.lakebase_instance or "",
             "LLM_MODEL": cfg.llm_model,
             "MLFLOW_EXPERIMENT_ID": cfg.mlflow_experiment_id or "",
-            # Notebook install path does not deploy the bundle, so the
-            # GenieWatch Cost dashboard never exists. Empty = hide the embed,
-            # matching deploy.sh's fallback when no dashboard ID resolves.
-            "DASHBOARD_COST_ID": "",
+            # Created above via the Lakeview API (the notebook path has no
+            # bundle to deploy it). Empty = hide the embed, matching deploy.sh's
+            # fallback when no dashboard ID resolves.
+            "DASHBOARD_COST_ID": dashboard_cost_id,
         },
         workspace_client=w,
     )
@@ -118,6 +136,7 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
         service_principal_client_id=app_sp_client_id,
         gso_job=gso_job,
         lakebase=lakebase,
+        dashboard_cost_id=dashboard_cost_id or None,
         genie_spaces_granted=genie_spaces_granted,
         deployment=deployment or {},
         verification=verification,

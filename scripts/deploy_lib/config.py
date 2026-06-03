@@ -109,6 +109,7 @@ class InstallResult:
     service_principal_client_id: str
     gso_job: GsoJobInfo
     lakebase: LakebaseInfo | None
+    dashboard_cost_id: str | None
     genie_spaces_granted: int
     deployment: dict[str, Any]
     verification: dict[str, Any]
