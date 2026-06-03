@@ -4,6 +4,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import { triggerAutoOptimize } from "@/lib/api"
 import { PermissionAlert } from "@/components/auto-optimize/PermissionAlert"
+import { ModelPicker } from "@/components/ModelPicker"
 import type { GSOPermissionCheck } from "@/types"
 
 interface OptimizationConfigProps {
@@ -30,6 +31,7 @@ const LEVERS = [
 export function OptimizationConfig({ spaceId, onStarted, onTriggerStart, onTriggerError, hasActiveRun, permissions, permsLoading, healthIssues, onRefreshPermissions }: OptimizationConfigProps) {
   const [selectedLevers, setSelectedLevers] = useState<Set<number>>(new Set(LEVERS.map((l) => l.id)))
   const [applyMode] = useState<"genie_config" | "both">("genie_config")
+  const [selectedModel, setSelectedModel] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -54,6 +56,7 @@ export function OptimizationConfig({ spaceId, onStarted, onTriggerStart, onTrigg
         space_id: spaceId,
         apply_mode: applyMode,
         levers: Array.from(selectedLevers).sort(),
+        llm_model: selectedModel,
       })
       onStarted(result.runId)
     } catch (e) {
@@ -82,6 +85,14 @@ export function OptimizationConfig({ spaceId, onStarted, onTriggerStart, onTrigg
               Changes will be applied only to the selected Genie Space configuration. Underlying Unity Catalog tables, columns, and descriptions will not be modified.
             </p>
           </div>
+
+          <ModelPicker
+            value={selectedModel}
+            onChange={setSelectedModel}
+            disabled={loading || hasActiveRun}
+            className="w-full max-w-xs"
+            helper="We recommend the latest frontier models (e.g. Claude Opus / Sonnet) for the most reliable optimization results."
+          />
 
           {/* Lever Selection */}
           <div className="space-y-2">

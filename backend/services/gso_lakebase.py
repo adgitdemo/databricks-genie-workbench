@@ -66,7 +66,8 @@ async def load_gso_runs_for_space(space_id: str) -> list[dict]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""SELECT run_id, space_id, status, started_at, completed_at,
-                          best_accuracy, best_iteration, convergence_reason, triggered_by
+                          best_accuracy, best_iteration, convergence_reason, triggered_by,
+                          llm_model
                    FROM {_tbl('genie_opt_runs')}
                    WHERE space_id = $1
                    ORDER BY started_at DESC""",

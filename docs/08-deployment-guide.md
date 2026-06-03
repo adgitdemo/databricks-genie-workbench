@@ -17,7 +17,7 @@ Both paths deploy the same app and provision the same core resources. The local 
   - A Unity Catalog where the GSO schema can be created
   - Lakebase Autoscaling available (optional but recommended for persistent scan history, starred spaces, and agent sessions)
   - MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
-  - The configured LLM model serving endpoint exists and is callable
+  - At least one READY chat-compatible model serving endpoint for Create Agent and Auto-Optimize model selection
 
 ### Installer permissions
 
@@ -76,14 +76,13 @@ The installer will:
 2. Ask for your Databricks CLI profile
 3. Ask for catalog (auto-discovered from your workspace)
 4. Ask for SQL warehouse (auto-discovered)
-5. Ask for LLM model endpoint
-6. Optionally configure MLflow tracing (creates or links an experiment)
-7. Ask for app name
-8. Create a fresh Lakebase Autoscaling project, choose a different new name, skip persistence, or use advanced existing-project attachment
-9. Write `.env.deploy` with your configuration
-10. Run `scripts/deploy.sh` to build and deploy the app
-11. Resolve the app's service principal
-12. Optionally grant the SP access to your existing Genie Spaces
+5. Optionally configure MLflow tracing (creates or links an experiment)
+6. Ask for app name
+7. Create a fresh Lakebase Autoscaling project, choose a different new name, skip persistence, or use advanced existing-project attachment
+8. Write `.env.deploy` with your configuration, including the default LLM endpoint
+9. Run `scripts/deploy.sh` to build and deploy the app
+10. Resolve the app's service principal
+11. Optionally grant the SP access to your existing Genie Spaces
 
 ## Option B: Databricks Notebook Installer
 
@@ -98,7 +97,6 @@ Use this path when you are already working inside Databricks and do not want a l
 | `app_name` | Yes | Databricks App name to create or update |
 | `catalog` | Yes | Unity Catalog for GSO tables and artifacts |
 | `warehouse_id` | Yes | SQL Warehouse ID used by the app and GSO |
-| `llm_model` | No | Model serving endpoint name |
 | `lakebase_mode` | Yes | `create`, `existing`, or `skip` |
 | `lakebase_project_name` | Conditional | Lakebase project name for `create` or `existing`; defaults to `<app-name>-lakebase` for `create` |
 
@@ -242,7 +240,7 @@ For the local terminal installer, set these in `.env.deploy` or as environment v
 | `GENIE_CATALOG` | Yes | — | Unity Catalog name (needs CREATE SCHEMA) |
 | `GENIE_APP_NAME` | No | `genie-workbench` | Databricks App name (unique in workspace) |
 | `GENIE_DEPLOY_PROFILE` | No | `DEFAULT` | Databricks CLI profile name |
-| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM serving endpoint |
+| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | Default LLM serving endpoint; users can override per Create Agent session or Auto-Optimize run |
 | `GENIE_LAKEBASE_INSTANCE` | No | empty | Lakebase Autoscaling project to use or create; installer defaults new installs to `<app-name>-lakebase`; keep stable for the same app, use a fresh project for a new app instance |
 
 ## Manual Setup (without local terminal installer)

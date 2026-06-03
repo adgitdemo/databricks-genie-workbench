@@ -1,7 +1,6 @@
 """Tests for genie_opt_runs schema additions for cross-task state resilience.
 
-The handoff plan widens genie_opt_runs with 3 nullable columns so that
-warehouse_id, human_corrections_json, and max_benchmark_count can be
+The handoff plan widens genie_opt_runs with nullable columns so values can be
 recovered from Delta when taskValues do not propagate on Repair Run.
 """
 from unittest.mock import MagicMock
@@ -11,10 +10,11 @@ from genie_space_optimizer.optimization.state import _migrate_add_columns
 
 
 def test_runs_ddl_includes_handoff_columns():
-    """The fresh DDL must declare the 3 handoff columns."""
+    """The fresh DDL must declare the handoff/telemetry columns."""
     assert "warehouse_id" in _GENIE_OPT_RUNS_DDL
     assert "human_corrections_json" in _GENIE_OPT_RUNS_DDL
     assert "max_benchmark_count" in _GENIE_OPT_RUNS_DDL
+    assert "llm_model" in _GENIE_OPT_RUNS_DDL
 
 
 def test_migration_adds_handoff_columns_when_missing():
@@ -33,6 +33,7 @@ def test_migration_adds_handoff_columns_when_missing():
     assert any("warehouse_id" in s for s in altered)
     assert any("human_corrections_json" in s for s in altered)
     assert any("max_benchmark_count" in s for s in altered)
+    assert any("llm_model" in s for s in altered)
 
 
 def test_migration_idempotent_when_columns_already_exist():
@@ -43,6 +44,7 @@ def test_migration_idempotent_when_columns_already_exist():
         {"col_name": "warehouse_id"},
         {"col_name": "human_corrections_json"},
         {"col_name": "max_benchmark_count"},
+        {"col_name": "llm_model"},
     ]
 
     _migrate_add_columns(spark, "test_catalog", "test_schema")
@@ -54,6 +56,7 @@ def test_migration_idempotent_when_columns_already_exist():
             "warehouse_id" in s
             or "human_corrections_json" in s
             or "max_benchmark_count" in s
+            or "llm_model" in s
         )
     ]
     assert handoff_alters == [], (

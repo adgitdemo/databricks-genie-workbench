@@ -962,6 +962,7 @@ def do_start_optimization(
             triggered_by=current_user,
             experiment_name=experiment_name,
             config_snapshot=space_snapshot if space_snapshot else None,
+            llm_model=config.llm_model or None,
         )
     else:
         create_run(
@@ -976,6 +977,7 @@ def do_start_optimization(
             triggered_by=current_user,
             experiment_name=experiment_name,
             config_snapshot=space_snapshot if space_snapshot else None,
+            llm_model=config.llm_model or None,
         )
 
     try:
@@ -994,6 +996,7 @@ def do_start_optimization(
             deploy_target=deploy_target or "",
             warehouse_id=config.warehouse_id or "",
             target_benchmark_count=str(target_benchmark_count) if target_benchmark_count else "",
+            llm_model=config.llm_model or "",
         )
 
         if use_warehouse_fallback:

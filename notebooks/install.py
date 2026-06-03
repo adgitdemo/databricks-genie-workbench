@@ -59,7 +59,6 @@ print(f"Repo root: {repo_root}")
 dbutils.widgets.text("app_name", "genie-workbench")
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("warehouse_id", "")
-dbutils.widgets.text("llm_model", "databricks-claude-sonnet-4-6")
 dbutils.widgets.dropdown("lakebase_mode", "create", ["create", "existing", "skip"])
 dbutils.widgets.text("lakebase_project_name", "")
 
@@ -75,7 +74,6 @@ dbutils.widgets.text("lakebase_project_name", "")
 # MAGIC - [ ] **Managed MLflow Prompt Registry** Beta is enabled.
 # MAGIC - [ ] The selected SQL warehouse exists and you have `CAN_USE`.
 # MAGIC - [ ] The selected Unity Catalog exists and you can create/use the target schema.
-# MAGIC - [ ] The selected model serving endpoint exists and is callable.
 # MAGIC - [ ] If `lakebase_mode` is not `skip`, Lakebase Autoscaling is available.
 
 # COMMAND ----------
@@ -130,7 +128,6 @@ cfg = InstallConfig(
     app_name=app_name,
     catalog=dbutils.widgets.get("catalog").strip(),
     warehouse_id=dbutils.widgets.get("warehouse_id").strip(),
-    llm_model=dbutils.widgets.get("llm_model").strip(),
     mlflow_experiment_id=None,
     lakebase_mode=lakebase_mode,
     lakebase_instance=lakebase_instance,

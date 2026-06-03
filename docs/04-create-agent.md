@@ -102,6 +102,14 @@ When the agent calls `generate_plan`, the request is routed to `backend/services
 
 These sections are generated concurrently using a `ThreadPoolExecutor` with 3 workers. After all sections complete, `_assemble()` merges the results and `_validate_plan_sqls()` runs SQL validation with 8 concurrent checks to catch syntax errors.
 
+## Model Selection
+
+Create Agent can use any READY chat-compatible Databricks Model Serving endpoint returned by `GET /api/models`. The workspace-wide `LLM_MODEL` value remains the default when the request omits `model`.
+
+The UI disables model switching while an SSE stream is active. A change made between turns is saved on the `CreateAgentSession` and applies to the next non-continuation request; auto-continuation rounds keep the session's current model so a single logical turn does not mix models.
+
+The selected model is persisted in Lakebase with the session and is used for streaming agent calls, config repair, and parallel plan generation.
+
 ## Fast Path
 
 When the user reviews the plan in the UI and clicks "Create" (sending `action: "create"` with `edited_plan`), the agent uses `_fast_create` to skip additional LLM rounds. It directly:

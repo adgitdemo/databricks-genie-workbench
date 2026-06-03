@@ -42,6 +42,7 @@ import remarkGfm from "remark-gfm"
 import { streamAgentChat, fetchCreatePreflight } from "@/lib/api"
 import type { AgentChatMessage, AgentUIElement } from "@/types"
 import { TableBrowserDrawer } from "@/components/TableBrowserDrawer"
+import { ModelPicker } from "@/components/ModelPicker"
 import { Tooltip } from "@/components/ui/tooltip"
 interface CreateAgentChatProps {
   onCreated: (spaceId: string, displayName: string, spaceUrl?: string, initialTab?: string) => void
@@ -231,6 +232,7 @@ interface PersistedState {
   usedElements: string[]
   panelOpen: boolean
   editedPlan?: EditablePlan | null
+  selectedModel?: string | null
 }
 
 function saveState(s: PersistedState) {
@@ -382,6 +384,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
   const [fixResult, setFixResult] = useState<{ spaceId: string; url: string } | null>(null)
   const queuedMessageRef = useRef<string | null>(null)
   const [preflight, setPreflight] = useState<{ warehouses_available: boolean; obo_enabled: boolean; app_name: string } | null>(null)
+  const [selectedModel, setSelectedModel] = useState<string | null>(restored.current?.selectedModel ?? null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -409,8 +412,9 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
       usedElements: Array.from(usedElements),
       panelOpen,
       editedPlan,
+      selectedModel,
     })
-  }, [messages, sessionId, progress, usedElements, panelOpen, editedPlan])
+  }, [messages, sessionId, progress, usedElements, panelOpen, editedPlan, selectedModel])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -461,6 +465,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
     fixModeRef.current = false
     setFixStep(0)
     setFixResult(null)
+    setSelectedModel(null)
     sessionStorage.removeItem(STORAGE_KEY)
   }
 
@@ -853,9 +858,9 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             requestAnimationFrame(() => sendMessage(pending))
           }
         },
-      }, spaceIdForRequest)
+      }, spaceIdForRequest, selectedModel)
     },
-    [sessionId, isStreaming],
+    [sessionId, isStreaming, selectedModel],
   )
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -2992,6 +2997,15 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             </Tooltip>
           </div>
         )}
+
+        <div className="flex items-center justify-end">
+          <ModelPicker
+            value={selectedModel}
+            onChange={setSelectedModel}
+            disabled={isStreaming}
+            className="w-full sm:w-72"
+          />
+        </div>
 
         {/* Chat area */}
         <div className="flex-1 overflow-y-auto border border-default rounded-xl bg-surface">

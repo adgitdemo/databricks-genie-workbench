@@ -178,6 +178,7 @@ class AgentChatRequest(BaseModel):
     session_id: str | None = Field(None, description="Existing session ID. Omit to start a new session.")
     selections: dict | None = Field(None, description="UI selections from interactive elements")
     space_id: str | None = Field(None, description="Pre-seed session with existing space ID for fix/update flows")
+    model: str | None = Field(None, max_length=256, description="Optional serving endpoint name for this session.")
 
 
 @router.post("/agent/chat")
@@ -197,7 +198,8 @@ async def agent_chat(body: AgentChatRequest, request: Request):
     from backend.services.create_agent_session import (
         create_session, get_session_async, persist_session,
     )
-    from backend.services.auth import set_obo_user_token, clear_obo_user_token
+    from backend.services.auth import get_workspace_client, set_obo_user_token, clear_obo_user_token
+    from backend.services.model_catalog import ModelValidationError, validate_chat_model
 
     agent = get_create_agent()
 
@@ -222,6 +224,21 @@ async def agent_chat(body: AgentChatRequest, request: Request):
                 logger.info("Pre-loaded space config for fix flow: %s", body.space_id)
             except Exception as e:
                 logger.warning("Could not pre-load space config for %s: %s", body.space_id, e)
+
+    requested_model = (body.model or "").strip() or None
+    if requested_model and not is_continuation:
+        try:
+            session.llm_model = validate_chat_model(
+                requested_model,
+                client=get_workspace_client(),
+            )
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    elif session.llm_model:
+        try:
+            validate_chat_model(session.llm_model, client=get_workspace_client())
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     user_message = body.message
     selections = body.selections
@@ -300,6 +317,7 @@ async def get_agent_session(session_id: str):
         "history": display_history,
         "space_id": session.space_id,
         "space_url": session.space_url,
+        "llm_model": session.llm_model,
         "has_config": session.space_config is not None,
     }
 

@@ -16,6 +16,7 @@ All API endpoints are prefixed with `/api` and served by FastAPI routers. This r
 | POST | `/api/space/parse` | None | Parse pasted Genie API JSON (client-side data, no auth needed) |
 | GET | `/api/debug/auth` | OBO | Dev-only auth debug endpoint (404 on Databricks Apps) |
 | GET | `/api/settings` | None | Read-only app settings (LLM model, warehouse, host) |
+| GET | `/api/models` | OBO → SP | List READY chat-compatible serving endpoints for model selection |
 
 ## Spaces Router (`/api`)
 
