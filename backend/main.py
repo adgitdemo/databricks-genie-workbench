@@ -74,7 +74,6 @@ from backend.routers.auto_optimize import router as auto_optimize_router
 from backend.watch.routers import (
     watch_admin_router,
     watch_cost_router,
-    watch_dashboards_router,
     watch_feedback_router,
     watch_resources_router,
     watch_settings_router,
@@ -219,7 +218,6 @@ app.include_router(watch_feedback_router)
 app.include_router(watch_resources_router)
 app.include_router(watch_settings_router)
 app.include_router(watch_admin_router)
-app.include_router(watch_dashboards_router)
 
 # Serve static files from React build
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"

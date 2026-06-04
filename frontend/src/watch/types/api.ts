@@ -153,11 +153,26 @@ export interface ResourceGraph {
   truncated: boolean
 }
 
+export interface DailyVolumePoint {
+  day: string
+  queries: number
+}
+
+export interface WorkspaceOverview {
+  days: number
+  active_spaces: number
+  total_queries: number
+  distinct_users: number
+  approx_usd: number | null
+  feedback_pos: number
+  feedback_neg: number
+  daily: DailyVolumePoint[]
+}
+
 export interface HealthStatus {
   lakebase_available: boolean
   obo_active: boolean
   warehouse_id: string | null
-  dashboard_cost_id: string | null
   workspace_host: string | null
   // null = unknown (no system-table query has run yet), true = accessible,
   // false = a query failed with a permission error (SP grants missing).

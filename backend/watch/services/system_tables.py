@@ -506,6 +506,113 @@ def usage_summary_all_spaces(days: int = 7) -> list[dict[str, Any]]:
     return _run(sql, params)
 
 
+# ─── Workspace overview (native cost-tab dashboard) ────────────────────────
+# Powers the app's own Genie Spaces Overview panel (KPI tiles + daily trend),
+# replacing the embedded AI/BI dashboard. Cost is attributed the same way as
+# top_spenders: a genie query gets a share of its warehouse-hour's USD by its
+# share of that hour's task time. Workspace-scoped + fail-closed via {ws}.
+
+_WORKSPACE_SUMMARY_SQL = """
+WITH q AS (
+    SELECT query_source.genie_space_id AS space_id,
+           executed_by,
+           compute.warehouse_id AS wh,
+           date_trunc('hour', start_time) AS hr,
+           total_task_duration_ms AS task_ms
+    FROM system.query.history
+    WHERE query_source.genie_space_id IS NOT NULL
+      AND start_time >= current_date() - :days
+      AND total_task_duration_ms > 0
+      {ws}
+), hr_total AS (
+    SELECT compute.warehouse_id AS wh,
+           date_trunc('hour', start_time) AS hr,
+           SUM(total_task_duration_ms) AS hr_task_ms
+    FROM system.query.history
+    WHERE start_time >= current_date() - :days
+      AND total_task_duration_ms > 0
+    GROUP BY 1, 2
+), hr_cost AS (
+    SELECT u.usage_metadata.warehouse_id AS wh,
+           date_trunc('hour', u.usage_start_time) AS hr,
+           SUM(u.usage_quantity * COALESCE(p.pricing.default, 0)) AS hr_usd
+    FROM system.billing.usage u
+    LEFT JOIN system.billing.list_prices p
+      ON u.sku_name = p.sku_name
+     AND u.cloud = p.cloud
+     AND u.usage_start_time >= p.price_start_time
+     AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
+    WHERE u.usage_metadata.warehouse_id IS NOT NULL
+      AND u.usage_start_time >= current_date() - :days
+    GROUP BY 1, 2
+), attributed AS (
+    SELECT q.space_id,
+           q.executed_by,
+           (q.task_ms / NULLIF(t.hr_task_ms, 0)) * COALESCE(c.hr_usd, 0) AS query_usd
+    FROM q
+    JOIN hr_total t USING (wh, hr)
+    LEFT JOIN hr_cost c USING (wh, hr)
+), totals AS (
+    SELECT COUNT(DISTINCT space_id) AS active_spaces,
+           COUNT(*) AS total_queries,
+           COUNT(DISTINCT executed_by) AS distinct_users,
+           ROUND(SUM(query_usd), 2) AS approx_usd
+    FROM attributed
+), fb AS (
+    SELECT SUM(CASE WHEN request_params.feedback_rating = 'THUMBS_UP'   THEN 1 ELSE 0 END) AS pos_feedback,
+           SUM(CASE WHEN request_params.feedback_rating = 'THUMBS_DOWN' THEN 1 ELSE 0 END) AS neg_feedback
+    FROM system.access.audit
+    WHERE service_name = 'aibiGenie'
+      AND action_name = 'updateConversationMessageFeedback'
+      AND event_time >= current_date() - :days
+      {ws}
+)
+SELECT t.active_spaces, t.total_queries, t.distinct_users, t.approx_usd,
+       COALESCE(f.pos_feedback, 0) AS pos_feedback,
+       COALESCE(f.neg_feedback, 0) AS neg_feedback
+FROM totals t CROSS JOIN fb f
+"""
+
+
+def workspace_summary(days: int = 7) -> dict[str, Any]:
+    # One {ws} bind reused across both occurrences (q + fb); resolved once so
+    # only a single ws_id param is appended.
+    params = [_p("days", days, "INT")]
+    sql = _WORKSPACE_SUMMARY_SQL.format(ws=_ws_clause(params))
+    rows = _run(sql, params)
+    return rows[0] if rows else {}
+
+
+# Zero-fill every day in the window (LEFT JOIN a generated date series) so the
+# trend always spans the full last-N-days range, even when only a few days have
+# activity — otherwise the chart (and its axis) collapses to the single day that
+# had queries.
+_DAILY_VOLUME_ALL_SQL = """
+WITH days AS (
+    SELECT explode(sequence(current_date() - :days, current_date(), interval 1 day)) AS day
+), vol AS (
+    SELECT to_date(start_time) AS day,
+           COUNT(*) AS queries
+    FROM system.query.history
+    WHERE query_source.genie_space_id IS NOT NULL
+      AND start_time >= current_date() - :days
+      {ws}
+    GROUP BY 1
+)
+SELECT d.day AS day,
+       COALESCE(v.queries, 0) AS queries
+FROM days d
+LEFT JOIN vol v ON d.day = v.day
+ORDER BY d.day
+"""
+
+
+def daily_volume_all_spaces(days: int = 30) -> list[dict[str, Any]]:
+    params = [_p("days", days, "INT")]
+    sql = _DAILY_VOLUME_ALL_SQL.format(ws=_ws_clause(params))
+    return _run(sql, params)
+
+
 _TOP_QUERIES_SQL = """
 SELECT statement_id,
        executed_by,

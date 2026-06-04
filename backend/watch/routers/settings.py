@@ -30,7 +30,6 @@ async def health() -> dict:
         lakebase_available=lakebase.is_available(),
         obo_active=False,
         warehouse_id=os.environ.get("SQL_WAREHOUSE_ID"),
-        dashboard_cost_id=os.environ.get("DASHBOARD_COST_ID") or None,
         workspace_host=host,
         system_tables_accessible=system_tables.system_tables_status(),
     ).model_dump(mode="json")

@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react'
-import { ExternalLink } from 'lucide-react'
+import { ExternalLink, RefreshCw } from 'lucide-react'
 
 import { Card } from '@/components/ui/card'
-import { DashboardEmbed } from '@/watch/components/DashboardEmbed'
+import { Stat } from '@/watch/components/Stat'
+import { LineChart } from '@/watch/components/LineChart'
 import * as api from '@/watch/lib/api'
-import type { CostTopSpender, HealthStatus } from '@/watch/types/api'
+import type { CostTopSpender, HealthStatus, WorkspaceOverview } from '@/watch/types/api'
 import { formatInt, formatUsd } from '@/watch/lib/format'
 import { genieSpaceUrl } from '@/watch/lib/genie'
 import { useCachedFetch } from '@/watch/lib/cache'
@@ -20,7 +21,12 @@ export function CostExplorer({ onOpenSpace }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>('approx_usd')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
-  const { data: top } = useCachedFetch<CostTopSpender[]>(
+  const { data: overview, loading: overviewLoading } = useCachedFetch<WorkspaceOverview>(
+    `overview:${days}`,
+    () => api.getOverview(days),
+    [days],
+  )
+  const { data: top, loading: topLoading } = useCachedFetch<CostTopSpender[]>(
     `top:${days}:50`,
     () => api.getTopSpenders(days, 50),
     [days],
@@ -64,25 +70,43 @@ export function CostExplorer({ onOpenSpace }: Props) {
             Workspace-wide health for Genie Spaces — KPIs, trends, and top spaces.
           </p>
         </div>
-        <select
-          value={days}
-          onChange={e => setDays(Number(e.target.value))}
-          className="rounded border border-default bg-elevated px-2 py-1 text-sm"
-        >
-          <option value={7}>last 7 days</option>
-          <option value={30}>last 30 days</option>
-          <option value={90}>last 90 days</option>
-        </select>
+        <div className="flex items-center gap-3">
+          {(overviewLoading || topLoading) && (
+            <span className="flex items-center gap-1 text-xs text-muted">
+              <RefreshCw size={12} className="animate-spin" /> Updating…
+            </span>
+          )}
+          <select
+            value={days}
+            onChange={e => setDays(Number(e.target.value))}
+            className="rounded border border-default bg-elevated px-2 py-1 text-sm"
+          >
+            <option value={7}>last 7 days</option>
+            <option value={30}>last 30 days</option>
+            <option value={90}>last 90 days</option>
+          </select>
+        </div>
       </div>
 
-      <Card className="overflow-hidden p-0">
-        <DashboardEmbed
-          dashboardId={health?.dashboard_cost_id ?? ''}
-          height={1100}
-        />
+      <div className={`grid grid-cols-2 gap-3 transition-opacity sm:grid-cols-3 lg:grid-cols-6 ${overviewLoading ? 'opacity-50' : ''}`}>
+        <Stat label="Active spaces" value={overview ? formatInt(overview.active_spaces) : '—'} />
+        <Stat label="Queries" value={overview ? formatInt(overview.total_queries) : '—'} />
+        <Stat label="Distinct users" value={overview ? formatInt(overview.distinct_users) : '—'} />
+        <Stat label="Approx cost" value={overview ? formatUsd(overview.approx_usd) : '—'} />
+        <Stat label="Pos. feedback" value={overview ? formatInt(overview.feedback_pos) : '—'} />
+        <Stat label="Neg. feedback" value={overview ? formatInt(overview.feedback_neg) : '—'} />
+      </div>
+
+      <Card className={`p-4 transition-opacity ${overviewLoading ? 'opacity-50' : ''}`}>
+        <h2 className="mb-3 text-sm font-medium uppercase text-muted">
+          Daily query volume — last {days} days
+        </h2>
+        {overview
+          ? <LineChart data={overview.daily.map(d => ({ x: d.day, y: d.queries }))} formatY={formatInt} />
+          : <p className="text-sm text-muted">Loading…</p>}
       </Card>
 
-      <Card className="overflow-hidden p-0">
+      <Card className={`overflow-hidden p-0 transition-opacity ${topLoading ? 'opacity-50' : ''}`}>
         <h2 className="border-b border-default px-4 py-3 text-sm font-medium uppercase text-muted">
           Top spending spaces — drill-down
         </h2>

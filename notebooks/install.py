@@ -83,7 +83,6 @@ from databricks.sdk import WorkspaceClient
 import scripts.deploy_lib.app_yaml
 import scripts.deploy_lib.apps
 import scripts.deploy_lib.config
-import scripts.deploy_lib.dashboard
 import scripts.deploy_lib.genie_spaces
 import scripts.deploy_lib.gso_job
 import scripts.deploy_lib.install
@@ -102,7 +101,6 @@ for module in [
     scripts.deploy_lib.uc,
     scripts.deploy_lib.verify,
     scripts.deploy_lib.gso_job,
-    scripts.deploy_lib.dashboard,
     scripts.deploy_lib.install,
 ]:
     importlib.reload(module)

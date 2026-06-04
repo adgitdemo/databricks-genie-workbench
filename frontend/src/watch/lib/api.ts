@@ -16,6 +16,7 @@ import type {
   SpaceSummary,
   TopQuery,
   UsageRollup,
+  WorkspaceOverview,
 } from '@/watch/types/api'
 
 const API_BASE = '/api/watch'
@@ -143,15 +144,7 @@ export const getHealth = () => fetchJson<HealthStatus>('/settings/health')
 export const refreshConversationCache = () =>
   fetchJson<{ queued: number }>('/settings/cache/refresh', { method: 'POST' })
 
-// ── Dashboards ──────────────────────────────────────────────────────────────
+// ── Overview ──────────────────────────────────────────────────────────────
 
-export interface DashboardEmbedConfig {
-  workspace_url: string
-  workspace_id: string
-  dashboard_id: string
-  embed_token: string
-  expires_in: number
-}
-
-export const getDashboardEmbedConfig = (dashboardId: string) =>
-  fetchJson<DashboardEmbedConfig>(`/dashboards/${dashboardId}/embed-config`)
+export const getOverview = (days = 7) =>
+  fetchJson<WorkspaceOverview>(`/overview?days=${days}`)

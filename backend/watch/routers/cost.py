@@ -14,10 +14,34 @@ from backend.watch.models import (
     CostPoint,
     CostRollup,
     CostTopSpender,
+    DailyVolumePoint,
+    WorkspaceOverview,
 )
 from backend.watch.services import system_tables
 
 router = APIRouter(prefix="/api/watch")
+
+
+@router.get("/overview")
+async def workspace_overview(days: int = Query(7, ge=1, le=365)) -> dict:
+    """Workspace-wide KPIs + daily query volume for the native cost-tab overview."""
+    days = validate_days(days, default=7)
+    summary = system_tables.workspace_summary(days=days)
+    daily = system_tables.daily_volume_all_spaces(days=days)
+    return WorkspaceOverview(
+        days=days,
+        active_spaces=int(summary.get("active_spaces") or 0),
+        total_queries=int(summary.get("total_queries") or 0),
+        distinct_users=int(summary.get("distinct_users") or 0),
+        approx_usd=_f(summary.get("approx_usd")),
+        feedback_pos=int(summary.get("pos_feedback") or 0),
+        feedback_neg=int(summary.get("neg_feedback") or 0),
+        daily=[
+            DailyVolumePoint(day=r["day"], queries=int(r.get("queries") or 0))
+            for r in daily
+            if r.get("day")
+        ],
+    ).model_dump(mode="json")
 
 
 @router.get("/spaces/{space_id}/cost")

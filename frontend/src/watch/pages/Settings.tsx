@@ -50,7 +50,6 @@ export function Settings() {
             </Badge>
           </Row>
           <Row k="Warehouse"><span className="font-mono text-xs">{health?.warehouse_id || '—'}</span></Row>
-          <Row k="Cost dashboard"><span className="font-mono text-xs">{health?.dashboard_cost_id || '—'}</span></Row>
         </div>
       </Card>
 

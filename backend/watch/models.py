@@ -90,6 +90,25 @@ class UsagePoint(BaseModel):
     distinct_users: int = 0
 
 
+# ─── Workspace overview (native cost-tab dashboard) ────────────────────────
+
+
+class DailyVolumePoint(BaseModel):
+    day: datetime
+    queries: int = 0
+
+
+class WorkspaceOverview(BaseModel):
+    days: int
+    active_spaces: int = 0
+    total_queries: int = 0
+    distinct_users: int = 0
+    approx_usd: Optional[float] = None
+    feedback_pos: int = 0
+    feedback_neg: int = 0
+    daily: list[DailyVolumePoint] = Field(default_factory=list)
+
+
 class FeedbackEvent(BaseModel):
     event_time: datetime
     user_email: Optional[str] = None
@@ -230,7 +249,6 @@ class HealthStatus(BaseModel):
     lakebase_available: bool
     obo_active: bool
     warehouse_id: Optional[str] = None
-    dashboard_cost_id: Optional[str] = None
     workspace_host: Optional[str] = None
     # Last observed system-table accessibility for the app SP:
     #   None  → unknown (no system-table query has run yet)
