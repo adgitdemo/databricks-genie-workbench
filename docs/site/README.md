@@ -1,8 +1,7 @@
 # Genie Workbench Documentation Site
 
 Docusaurus 3 site for the Genie Workbench docs, styled with Databricks branding
-(Tailwind + DM Sans/Mono, dark-default). Deployed to GitHub Pages by
-`.github/workflows/docs.yml` on push to `main`.
+(Tailwind + DM Sans/Mono, dark-default).
 
 ## Local development
 
@@ -13,6 +12,22 @@ npm start        # dev server at http://localhost:3000/databricks-genie-workbenc
 npm run build    # production build into ./build
 npm run serve    # serve the production build locally
 ```
+
+## Deployment
+
+GitHub Pages serves the site from the `gh-pages` branch ("Deploy from a branch"
+in repo Settings → Pages). There is no CI workflow — the built site is pushed to
+`gh-pages` manually:
+
+```bash
+cd docs/site
+npm run build                                  # produces ./build
+# push ./build to the gh-pages branch (e.g. with the `gh-pages` CLI,
+# `docusaurus deploy`, or a manual git push of the build output)
+```
+
+A `.nojekyll` file in the build output tells Pages to serve it as-is (no Jekyll
+processing).
 
 ## Structure
 
