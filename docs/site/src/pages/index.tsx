@@ -36,7 +36,7 @@ const CAPABILITIES = [
 const STATS = [
   {value: '12', label: 'IQ quality checks'},
   {value: '3', label: 'maturity tiers'},
-  {value: '6', label: 'task optimization pipeline'},
+  {value: '6', label: 'optimization pipeline tasks'},
   {value: '9', label: 'evaluation judges'},
 ];
 
@@ -143,7 +143,9 @@ function Capabilities() {
               <h3 className="m-0 text-xl font-medium text-[#1b3139] group-hover:text-[#2272b4] dark:text-white dark:group-hover:text-[#4299e0]">
                 {item.title}
               </h3>
-              <span className="ml-auto text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-[#2272b4] dark:text-slate-600 dark:group-hover:text-[#4299e0]">
+              <span
+                aria-hidden="true"
+                className="ml-auto text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-[#2272b4] dark:text-slate-600 dark:group-hover:text-[#4299e0]">
                 →
               </span>
             </div>
@@ -209,7 +211,9 @@ function Personas() {
             className="group rounded-xl border border-slate-200 bg-white p-6 no-underline transition hover:border-[#2272b4] hover:shadow-md hover:no-underline dark:border-slate-700 dark:bg-[#1f3239] dark:hover:border-[#4299e0]">
             <h3 className="flex items-center justify-between text-xl font-medium text-[#1b3139] group-hover:text-[#2272b4] dark:text-white dark:group-hover:text-[#4299e0]">
               {item.title}
-              <span className="text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-[#2272b4] dark:text-slate-600 dark:group-hover:text-[#4299e0]">
+              <span
+                aria-hidden="true"
+                className="text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-[#2272b4] dark:text-slate-600 dark:group-hover:text-[#4299e0]">
                 →
               </span>
             </h3>
