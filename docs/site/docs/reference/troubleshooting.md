@@ -77,7 +77,9 @@ databricks apps get <app-name> --profile <profile> | grep service_principal
 
 ## MLflow Tracing
 
-> `MLFLOW_EXPERIMENT_ID` is workspace-specific. The app validates it at startup and silently disables tracing if the experiment doesn't exist. To enable tracing, create an MLflow experiment and update the value in `app.yaml` before deploying.
+:::note
+`MLFLOW_EXPERIMENT_ID` is workspace-specific. The app validates it at startup and silently disables tracing if the experiment doesn't exist. To enable tracing, create an MLflow experiment and update the value in `app.yaml` before deploying.
+:::
 
 ## Related Documentation
 

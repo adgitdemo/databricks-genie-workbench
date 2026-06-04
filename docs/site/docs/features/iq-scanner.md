@@ -23,9 +23,9 @@ Each of the 12 checks is worth 1 point. A check either passes (1 point) or fails
 
 | Tier | Criteria | Meaning |
 |------|----------|---------|
-| **Trusted** | All 12 checks pass | Space is fully configured and has proven accuracy |
-| **Ready to Optimize** | Checks 1–10 pass (config complete) | Configuration is solid; ready for benchmark-driven optimization |
-| **Not Ready** | Any of checks 1–10 fail | Configuration gaps need to be addressed first |
+| <span className="badge badge--success">Trusted</span> | All 12 checks pass | Space is fully configured and has proven accuracy |
+| <span className="badge badge--warning">Ready to Optimize</span> | Checks 1–10 pass (config complete) | Configuration is solid; ready for benchmark-driven optimization |
+| <span className="badge badge--danger">Not Ready</span> | Any of checks 1–10 fail | Configuration gaps need to be addressed first |
 
 The first 10 checks evaluate configuration quality. The last 2 checks evaluate optimization results — you must run Auto-Optimize to pass them.
 

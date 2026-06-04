@@ -9,26 +9,11 @@ The Fix Agent is an AI-powered service that takes IQ Scanner findings and automa
 
 ## How It Works
 
-```
-IQ Scanner findings
-        │
-        ▼
-┌───────────────────────┐
-│  Parallel LLM calls   │  One call per finding
-│  (run_in_executor)    │  All run concurrently
-└───────────┬───────────┘
-            │
-            ▼
-┌───────────────────────┐
-│  Patch validation     │  Check field_path against _VALID_FIELDS
-│  + merge into config  │  Apply to mutable config copy
-└───────────┬───────────┘
-            │
-            ▼
-┌───────────────────────┐
-│  Re-fetch + apply     │  Fresh GET → apply patches → PATCH API
-│  with retry           │  Up to 3 attempts with back-off
-└───────────────────────┘
+```mermaid
+flowchart TB
+    findings["IQ Scanner findings"] --> parallel["Parallel LLM calls<br/>one per finding · run concurrently"]
+    parallel --> validate["Patch validation + merge<br/>check field_path vs _VALID_FIELDS"]
+    validate --> apply["Re-fetch + apply with retry<br/>fresh GET → patches → PATCH API · up to 3 attempts"]
 ```
 
 ## Parallel Patch Generation

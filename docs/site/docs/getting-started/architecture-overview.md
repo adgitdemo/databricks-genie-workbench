@@ -9,36 +9,27 @@ Genie Workbench is a full-stack application deployed as a [Databricks App](https
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Databricks Apps Platform                │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                 Reverse Proxy (OBO)                    │  │
-│  │          x-forwarded-access-token injection            │  │
-│  └───────────────────┬───────────────────────────────────┘  │
-│                      │                                       │
-│  ┌───────────────────▼───────────────────────────────────┐  │
-│  │              FastAPI Backend (uvicorn)                  │  │
-│  │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐   │  │
-│  │  │ Routers  │  │ Services │  │ Static File Server │   │  │
-│  │  │ /api/*   │  │ (auth,   │  │ frontend/dist/     │   │  │
-│  │  │          │  │  genie,  │  │                    │   │  │
-│  │  │          │  │  llm,    │  │                    │   │  │
-│  │  │          │  │  lakebase│  │                    │   │  │
-│  │  │          │  │  scanner)│  │                    │   │  │
-│  │  └──────────┘  └──────────┘  └────────────────────┘   │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                      │                                       │
-│  ┌───────────────────▼───────────────────────────────────┐  │
-│  │              External Services                         │  │
-│  │  ┌──────────┐ ┌──────┐ ┌────────┐ ┌──────────────┐   │  │
-│  │  │ Genie API│ │  UC  │ │ SQL WH │ │Model Serving │   │  │
-│  │  └──────────┘ └──────┘ └────────┘ └──────────────┘   │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌─────────────────────┐   │  │
-│  │  │ Lakebase │ │  MLflow  │ │ Delta (GSO state)   │   │  │
-│  │  └──────────┘ └──────────┘ └─────────────────────┘   │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    proxy["Reverse Proxy (OBO)<br/>x-forwarded-access-token injection"]
+    subgraph platform["Databricks Apps Platform"]
+        subgraph backend["FastAPI Backend (uvicorn)"]
+            routers["Routers<br/>/api/*"]
+            services["Services<br/>auth · genie · llm · lakebase · scanner"]
+            static["Static File Server<br/>frontend/dist/"]
+        end
+        subgraph ext["External Services"]
+            genie["Genie API"]
+            uc["Unity Catalog"]
+            wh["SQL Warehouse"]
+            ms["Model Serving"]
+            lb["Lakebase"]
+            mlflow["MLflow"]
+            delta["Delta (GSO state)"]
+        end
+    end
+    proxy --> backend
+    backend --> ext
 ```
 
 ## Backend Structure

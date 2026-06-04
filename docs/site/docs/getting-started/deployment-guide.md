@@ -35,7 +35,9 @@ cd databricks-genie-workbench
 databricks auth login --profile <workspace-profile>
 ```
 
-> **Do NOT run `databricks bundle init`** — it overwrites the project configuration.
+:::danger
+**Do NOT run `databricks bundle init`** — it overwrites the project configuration.
+:::
 
 ### 3. Run the guided installer
 
@@ -72,7 +74,9 @@ The app creates the `genie` schema and tables on first startup. Since the SP exe
 
 The installer asks for a Lakebase project name (defaults to the app name, stored as `GENIE_LAKEBASE_INSTANCE` in `.env.deploy`). No manual steps required.
 
-> **Note:** The GRANT step requires `psycopg[binary]` in the project venv (installed by `uv sync`). If unavailable, the script prints the commands to run manually in the Lakebase SQL Editor.
+:::note
+The GRANT step requires `psycopg[binary]` in the project venv (installed by `uv sync`). If unavailable, the script prints the commands to run manually in the Lakebase SQL Editor.
+:::
 
 ## What `deploy.sh` Does
 
@@ -181,7 +185,9 @@ echo "-e ./packages/genie-space-optimizer" >> requirements.txt
 git add uv.lock requirements.txt
 ```
 
-> Do not edit `requirements.txt` manually. It is generated from `uv.lock`.
+:::warning
+Do not edit `requirements.txt` manually. It is generated from `uv.lock`.
+:::
 
 ### Updating npm dependencies
 

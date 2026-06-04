@@ -74,19 +74,11 @@ These variables are used by `deploy.sh` and `install.sh` at deploy time. They ar
 
 ## How Variables Flow
 
-```
-.env.deploy                    app.yaml (template)              app.yaml (deployed)
-┌──────────────────┐          ┌───────────────────┐           ┌───────────────────┐
-│ GENIE_CATALOG=foo│─────────▶│ GSO_CATALOG:      │──────────▶│ GSO_CATALOG: foo  │
-│ GENIE_WAREHOUSE  │          │   __GSO_CATALOG__  │           │                   │
-│ GENIE_LLM_MODEL │          │ LLM_MODEL:        │           │ LLM_MODEL:        │
-│ ...              │          │   __LLM_MODEL__    │           │   claude-sonnet   │
-└──────────────────┘          └───────────────────┘           └───────────────────┘
-                                                                       │
-                                 deploy.sh patches                     │
-                                 placeholders with                     ▼
-                                 real values                    App Runtime
-                                                               (env vars available)
+```mermaid
+flowchart LR
+    env[".env.deploy<br/>GENIE_CATALOG · GENIE_WAREHOUSE_ID · ..."] -->|"deploy.sh patches placeholders"| tmpl["app.yaml (template)<br/>__GSO_CATALOG__ · __LLM_MODEL__"]
+    tmpl --> deployed["app.yaml (deployed)<br/>real values"]
+    deployed --> runtime["App Runtime<br/>env vars injected"]
 ```
 
 1. `install.sh` collects values and writes `.env.deploy`

@@ -9,23 +9,12 @@ This is the authoritative reference for how identity and authorization work in G
 
 ## Overview
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Databricks Apps                           │
-│                                                                  │
-│   Browser ──▶ Reverse Proxy ──▶ FastAPI Backend                  │
-│                  │                    │                           │
-│                  │ injects            │ reads header              │
-│                  │ x-forwarded-       │ stores in ContextVar      │
-│                  │ access-token       │                           │
-│                  ▼                    ▼                           │
-│            User's OAuth       OBO WorkspaceClient                │
-│            Token               (per-request)                     │
-│                                                                  │
-│                               SP WorkspaceClient                 │
-│                                (singleton, from                  │
-│                                 platform env vars)               │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    browser["Browser"] --> proxy["Reverse Proxy"]
+    proxy -->|"injects x-forwarded-access-token"| backend["FastAPI Backend"]
+    backend -->|"reads header → ContextVar"| obo["OBO WorkspaceClient<br/>(per-request)"]
+    backend --> sp["SP WorkspaceClient<br/>(singleton · platform env vars)"]
 ```
 
 ## OBO (On-Behalf-Of) Authentication
@@ -38,7 +27,9 @@ This is the authoritative reference for how identity and authorization work in G
 
 3. `set_obo_user_token()` creates a `WorkspaceClient` configured with `auth_type="pat"` using the user's token. This is stored in a Python `ContextVar` so it is scoped to the current request.
 
-   > The explicit `auth_type="pat"` is required because the Databricks Apps environment has `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` set for the SP. Without it, the SDK would default to OAuth M2M instead of the user's token.
+   :::note
+   The explicit `auth_type="pat"` is required because the Databricks Apps environment has `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` set for the SP. Without it, the SDK would default to OAuth M2M instead of the user's token.
+   :::
 
 4. All downstream service calls use `get_workspace_client()`, which returns the OBO client if set, otherwise falls back to the SP singleton.
 
@@ -90,47 +81,16 @@ Reads and writes to the optimizer state tables (12 Delta tables under `GSO_CATAL
 
 When a user triggers Auto-Optimize, the app uses **both** identities in a carefully sequenced flow:
 
-```
-User clicks "Optimize"
-        │
-        ▼
-POST /api/auto-optimize/trigger
-        │
-        ▼
-┌───────────────────────────────┐
-│ 1. user_can_edit_space(OBO)   │◀── Verify user has CAN_EDIT/CAN_MANAGE
-│    Reject if unauthorized     │
-└───────────┬───────────────────┘
-            ▼
-┌───────────────────────────────┐
-│ 2. fetch_space_config         │◀── Try OBO first, then SP fallback
-│    Snapshot the space config  │
-└───────────┬───────────────────┘
-            ▼
-┌───────────────────────────────┐
-│ 3. fetch_uc_metadata(OBO)     │◀── Column/tag metadata respects user visibility
-└───────────┬───────────────────┘
-            ▼
-┌───────────────────────────────┐
-│ 4. sp_can_manage_space(SP)    │◀── Verify SP has CAN_MANAGE
-│    Reject if SP lacks access  │
-└───────────┬───────────────────┘
-            ▼
-┌───────────────────────────────┐
-│ 5. wh_create_run(OBO)         │◀── Insert run row in Delta (user identity)
-└───────────┬───────────────────┘
-            ▼
-┌───────────────────────────────┐
-│ 6. submit_optimization(SP)    │◀── jobs.run_now() as SP
-│    → Lakeflow Job submitted   │
-└───────────┬───────────────────┘
-            ▼
-┌───────────────────────────────┐
-│ 7. 6-task DAG executes as SP  │
-│    (preflight → baseline →    │
-│     enrichment → lever_loop → │
-│     finalize → deploy)        │
-└───────────────────────────────┘
+```mermaid
+flowchart TB
+    click(["User clicks Optimize"]) --> trigger["POST /api/auto-optimize/trigger"]
+    trigger --> s1["1 · user_can_edit_space (OBO)<br/>verify CAN_EDIT / CAN_MANAGE — reject if unauthorized"]
+    s1 --> s2["2 · fetch_space_config<br/>OBO first, then SP fallback"]
+    s2 --> s3["3 · fetch_uc_metadata (OBO)<br/>respects user visibility"]
+    s3 --> s4["4 · sp_can_manage_space (SP)<br/>reject if SP lacks access"]
+    s4 --> s5["5 · wh_create_run (OBO)<br/>insert run row in Delta"]
+    s5 --> s6["6 · submit_optimization (SP)<br/>jobs.run_now() → Lakeflow Job"]
+    s6 --> s7["7 · 6-task DAG executes as SP<br/>preflight → baseline → enrichment → lever_loop → finalize → deploy"]
 ```
 
 **Source:** `packages/genie-space-optimizer/src/genie_space_optimizer/integration/trigger.py` — `trigger_optimization()`

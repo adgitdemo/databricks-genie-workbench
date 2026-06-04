@@ -11,22 +11,13 @@ The Create Agent is a multi-turn, tool-calling LLM agent that walks users from b
 
 The agent follows a structured progression through six steps. Each step focuses on gathering specific information before moving to the next:
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Requirements │───▶│ Data Sources │───▶│  Inspection  │
-│ What does    │    │ Which tables │    │ Profile cols │
-│ the space    │    │ and schemas? │    │ assess data  │
-│ need to do?  │    │              │    │ quality      │
-└──────────────┘    └──────────────┘    └──────────────┘
-                                               │
-       ┌───────────────────────────────────────┘
-       ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│     Plan     │───▶│ Config Create│───▶│Post-Creation │
-│ Generate and │    │ Build, valid-│    │ Summary and  │
-│ present the  │    │ ate, deploy  │    │ next steps   │
-│ space plan   │    │ the space    │    │              │
-└──────────────┘    └──────────────┘    └──────────────┘
+```mermaid
+flowchart LR
+    req["Requirements<br/>what does the space need to do?"] --> ds["Data Sources<br/>which tables and schemas?"]
+    ds --> insp["Inspection<br/>profile columns · assess quality"]
+    insp --> plan["Plan<br/>generate and present the plan"]
+    plan --> cfg["Config Create<br/>build · validate · deploy"]
+    cfg --> post["Post-Creation<br/>summary and next steps"]
 ```
 
 ### Step Descriptions

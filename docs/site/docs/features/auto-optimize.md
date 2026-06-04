@@ -15,12 +15,13 @@ Unlike the [Fix Agent](/docs/features/fix-agent) (which applies targeted patches
 
 The optimization runs as a Databricks Lakeflow Job with six sequential tasks:
 
-```
-┌───────────┐   ┌──────────┐   ┌────────────┐   ┌────────────┐   ┌──────────┐   ┌────────┐
-│ Preflight │──▶│ Baseline │──▶│ Enrichment │──▶│ Lever Loop │──▶│ Finalize │──▶│ Deploy │
-│           │   │   Eval   │   │            │   │            │   │          │   │        │
-└───────────┘   └──────────┘   └────────────┘   └────────────┘   └──────────┘   └────────┘
-     1               2               3                4               5             6
+```mermaid
+flowchart LR
+    p1["1 · Preflight"] --> p2["2 · Baseline Eval"]
+    p2 --> p3["3 · Enrichment"]
+    p3 --> p4["4 · Lever Loop"]
+    p4 --> p5["5 · Finalize"]
+    p5 --> p6["6 · Deploy"]
 ```
 
 ### Task Details
@@ -52,16 +53,10 @@ The lever loop's **strategist** analyzes current failure patterns and selects th
 
 Before accepting any set of patches, the optimizer runs them through three progressively broader evaluation gates:
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Gate 1:    │────▶│   Gate 2:    │────▶│   Gate 3:    │
-│   Slice      │     │   P0         │     │   Full       │
-│              │     │              │     │              │
-│ Test on the  │     │ Test on high │     │ Test on all  │
-│ failing      │     │ priority     │     │ benchmark    │
-│ questions    │     │ questions    │     │ questions    │
-│ only         │     │              │     │              │
-└──────────────┘     └──────────────┘     └──────────────┘
+```mermaid
+flowchart LR
+    g1["Gate 1 · Slice<br/>failing questions only"] --> g2["Gate 2 · P0<br/>high-priority questions"]
+    g2 --> g3["Gate 3 · Full<br/>all benchmark questions"]
 ```
 
 | Gate | Scope | Purpose |
@@ -127,7 +122,9 @@ The optimization job runs entirely as the app's **Service Principal** (SP). See 
 - **Prompt Registry**: judge prompts are versioned in MLflow Prompt Registry, enabling reproducible evaluations
 - **`MLFLOW_EXPERIMENT_ID`**: configured in `app.yaml`, validated at startup
 
-> MLflow Prompt Registry must be enabled on the workspace. If disabled, the preflight task will fail with `FEATURE_DISABLED`.
+:::warning
+MLflow Prompt Registry must be enabled on the workspace. If disabled, the preflight task will fail with `FEATURE_DISABLED`.
+:::
 
 ## Triggering from the UI
 

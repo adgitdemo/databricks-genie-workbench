@@ -43,14 +43,13 @@ Genie Workbench provides five capabilities that form a continuous improvement lo
 
 The features form a lifecycle that can be entered at any point and repeated as the space evolves:
 
-```
-┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────────┐     ┌──────────┐
-│  Create   │────▶│ IQ Scan  │────▶│   Fix    │────▶│ Auto-Optimize│────▶│  Track   │
-│  Agent    │     │ (Score)  │     │  Agent   │     │   (GSO)      │     │ (History)│
-└──────────┘     └──────────┘     └──────────┘     └──────────────┘     └──────────┘
-                       ▲                                                       │
-                       └───────────────────────────────────────────────────────┘
-                                        continuous improvement
+```mermaid
+flowchart LR
+    Create["Create Agent"] --> Score["IQ Scan (Score)"]
+    Score --> Fix["Fix Agent"]
+    Fix --> Optimize["Auto-Optimize (GSO)"]
+    Optimize --> Track["Track (History)"]
+    Track -. "re-scan · continuous improvement" .-> Score
 ```
 
 - **Create Agent** builds a new space from scratch (or updates an existing one).

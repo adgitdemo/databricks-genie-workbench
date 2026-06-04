@@ -129,7 +129,7 @@ The main Workbench app proxies GSO functionality through `backend/routers/auto_o
 
 ### SSE Streaming
 
-Four endpoints use Server-Sent Events via FastAPI's `StreamingResponse`:
+Two endpoints use Server-Sent Events via FastAPI's `StreamingResponse`:
 
 | Endpoint | Use |
 |----------|-----|
