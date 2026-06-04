@@ -122,7 +122,40 @@ const config: Config = {
     },
     footer: {
       style: 'dark',
-      links: [],
+      links: [
+        {
+          title: 'Getting Started',
+          items: [
+            {label: 'Introduction', to: '/docs/getting-started/introduction'},
+            {label: 'Architecture Overview', to: '/docs/getting-started/architecture-overview'},
+            {label: 'Deployment Guide', to: '/docs/getting-started/deployment-guide'},
+          ],
+        },
+        {
+          title: 'Features',
+          items: [
+            {label: 'Create Agent', to: '/docs/features/create-agent'},
+            {label: 'IQ Scanner', to: '/docs/features/iq-scanner'},
+            {label: 'Fix Agent', to: '/docs/features/fix-agent'},
+            {label: 'Auto-Optimize', to: '/docs/features/auto-optimize'},
+          ],
+        },
+        {
+          title: 'Reference',
+          items: [
+            {label: 'API Reference', to: '/docs/reference/api'},
+            {label: 'Environment Variables', to: '/docs/reference/environment-variables'},
+            {label: 'Troubleshooting', to: '/docs/reference/troubleshooting'},
+          ],
+        },
+        {
+          title: 'More',
+          items: [
+            {label: 'GitHub', href: `https://github.com/${ORG}/${REPO}`},
+            {label: 'Databricks Genie', href: 'https://docs.databricks.com/aws/en/genie/'},
+          ],
+        },
+      ],
       copyright: `© Databricks ${new Date().getFullYear()}. Provided by Databricks Solutions.`,
     },
     prism: {
