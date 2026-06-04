@@ -12,11 +12,6 @@ const config: Config = {
   tagline: 'Create, score, and optimize Databricks Genie Spaces',
   favicon: 'img/favicon.svg',
 
-  future: {
-    v4: true,
-    faster: true,
-  },
-
   // Production URL for GitHub Pages: https://databricks-solutions.github.io/databricks-genie-workbench/
   url: `https://${ORG}.github.io`,
   baseUrl: `/${REPO}/`,
