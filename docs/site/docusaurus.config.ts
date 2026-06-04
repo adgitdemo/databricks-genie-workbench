@@ -81,10 +81,19 @@ const config: Config = {
         background: {light: '#F8FAFC', dark: '#1b3139'},
       },
     ],
+    // Generate llms.txt (+ per-page markdown) for LLM consumption.
+    [
+      '@signalwire/docusaurus-plugin-llms-txt',
+      {
+        siteTitle: 'Genie Workbench',
+        siteDescription:
+          'Developer tool for creating, scoring, and optimizing Databricks Genie Spaces.',
+      },
+    ],
   ],
 
   themeConfig: {
-    image: 'img/logo.svg',
+    image: 'img/social-card.png',
     colorMode: {
       // Dark-default regardless of OS preference, matching the Lakebridge docs.
       // Visitors can still toggle; the choice persists in localStorage.
