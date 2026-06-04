@@ -8,7 +8,7 @@ Databricks App for creating, scoring, and optimizing Genie Spaces. FastAPI backe
 - **DO NOT run `databricks bundle init`.** It overwrites the project's `databricks.yml` and destroys the existing configuration.
 - **DO NOT use `npm install` in build or deploy scripts** — always use `npm ci`. `npm install` can silently upgrade packages within `^` ranges; `npm ci` enforces the exact lockfile.
 - **DO NOT edit `requirements.txt` manually.** It is generated from `uv.lock` as a pip-compatible reference but is excluded from deployment via `.databricksignore`. The platform uses `uv sync` (pyproject.toml + uv.lock) for hash-verified installs.
-- All testing is done by deploying to a real Databricks workspace, not by running locally.
+- **Backend logic has offline unit tests** in `backend/tests/` (`./scripts/test.sh`) — run these locally. But integration/E2E testing (auth, Lakebase, serving endpoints) is done by deploying to a real Databricks workspace, not by running the server locally.
 
 ## Commands
 
@@ -36,7 +36,13 @@ uv export --frozen --no-dev --no-hashes --format requirements-txt \
   | grep -v "^-e " > requirements.txt
 echo "-e ./packages/genie-space-optimizer" >> requirements.txt
 
-# Tests (require running backend at localhost:8000)
+# Backend unit tests (offline, no running server — pytest in backend/tests/)
+./scripts/test.sh                 # Run full backend suite (installs dev deps if missing)
+./scripts/test.sh -v              # Verbose
+./scripts/test.sh -k scanner      # Run a single test file/selection (e.g. test_scanner.py)
+# Configured in pyproject.toml: testpaths=backend/tests, asyncio_mode=auto
+
+# Integration/E2E tests (require running backend at localhost:8000)
 python tests/test_e2e_local.py    # E2E create agent tests
 python tests/test_full_schema.py  # Schema validation
 # Deployed E2E tests require: pip install playwright && playwright install chromium
@@ -52,6 +58,7 @@ backend/
   prompts.py               # Prompt templates for analysis/fix agent
   genie_creator.py         # Genie Space creation logic (API calls, config assembly)
   sql_executor.py          # SQL execution via Databricks SQL warehouse
+  _telemetry.py            # Databricks SDK telemetry constants (PRODUCT_VERSION — keep in sync with pyproject.toml)
   routers/
     analysis.py            # /api/space/* (fetch, parse), /api/settings, /api/debug/auth
     spaces.py              # /api/spaces/* (list, scan, history, star, fix)
@@ -59,8 +66,10 @@ backend/
     auth.py                # /api/auth/me
     create.py              # /api/create/* (agent chat, UC discovery, wizard)
     auto_optimize.py       # /api/auto-optimize/* (GSO engine proxy)
+    _validators.py         # Shared FastAPI path-param validators (e.g. RunId — uuid4-enforced)
   services/
     auth.py                # OBO auth (ContextVar), SP fallback, WorkspaceClient mgmt
+    prompt_registry.py     # Thin re-export of genie_space_optimizer.common.prompt_registry (shared probe — see Key Patterns)
     genie_client.py        # Databricks Genie API (fetch space, list spaces, query for SQL)
     scanner.py             # Rule-based IQ scoring engine (0-12, 12 checks, 3-tier maturity, UC-enriched)
     fix_agent.py           # LLM agent (Quick Fix in UI) that generates JSON patches and applies via Genie API
@@ -75,11 +84,13 @@ backend/
   prompts/                 # Prompt templates for analysis
   prompts_create/          # Prompt templates for create agent (multi-file, modular)
   references/schema.md     # Genie Space JSON schema reference
+  tests/                   # Offline pytest unit suite (scanner, fix/create agent, llm_utils, sql validation) — run via ./scripts/test.sh
 scripts/
   install.sh               # Guided first-time setup (creates .env.deploy, provisions resources)
   deploy.sh                # Build + bundle deploy (job) + app deploy (idempotent)
   preflight.sh             # Pre-deploy validation checks
   build.sh                 # Frontend build
+  test.sh                  # Run the backend pytest suite (installs dev deps if missing)
   deploy-config.sh         # Shared deploy configuration/variables
   grant_permissions.py     # Grants required permissions for app resources
   setup_lakebase.py        # Automates Lakebase Autoscaling project, SP role, and grants
@@ -167,6 +178,8 @@ attacks like the litellm PyPI credential stealer (March 2026) and axios npm RAT
 
 ## Gotchas
 
+- **`CLAUDE.md` is a symlink to `AGENTS.md`** — one source of truth shared by Claude Code and other agent tools. Edit `AGENTS.md`; never replace the symlink with a separate file.
+- **`backend/services/prompt_registry.py` is a re-export** — the real implementation lives in `genie_space_optimizer.common.prompt_registry` so the GSO job (no `backend` on its path) and the Workbench webapp share one source of truth. Import from either path; edit the GSO copy.
 - **frontend/dist/ is gitignored but NOT databricksignored** — the built React app must be synced to workspace for deployment. Build before `databricks sync`.
 - **`.databricksignore` excludes `*.md`** but explicitly re-includes `backend/references/schema.md` (needed at runtime by create agent and analysis prompts).
 - **OBO ContextVar and streaming** — for SSE endpoints, the ContextVar is NOT cleared after `call_next` because the response streams lazily. Streaming handlers stash the token on `request.state` and re-set it inside the generator.

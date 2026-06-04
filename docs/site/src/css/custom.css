@@ -23,6 +23,8 @@
   --ifm-color-primary-lightest: #5ba6da;
 
   --ifm-footer-background-color: #1b3139;
+  /* Mobile drawer takes half the viewport (default 83vw), kept proportionate. */
+  --ifm-navbar-sidebar-width: 50vw;
   --ifm-navbar-shadow: none;
   --ifm-link-decoration: none;
   --ifm-link-hover-decoration: underline;
@@ -77,6 +79,73 @@ h3 {
   margin-right: 1.75rem;
 }
 
+/* Never abbreviate the brand title — let it keep its full width. */
+.navbar__title {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* Collapse the navbar to the hamburger sooner than Docusaurus's hardcoded 996px,
+   so the desktop bar never has to cram or truncate at mid-size widths. This
+   mirrors Infima's max-width:996px rules at a higher threshold; the matching JS
+   gate lives in src/theme/Navbar/MobileSidebar (keep the values in sync). */
+@media (max-width: 1140px) {
+  .navbar > .container,
+  .navbar > .container-fluid {
+    padding: 0;
+  }
+  .navbar__toggle {
+    display: inherit;
+  }
+  .navbar__item {
+    display: none;
+  }
+  /* Hide the desktop color-mode toggle below the breakpoint (it moves into the
+     drawer next to GitHub). */
+  .navbar-color-mode-toggle {
+    display: none;
+  }
+  /* In the collapsed (hamburger) view, push the search to the right edge instead
+     of letting Docusaurus center the navbar center-group. */
+  .navbar__items--center {
+    margin-left: auto;
+  }
+  .navbar__items--center + .navbar__items--right {
+    flex: 0 0 auto;
+  }
+  /* Fixed search size in the collapsed view (does not shrink with the window).
+     Scoped to the center group so it beats Infima's own max-width:996px rule. */
+  .navbar__items--center .navbar__search-input {
+    width: 20rem;
+  }
+}
+
+/* Desktop only: three-zone navbar — left items / search / right icons.
+   `auto 1fr auto` keeps the left (brand + dropdowns) and right (icons) clusters
+   at their content width; the search sits in the middle gap, right-aligned next
+   to the icons, and scales fluidly (capped at 24rem, shrinking with the window).
+   Below the breakpoint this reverts to Infima's flex layout. */
+@media (min-width: 1141px) {
+  .navbar__inner {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    column-gap: 1rem;
+  }
+  .navbar__items--center {
+    min-width: 0;
+    justify-content: flex-end;
+  }
+  .navbar__items--right {
+    justify-content: flex-end;
+  }
+  .navbar__search-input {
+    width: clamp(13rem, 24vw, 24rem);
+  }
+}
+
 /* Replace the default filled-triangle dropdown caret with a sleek chevron.
    Flex the toggle so the chevron is centered against the label vertically. */
 .dropdown > .navbar__link {
@@ -102,6 +171,14 @@ h3 {
 
 .dropdown--show > .navbar__link::after {
   transform: rotate(180deg);
+}
+
+/* Mobile drawer: keep the GitHub icon and the (moved) theme toggle on one row */
+.navbar-sidebar__items .menu__list-item:has(.header-github-link),
+.navbar-sidebar__items .navbar-sidebar__toggle-item {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
 }
 
 /* Tighten sidebar typography a touch */
