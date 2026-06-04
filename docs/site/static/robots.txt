@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://databricks-solutions.github.io/databricks-genie-workbench/sitemap.xml

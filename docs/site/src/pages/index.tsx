@@ -184,11 +184,11 @@ function QuickStart() {
           </div>
           <pre className="m-0 overflow-x-auto bg-transparent p-5 font-mono leading-relaxed text-slate-200">
             <code>
-              <span className="text-slate-500"># First-time setup (interactive)</span>
+              <span className="text-slate-400"># First-time setup (interactive)</span>
               {'\n'}./scripts/install.sh{'\n\n'}
-              <span className="text-slate-500"># Subsequent deploys</span>
+              <span className="text-slate-400"># Subsequent deploys</span>
               {'\n'}./scripts/deploy.sh{'\n\n'}
-              <span className="text-slate-500"># Code-only update (faster)</span>
+              <span className="text-slate-400"># Code-only update (faster)</span>
               {'\n'}./scripts/deploy.sh --update
             </code>
           </pre>

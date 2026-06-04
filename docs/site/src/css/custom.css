@@ -76,3 +76,58 @@ h3 {
 .menu {
   font-size: 0.92rem;
 }
+
+/* Accessibility: WCAG-AA badge colors (Infima defaults fail white-on-light).
+   Fixed dark backgrounds + white text, ≥4.5:1 in both themes. */
+.badge {
+  color: #fff;
+  font-weight: 600;
+}
+.badge--success {
+  background-color: #1a7f37;
+  border-color: #1a7f37;
+}
+.badge--info {
+  background-color: #1862ab;
+  border-color: #1862ab;
+}
+.badge--warning {
+  background-color: #8a5a00;
+  border-color: #8a5a00;
+}
+.badge--danger {
+  background-color: #b3261e;
+  border-color: #b3261e;
+}
+.badge--primary {
+  background-color: #1f6699;
+  border-color: #1f6699;
+}
+.badge--secondary {
+  background-color: #475569;
+  border-color: #475569;
+}
+
+/* Accessibility: underline links inside doc content so they're distinguishable
+   without relying on color alone (navbar/sidebar/cards keep their own affordances). */
+.markdown a {
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+/* Accessibility: lift the dark-mode primary slightly so sidebar/breadcrumb/TOC
+   links clear 4.5:1 on the elevated dark surface (#222f35). */
+html[data-theme='dark'] {
+  --ifm-color-primary: #5aa9ec;
+}
+
+/* Accessibility: Mermaid's dark-theme edge labels (#ccc on #585858 = 4.43) miss
+   AA. Darken the label background and lighten the text for high contrast. */
+html[data-theme='dark'] .labelBkg {
+  background-color: #16242a !important;
+}
+html[data-theme='dark'] .edgeLabel,
+html[data-theme='dark'] .edgeLabel p {
+  color: #e6edf3 !important;
+  background-color: transparent !important;
+}
