@@ -59,10 +59,13 @@ def test_list_chat_models_returns_curated_compatible_models(monkeypatch):
         isDefault=True,
     )
     assert "databricks-gpt-5-4" in names
+    assert "databricks-gpt-5-4-mini" not in names
     assert "databricks-gpt-5-5" not in names
     assert "databricks-gpt-5-5-pro" not in names
     assert "databricks-claude-opus-4-8" in names
     assert "databricks-claude-opus-4-7" in names
+    assert "databricks-claude-sonnet-4-5" not in names
+    assert "databricks-claude-haiku-4-5" not in names
     assert "chat-default" not in names
     assert "chat-alt" not in names
     assert models[0].isDefault is True
