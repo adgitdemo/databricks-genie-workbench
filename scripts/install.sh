@@ -9,15 +9,14 @@ set -euo pipefail
 #   2. Asks for Databricks profile
 #   3. Asks for catalog (with auto-discovery)
 #   4. Asks for SQL Warehouse (with auto-discovery)
-#   5. Asks for LLM model
-#   6. MLflow tracing (optional — experiment ID for agent observability)
-#   7. Asks for app name
-#   8. Lakebase project (create new, skip, or advanced attach existing)
-#   9. Writes .env.deploy
-#  10. Runs deploy.sh
-#  11. Resolves app service principal
-#  12. Optionally grants SP access to Genie Spaces
-#  13. Prints summary with automated/manual sections
+#   5. MLflow tracing (optional — experiment ID for agent observability)
+#   6. Asks for app name
+#   7. Lakebase project (create new, skip, or advanced attach existing)
+#   8. Writes .env.deploy
+#   9. Runs deploy.sh
+#  10. Resolves app service principal
+#  11. Optionally grants SP access to Genie Spaces
+#  12. Prints summary with automated/manual sections
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -467,82 +466,14 @@ fi
 _ok "Selected warehouse: $WAREHOUSE_ID"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 5: LLM Model
-# ══════════════════════════════════════════════════════════════════════════
-_header "Step 5: LLM Model"
-
-_info "Choose the foundation model Genie Workbench will use to create and"
-_info "optimize Genie Spaces, generate SQL instructions, and explain findings."
-echo ""
-
-CURATED_MODELS=(
-    "Claude Sonnet 4.6  (Recommended — databricks-claude-sonnet-4-6)"
-    "GPT-5.4            (Databricks — databricks-gpt-5-4)"
-    "Other              (browse all serving endpoints or enter a name manually)"
-)
-
-LLM_MODEL=""
-_select_from MODEL_CHOICE "Select a model" 1 "${CURATED_MODELS[@]}"
-
-case "$MODEL_CHOICE" in
-    Claude*)
-        LLM_MODEL="databricks-claude-sonnet-4-6" ;;
-    GPT*)
-        LLM_MODEL="databricks-gpt-5-4" ;;
-    Other*)
-        echo ""
-        echo "    1) Browse all serving endpoints in my workspace"
-        echo "    2) Enter endpoint name manually"
-        echo ""
-        OTHER_CHOICE=""
-        while true; do
-            echo -en "  [1-2]: "
-            read -r OTHER_CHOICE
-            case "$OTHER_CHOICE" in
-                1|2) break ;;
-                *) echo "  Please enter 1 or 2." ;;
-            esac
-        done
-        if [ "$OTHER_CHOICE" = "1" ]; then
-            _info "Fetching all serving endpoints..."
-            ALL_ENDPOINTS=()
-            while IFS= read -r ep; do
-                [ -n "$ep" ] && ALL_ENDPOINTS+=("$ep")
-            done < <(
-                databricks serving-endpoints list --profile "$PROFILE" -o json 2>/dev/null \
-                | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    eps = data if isinstance(data, list) else data.get('endpoints', [])
-    for e in eps:
-        print(e.get('name',''))
-except: pass
-" 2>/dev/null
-            )
-            if [ ${#ALL_ENDPOINTS[@]} -eq 0 ]; then
-                _warn "No serving endpoints found. Enter endpoint name manually."
-                _prompt LLM_MODEL "Endpoint name" ""
-            else
-                _select_from LLM_MODEL "Select endpoint" "${ALL_ENDPOINTS[@]}"
-            fi
-        else
-            _prompt LLM_MODEL "Endpoint name" ""
-        fi
-        ;;
-esac
-
-if [ -z "$LLM_MODEL" ]; then
-    _error "No LLM model selected."
-    exit 1
-fi
-
-_ok "LLM model: $LLM_MODEL"
+LLM_MODEL="${GENIE_LLM_MODEL:-databricks-claude-sonnet-4-6}"
+_ok "Default LLM model: $LLM_MODEL"
+_info "Users can choose other READY chat serving endpoints inside the app."
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 6: MLflow Tracing (optional)
+# Step 5: MLflow Tracing (optional)
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 6: MLflow Tracing (optional)"
+_header "Step 5: MLflow Tracing (optional)"
 
 _info "MLflow tracing is observability for the app's AI agents."
 _info "When enabled, the Create Agent and Fix Agent log their LLM requests,"
@@ -646,9 +577,9 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 7: App name
+# Step 6: App name
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 7: App name"
+_header "Step 6: App name"
 
 _info "This is the name of the Databricks App that will be created in your workspace."
 _info "Only lowercase letters, numbers, and hyphens are allowed."
@@ -685,9 +616,9 @@ done
 _ok "App name: $APP_NAME"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 8: Lakebase (PostgreSQL)
+# Step 7: Lakebase (PostgreSQL)
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 8: Lakebase (PostgreSQL)"
+_header "Step 7: Lakebase (PostgreSQL)"
 
 _info "Lakebase provides persistent PostgreSQL storage for scan history, starred"
 _info "spaces, and Create Agent sessions. Without it, the app uses in-memory"
@@ -836,9 +767,9 @@ while true; do
 done
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 9: Write .env.deploy
+# Step 8: Write .env.deploy
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 9: Writing configuration"
+_header "Step 8: Writing configuration"
 
 ENV_FILE="$PROJECT_DIR/.env.deploy"
 cat > "$ENV_FILE" <<EOF
@@ -862,15 +793,15 @@ echo "  │  App name:     $APP_NAME"
 echo "  │  Catalog:      $CATALOG"
 echo "  │  GSO Schema:   ${CATALOG}.${GSO_SCHEMA} (default)"
 echo "  │  Warehouse ID: $WAREHOUSE_ID"
-echo "  │  LLM Model:    $LLM_MODEL"
+echo "  │  Default LLM:  $LLM_MODEL"
 echo "  │  Lakebase:     ${LAKEBASE_INSTANCE:-<none>}"
 echo "  │  MLflow:       ${MLFLOW_EXPERIMENT_ID:-<disabled>}"
 echo "  └───────────────────────────────────────────────────────────┘"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 10: Deploy
+# Step 9: Deploy
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 10: Deploying"
+_header "Step 9: Deploying"
 
 _info "This will build the frontend, sync code to your workspace, deploy the"
 _info "optimization job, and start the app (typically 3-5 minutes)."
@@ -889,9 +820,9 @@ AUTOMATED=()
 AUTOMATED_FAIL=()
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 11: Resolve app service principal
+# Step 10: Resolve app service principal
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 11: Resolving app service principal"
+_header "Step 10: Resolving app service principal"
 
 SP_CLIENT_ID=$(
     databricks apps get "$APP_NAME" --profile "$PROFILE" -o json 2>/dev/null \
@@ -924,9 +855,9 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 12: Genie Space permissions (optional)
+# Step 11: Genie Space permissions (optional)
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 12: Genie Space access"
+_header "Step 11: Genie Space access"
 
 _info "The app uses On-Behalf-Of (OBO) auth, so users see their own spaces."
 _info "However, the service principal needs explicit grants for fallback access."

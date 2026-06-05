@@ -51,6 +51,7 @@ def generate_plan(
     tables_context: list[dict],
     inspection_summaries: dict[str, Any],
     user_requirements: str,
+    model: str | None = None,
 ) -> dict:
     """Generate a complete Genie Space plan via parallel LLM calls.
 
@@ -66,11 +67,11 @@ def generate_plan(
     shared_context = _build_shared_context(tables_context, inspection_summaries, user_requirements)
 
     section_specs: list[tuple[str, callable, dict]] = [
-        ("tables", _gen_tables, {"shared": shared_context, "tables_context": tables_context}),
-        ("questions", _gen_questions_instructions, {"shared": shared_context}),
-        ("example_sqls", _gen_example_sqls, {"shared": shared_context}),
-        ("benchmarks", _gen_benchmarks, {"shared": shared_context}),
-        ("analytics", _gen_analytics, {"shared": shared_context}),
+        ("tables", _gen_tables, {"shared": shared_context, "tables_context": tables_context, "model": model}),
+        ("questions", _gen_questions_instructions, {"shared": shared_context, "model": model}),
+        ("example_sqls", _gen_example_sqls, {"shared": shared_context, "model": model}),
+        ("benchmarks", _gen_benchmarks, {"shared": shared_context, "model": model}),
+        ("analytics", _gen_analytics, {"shared": shared_context, "model": model}),
     ]
 
     results: dict[str, dict] = {}
@@ -93,7 +94,7 @@ def generate_plan(
     plan = _assemble(results, tables_context)
 
     # Validate example SQLs and benchmarks (test execution + repair)
-    validated = _validate_plan_sqls(plan, shared_context=shared_context)
+    validated = _validate_plan_sqls(plan, shared_context=shared_context, model=model)
     if validated:
         errors.extend(validated)
 
@@ -103,7 +104,7 @@ def generate_plan(
         errors.extend(analytics_warnings)
 
     # Check benchmark question-SQL alignment (LLM-based)
-    alignment_warnings = _validate_benchmark_alignment(plan, shared_context)
+    alignment_warnings = _validate_benchmark_alignment(plan, shared_context, model=model)
     if alignment_warnings:
         errors.extend(alignment_warnings)
 
@@ -167,7 +168,7 @@ def _metric_view_plan_entry(t: dict) -> dict:
     }
 
 
-def _call_llm_section(prompt: str, max_tokens: int, section_name: str) -> dict:
+def _call_llm_section(prompt: str, max_tokens: int, section_name: str, model: str | None = None) -> dict:
     """Call the LLM serving endpoint and parse the JSON response.
 
     Raises RuntimeError (re-raised from the original) on failure so the
@@ -176,13 +177,30 @@ def _call_llm_section(prompt: str, max_tokens: int, section_name: str) -> dict:
     try:
         response = call_serving_endpoint(
             [{"role": "user", "content": prompt}],
-            model=get_llm_model(),
+            model=model or get_llm_model(),
             max_tokens=max_tokens,
         )
         return parse_json_from_llm_response(response)
     except Exception as e:
         logger.exception("%s generation failed", section_name)
         raise RuntimeError(f"{section_name} LLM call failed: {e}") from e
+
+
+def _call_llm_section_for_model(
+    prompt: str,
+    *,
+    max_tokens: int,
+    section_name: str,
+    model: str | None = None,
+) -> dict:
+    if model:
+        return _call_llm_section(
+            prompt,
+            max_tokens=max_tokens,
+            section_name=section_name,
+            model=model,
+        )
+    return _call_llm_section(prompt, max_tokens=max_tokens, section_name=section_name)
 
 
 def _build_shared_context(
@@ -333,7 +351,7 @@ def _summarize_profiles(profiles: dict) -> str:
     return "IMPORTANT — Use ONLY these actual values in SQL and instructions:\n" + "\n".join(lines)
 
 
-def _gen_tables(shared: str, tables_context: list[dict]) -> dict:
+def _gen_tables(shared: str, tables_context: list[dict], model: str | None = None) -> dict:
     """Generate table descriptions and column_configs.
 
     Mostly programmatic (columns come from inspection), with an LLM call
@@ -368,7 +386,12 @@ def _gen_tables(shared: str, tables_context: list[dict]) -> dict:
     )
 
     try:
-        result = _call_llm_section(prompt, max_tokens=4096, section_name="tables")
+        result = _call_llm_section_for_model(
+            prompt,
+            max_tokens=4096,
+            section_name="tables",
+            model=model,
+        )
         if "tables" not in result:
             result = {"tables": tables}
         if metric_views:
@@ -382,7 +405,7 @@ def _gen_tables(shared: str, tables_context: list[dict]) -> dict:
         return result
 
 
-def _gen_questions_instructions(shared: str) -> dict:
+def _gen_questions_instructions(shared: str, model: str | None = None) -> dict:
     """Generate sample_questions and text_instructions."""
     prompt = (
         "You are creating sample questions and text instructions for a Databricks Genie Space.\n\n"
@@ -418,10 +441,15 @@ def _gen_questions_instructions(shared: str) -> dict:
         '"## CONSTRAINTS\\n- Never show PII columns."]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=3000, section_name="questions/instructions")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=3000,
+        section_name="questions/instructions",
+        model=model,
+    )
 
 
-def _gen_example_sqls(shared: str) -> dict:
+def _gen_example_sqls(shared: str, model: str | None = None) -> dict:
     """Generate example_sqls (question + SQL pairs that teach Genie query patterns).
 
     Hard cap: exactly 12 pairs. At ~350 tokens each (question + SQL + params + guidance + JSON),
@@ -453,10 +481,15 @@ def _gen_example_sqls(shared: str) -> dict:
         '{"example_sqls": [{"question": "...", "sql": "...", "usage_guidance": "...", "parameters": [...]}]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=6000, section_name="example_sqls")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=6000,
+        section_name="example_sqls",
+        model=model,
+    )
 
 
-def _gen_benchmarks(shared: str) -> dict:
+def _gen_benchmarks(shared: str, model: str | None = None) -> dict:
     """Generate benchmark questions (ground-truth Q+SQL for space quality scoring).
 
     Hard cap: exactly 10 benchmarks. At ~300 tokens each (question + SQL + JSON),
@@ -491,10 +524,15 @@ def _gen_benchmarks(shared: str) -> dict:
         '{"benchmarks": [{"question": "...", "expected_sql": "..."}]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=5000, section_name="benchmarks")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=5000,
+        section_name="benchmarks",
+        model=model,
+    )
 
 
-def _gen_analytics(shared: str) -> dict:
+def _gen_analytics(shared: str, model: str | None = None) -> dict:
     """Generate join_specs, measures, filters, and expressions.
 
     Hard cap: ~20 items total (up to 5 joins + 5 measures + 5 filters + 4 expressions).
@@ -525,10 +563,20 @@ def _gen_analytics(shared: str) -> dict:
         '{"join_specs": [...], "measures": [...], "filters": [...], "expressions": [...]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=5000, section_name="analytics")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=5000,
+        section_name="analytics",
+        model=model,
+    )
 
 
-def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | None:
+def _repair_unbound_sql(
+    item: dict,
+    kind: str,
+    shared_context: str,
+    model: str | None = None,
+) -> dict | None:
     """Ask the LLM to fix missing parameter default_values in a parameterized SQL.
 
     For example_sqls: fills in default_value for each :param so _substitute_params
@@ -552,7 +600,12 @@ def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | No
             f"Context:\n{shared_context[:2000]}"
         )
         try:
-            result = _call_llm_section(prompt, max_tokens=512, section_name="param repair")
+            result = _call_llm_section_for_model(
+                prompt,
+                max_tokens=512,
+                section_name="param repair",
+                model=model,
+            )
             repaired_params = result.get("parameters")
             if repaired_params:
                 return {**item, "parameters": repaired_params}
@@ -572,7 +625,12 @@ def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | No
             f"Context:\n{shared_context[:2000]}"
         )
         try:
-            result = _call_llm_section(prompt, max_tokens=512, section_name="benchmark repair")
+            result = _call_llm_section_for_model(
+                prompt,
+                max_tokens=512,
+                section_name="benchmark repair",
+                model=model,
+            )
             repaired_sql = result.get("expected_sql", "")
             # Verify no :param placeholders remain anywhere in the repaired SQL
             if repaired_sql and not re.search(r":[a-zA-Z_]\w*", repaired_sql):
@@ -586,7 +644,13 @@ def _is_metric_view_measure_error(error: str) -> bool:
     return _METRIC_VIEW_MEASURE_ERROR in error
 
 
-def _repair_metric_view_sql(item: dict, kind: str, shared_context: str, error: str) -> dict | None:
+def _repair_metric_view_sql(
+    item: dict,
+    kind: str,
+    shared_context: str,
+    error: str,
+    model: str | None = None,
+) -> dict | None:
     """Rewrite SQL that failed because metric-view measures need MEASURE()."""
     sql_key = "sql" if kind == "example_sql" else "expected_sql"
     sql = item.get(sql_key, "")
@@ -610,7 +674,12 @@ def _repair_metric_view_sql(item: dict, kind: str, shared_context: str, error: s
         f"Context:\n{shared_context[:4000]}"
     )
     try:
-        result = _call_llm_section(prompt, max_tokens=2048, section_name="metric view SQL repair")
+        result = _call_llm_section_for_model(
+            prompt,
+            max_tokens=2048,
+            section_name="metric view SQL repair",
+            model=model,
+        )
         repaired_sql = result.get(sql_key, "")
         if repaired_sql:
             return {**item, sql_key: repaired_sql}
@@ -624,10 +693,11 @@ def _repair_sql_validation_failure(
     kind: str,
     shared_context: str,
     reason: str,
+    model: str | None = None,
 ) -> dict | None:
     if _is_metric_view_measure_error(reason):
-        return _repair_metric_view_sql(item, kind, shared_context, reason)
-    return _repair_unbound_sql(item, kind, shared_context)
+        return _repair_metric_view_sql(item, kind, shared_context, reason, model=model)
+    return _repair_unbound_sql(item, kind, shared_context, model=model)
 
 
 def _validate_analytics_sql(plan: dict) -> list[str]:
@@ -716,7 +786,11 @@ def _extract_table_from_sql(sql_fragment: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _validate_benchmark_alignment(plan: dict, shared_context: str) -> list[str]:
+def _validate_benchmark_alignment(
+    plan: dict,
+    shared_context: str,
+    model: str | None = None,
+) -> list[str]:
     """Check that benchmark expected_sql is the most direct answer to the question.
 
     Uses an LLM to verify alignment — flags benchmarks where the SQL has unnecessary
@@ -731,7 +805,7 @@ def _validate_benchmark_alignment(plan: dict, shared_context: str) -> list[str]:
 
     with ThreadPoolExecutor(max_workers=_CONCURRENCY) as pool:
         futures = {
-            pool.submit(run_in_context(_check_benchmark_alignment, bm, shared_context)): i
+            pool.submit(run_in_context(_check_benchmark_alignment, bm, shared_context, model)): i
             for i, bm in enumerate(benchmarks)
         }
         for future in as_completed(futures):
@@ -756,7 +830,11 @@ def _validate_benchmark_alignment(plan: dict, shared_context: str) -> list[str]:
     return warnings
 
 
-def _check_benchmark_alignment(benchmark: dict, shared_context: str) -> dict | None:
+def _check_benchmark_alignment(
+    benchmark: dict,
+    shared_context: str,
+    model: str | None = None,
+) -> dict | None:
     """Check a single benchmark for question-SQL alignment."""
     question = benchmark.get("question", "")
     sql = benchmark.get("expected_sql", "")
@@ -780,13 +858,22 @@ def _check_benchmark_alignment(benchmark: dict, shared_context: str) -> dict | N
         "Return ONLY valid JSON."
     )
     try:
-        result = _call_llm_section(prompt, max_tokens=1024, section_name="benchmark alignment")
+        result = _call_llm_section_for_model(
+            prompt,
+            max_tokens=1024,
+            section_name="benchmark alignment",
+            model=model,
+        )
         return result
     except Exception:
         return None
 
 
-def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
+def _validate_plan_sqls(
+    plan: dict,
+    shared_context: str = "",
+    model: str | None = None,
+) -> list[str]:
     """Test all example_sqls and benchmark SQLs in parallel.
 
     Unbound-parameter failures get an LLM repair pass (example_sqls have
@@ -869,6 +956,7 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
                         kind,
                         shared_context,
                         repair_reasons.get((kind, idx), ""),
+                        model,
                     )
                 ): (kind, idx)
                 for kind, idx, item in repair_items

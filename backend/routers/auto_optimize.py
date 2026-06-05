@@ -16,6 +16,7 @@ from backend.routers._validators import RunId, SpaceId
 
 from backend.services.auth import get_workspace_client, get_service_principal_client, get_databricks_host
 from backend.services import gso_lakebase
+from backend.services.model_catalog import ModelValidationError, validate_chat_model
 from genie_space_optimizer.backend.utils import safe_int, safe_float, safe_finite, safe_json_parse
 from genie_space_optimizer.common.accuracy import (
     compute_run_scores,
@@ -81,6 +82,7 @@ class TriggerRequest(BaseModel):
     apply_mode: str = "genie_config"
     levers: list[int] | None = None
     deploy_target: str | None = None
+    llm_model: str | None = Field(None, max_length=256)
 
 
 # PermissionCheckResponse + SchemaAccessStatus now live in `backend.models`
@@ -242,13 +244,13 @@ def _select_iterations_delta(run_id: str) -> list[dict]:
         return _delta_query(f"SELECT {_ITER_COLS_LEGACY} FROM {table} {order}")
 
 
-def _build_gso_config() -> IntegrationConfig:
+def _build_gso_config(llm_model_override: str | None = None) -> IntegrationConfig:
     return IntegrationConfig(
         catalog=os.environ.get("GSO_CATALOG", ""),
         schema_name=os.environ.get("GSO_SCHEMA", "genie_space_optimizer"),
         warehouse_id=os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", ""),
         job_id=int(os.environ["GSO_JOB_ID"]) if os.environ.get("GSO_JOB_ID", "").isdigit() else None,
-        llm_model=os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
+        llm_model=llm_model_override or os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
     )
 
 
@@ -1010,7 +1012,14 @@ async def trigger(body: TriggerRequest, request: Request):
 
     ws = get_workspace_client()
     sp_ws = get_service_principal_client()
-    config = _build_gso_config()
+    selected_llm_model = (body.llm_model or "").strip() or None
+    if selected_llm_model:
+        try:
+            selected_llm_model = validate_chat_model(selected_llm_model, client=sp_ws)
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    config = _build_gso_config(llm_model_override=selected_llm_model)
 
     # Server-side gate: re-verify Prompt Registry is available under the same
     # identity (sp_ws) the job will use. The UI also checks via /permissions,
@@ -1550,7 +1559,7 @@ async def load_runs_with_fallback(space_id: str) -> list[dict]:
 
     return _delta_query(
         f"SELECT run_id, space_id, status, started_at, completed_at, "
-        f"best_accuracy, best_iteration, convergence_reason, triggered_by "
+        f"best_accuracy, best_iteration, convergence_reason, triggered_by, llm_model "
         f"FROM {_delta_table('genie_opt_runs')} "
         f"WHERE space_id = '{space_id}' ORDER BY started_at DESC"
     )

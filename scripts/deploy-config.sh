@@ -11,7 +11,7 @@
 #   GENIE_CATALOG            (required)  Unity Catalog name (must have CREATE SCHEMA permission)
 #   GENIE_APP_NAME           (optional)  Databricks App name          [default: genie-workbench]
 #   GENIE_DEPLOY_PROFILE     (optional)  Databricks CLI profile       [default: DEFAULT]
-#   GENIE_LLM_MODEL          (optional)  LLM serving endpoint         [default: databricks-claude-sonnet-4-6]
+#   GENIE_LLM_MODEL          (optional)  Default LLM serving endpoint [default: databricks-claude-sonnet-4-6]
 #   GENIE_LAKEBASE_INSTANCE  (optional)  Lakebase instance name       [default: none]
 #   GENIE_MLFLOW_EXPERIMENT_ID (optional) MLflow experiment ID for agent tracing [default: disabled]
 #
@@ -67,7 +67,7 @@ _print_config() {
     echo "  │  Catalog:      $CATALOG"
     echo "  │  GSO Schema:   ${CATALOG}.${GSO_SCHEMA}"
     echo "  │  Warehouse ID: $WAREHOUSE_ID"
-    echo "  │  LLM Model:    $LLM_MODEL"
+    echo "  │  Default LLM:  $LLM_MODEL"
     echo "  │  Lakebase:     $LAKEBASE_INSTANCE"
     echo "  │  MLflow:       ${MLFLOW_EXPERIMENT_ID:-<disabled>}"
     echo "  └─────────────────────────────────────────────────────────┘"

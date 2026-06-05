@@ -107,6 +107,13 @@ class CreateSpaceResponse(BaseModel):
     space_url: str
 
 
+class LLMModelInfo(BaseModel):
+    """Selectable chat model served by Databricks Model Serving."""
+    name: str
+    displayName: str
+    isDefault: bool = False
+
+
 # ── Auto-Optimize preflight permissions ──────────────────────────────────
 # Mirrored on the frontend as `GSOPermissionCheck` in `frontend/src/types/index.ts`.
 # Both halves must stay in sync — update together (see AGENTS.md §Models).

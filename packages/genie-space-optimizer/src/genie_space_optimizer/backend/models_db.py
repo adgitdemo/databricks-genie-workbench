@@ -27,6 +27,7 @@ class GSORunRecord(SQLModel, table=True):
     job_run_id: Optional[str] = Field(default=None, max_length=64)
     job_id: Optional[str] = Field(default=None, max_length=64)
     apply_mode: str = Field(default="genie_config", max_length=32)
+    llm_model: Optional[str] = Field(default=None, max_length=256)
     levers: Optional[str] = None  # JSON array
     best_iteration: Optional[int] = None
     best_accuracy: Optional[float] = None

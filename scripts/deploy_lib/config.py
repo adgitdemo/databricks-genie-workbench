@@ -91,8 +91,6 @@ class InstallConfig:
             errors.append("catalog is required")
         if not cfg.warehouse_id:
             errors.append("warehouse_id is required")
-        if not cfg.llm_model:
-            errors.append("llm_model is required")
         if cfg.lakebase_mode not in ("create", "existing", "skip"):
             errors.append("lakebase_mode must be one of: create, existing, skip")
         if cfg.lakebase_mode == "existing" and not cfg.lakebase_instance:

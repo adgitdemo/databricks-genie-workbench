@@ -134,6 +134,7 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
         (TABLE_RUNS, "labeling_session_name", "STRING COMMENT 'MLflow labeling session name for human review'"),
         (TABLE_RUNS, "labeling_session_run_id", "STRING COMMENT 'MLflow run ID associated with the labeling session'"),
         (TABLE_RUNS, "labeling_session_url", "STRING COMMENT 'URL to the MLflow Review App labeling session'"),
+        (TABLE_RUNS, "llm_model", "STRING COMMENT 'Databricks Model Serving endpoint selected for this optimization run'"),
         (TABLE_ITERATIONS, "reflection_json", "STRING COMMENT 'JSON: adaptive loop reflection entry for this iteration'"),
         (TABLE_DATA_ACCESS_GRANTS, "grant_type", "STRING DEFAULT 'read' COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'"),
         (TABLE_ITERATIONS, "evaluated_count", "INT COMMENT 'Denominator of overall_accuracy (total_questions minus runtime exclusions; see Bug #2 denominator contract)'"),
@@ -311,6 +312,7 @@ def create_run(
     experiment_id: str | None = None,
     config_snapshot: dict | None = None,
     triggered_by: str | None = None,
+    llm_model: str | None = None,
 ) -> None:
     """Insert a new row into ``genie_opt_runs`` with status QUEUED."""
     from genie_space_optimizer.common.config import DEFAULT_LEVER_ORDER, MAX_ITERATIONS
@@ -339,6 +341,8 @@ def create_run(
         row["config_snapshot"] = json.dumps(config_snapshot)
     if triggered_by is not None:
         row["triggered_by"] = triggered_by
+    if llm_model is not None:
+        row["llm_model"] = llm_model
 
     insert_row(spark, catalog, schema, TABLE_RUNS, row)
     logger.info("Created run %s for space %s", run_id, space_id)
@@ -419,6 +423,7 @@ def update_run_status(
     warehouse_id: str | None = None,
     human_corrections: list[dict] | None = None,
     max_benchmark_count: int | None = None,
+    llm_model: str | None = None,
     space_id: str | None = None,
 ) -> None:
     """Update ``genie_opt_runs`` — only sets non-None fields."""
@@ -463,6 +468,8 @@ def update_run_status(
         updates["human_corrections_json"] = json.dumps(human_corrections, default=str)
     if max_benchmark_count is not None:
         updates["max_benchmark_count"] = int(max_benchmark_count)
+    if llm_model is not None:
+        updates["llm_model"] = llm_model
 
     resolved_space_id = space_id or _lookup_run_space_id(spark, run_id, catalog, schema)
     keys: dict[str, Any] = {"run_id": run_id}

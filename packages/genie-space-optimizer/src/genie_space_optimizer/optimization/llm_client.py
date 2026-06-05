@@ -122,6 +122,10 @@ def call_llm(
 
     This is the low-level building block — callers are responsible for
     JSON parsing, prompt linking, span wrapping, etc.
+
+    ``temperature`` is accepted for backwards-compatible call sites but is
+    not sent to Databricks, because some supported reasoning/frontier
+    endpoints reject the parameter.
     """
     client = get_openai_client(w)
     model = get_llm_endpoint()
@@ -129,9 +133,9 @@ def call_llm(
     call_kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
         "timeout": eval_llm_timeout_seconds(),
     }
+    # Do not send temperature: Claude Opus 4.7/4.8 and some GPT 5.x endpoints reject it.
     if max_tokens is not None:
         call_kwargs["max_tokens"] = max_tokens
 

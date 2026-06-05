@@ -207,6 +207,10 @@ def _traced_llm_call(
     Returns ``(raw_text, response_object)`` for the caller to parse.
     Raises the last exception if all retries are exhausted.
 
+    ``temperature`` is accepted for backwards-compatible call sites but is
+    not sent to Databricks, because some supported reasoning/frontier
+    endpoints reject the parameter.
+
     ``response_validator`` (optional): a callable invoked with the
     trimmed completion text after each successful HTTP round-trip. If
     it raises, the exception is treated as a retryable failure (same
@@ -228,7 +232,8 @@ def _traced_llm_call(
         model = get_llm_endpoint()
         span.set_inputs({
             "model": model,
-            "temperature": temperature,
+            "temperature_requested": temperature,
+            "temperature_sent": False,
             "prompt_chars": len(prompt),
         })
 
@@ -251,8 +256,8 @@ def _traced_llm_call(
                 call_kwargs: dict[str, Any] = {
                     "model": model,
                     "messages": messages,
-                    "temperature": temperature,
                 }
+                # Do not send temperature: Claude Opus 4.7/4.8 and some GPT 5.x endpoints reject it.
                 if max_tokens is not None:
                     call_kwargs["max_tokens"] = max_tokens
 

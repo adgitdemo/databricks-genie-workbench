@@ -31,6 +31,7 @@ class AgentSession:
     selected_tables: list[str] = field(default_factory=list)
     feasibility_confirmed: bool = False
     continuation_count: int = 0
+    llm_model: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
     def add_message(self, role: str, content: str) -> None:
@@ -93,6 +94,7 @@ async def _ensure_table() -> None:
                     selected_schemas  JSONB NOT NULL DEFAULT '[]'::jsonb,
                     selected_tables   JSONB NOT NULL DEFAULT '[]'::jsonb,
                     feasibility_confirmed BOOLEAN NOT NULL DEFAULT false,
+                    llm_model    TEXT,
                     created_at   DOUBLE PRECISION NOT NULL,
                     last_active  DOUBLE PRECISION NOT NULL
                 )
@@ -107,6 +109,7 @@ async def _ensure_table() -> None:
                 "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS selected_schemas JSONB NOT NULL DEFAULT '[]'::jsonb",
                 "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS selected_tables JSONB NOT NULL DEFAULT '[]'::jsonb",
                 "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS feasibility_confirmed BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS llm_model TEXT",
             ]:
                 try:
                     await conn.execute(col_sql)
@@ -128,8 +131,8 @@ async def _persist(session: AgentSession) -> None:
                 INSERT INTO genie.agent_sessions
                     (session_id, history, space_config, space_id, space_url,
                      selected_catalogs, selected_schemas, selected_tables,
-                     feasibility_confirmed, created_at, last_active)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     feasibility_confirmed, llm_model, created_at, last_active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 ON CONFLICT (session_id) DO UPDATE SET
                     history      = EXCLUDED.history,
                     space_config = EXCLUDED.space_config,
@@ -139,6 +142,7 @@ async def _persist(session: AgentSession) -> None:
                     selected_schemas      = EXCLUDED.selected_schemas,
                     selected_tables       = EXCLUDED.selected_tables,
                     feasibility_confirmed = EXCLUDED.feasibility_confirmed,
+                    llm_model    = EXCLUDED.llm_model,
                     last_active  = EXCLUDED.last_active
             """,
                 session.session_id,
@@ -150,6 +154,7 @@ async def _persist(session: AgentSession) -> None:
                 json.dumps(session.selected_schemas),
                 json.dumps(session.selected_tables),
                 session.feasibility_confirmed,
+                session.llm_model,
                 session.created_at,
                 session.last_active,
             )
@@ -170,6 +175,11 @@ async def _load(session_id: str) -> AgentSession | None:
             )
         if row is None:
             return None
+        try:
+            llm_model = row["llm_model"]
+        except (KeyError, IndexError):
+            llm_model = None
+
         session = AgentSession(
             session_id=row["session_id"],
             history=json.loads(row["history"]),
@@ -182,6 +192,7 @@ async def _load(session_id: str) -> AgentSession | None:
             selected_schemas=json.loads(row["selected_schemas"]) if row["selected_schemas"] else [],
             selected_tables=json.loads(row["selected_tables"]) if row["selected_tables"] else [],
             feasibility_confirmed=row["feasibility_confirmed"] if row["feasibility_confirmed"] is not None else False,
+            llm_model=llm_model,
         )
         if session.is_expired():
             return None

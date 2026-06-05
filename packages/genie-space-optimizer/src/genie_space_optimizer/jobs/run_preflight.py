@@ -564,6 +564,7 @@ update_run_status(
     warehouse_id=warehouse_id,
     human_corrections=ctx_feedback["human_corrections"],
     max_benchmark_count=effective_max,
+    llm_model=llm_model or None,
 )
 _log(
     "Persisted handoff columns to genie_opt_runs",

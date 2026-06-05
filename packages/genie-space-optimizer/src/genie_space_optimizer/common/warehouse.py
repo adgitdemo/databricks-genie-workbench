@@ -82,6 +82,7 @@ def wh_create_run(
     triggered_by: str | None = None,
     experiment_name: str | None = None,
     config_snapshot: dict | None = None,
+    llm_model: str | None = None,
 ) -> None:
     """Insert a QUEUED run row via SQL warehouse."""
     from genie_space_optimizer.common.config import DEFAULT_LEVER_ORDER, MAX_ITERATIONS
@@ -90,16 +91,18 @@ def wh_create_run(
     levers_json = json.dumps(levers if levers is not None else DEFAULT_LEVER_ORDER)
     exp = (experiment_name or "").replace("'", "''")
     user = (triggered_by or "").replace("'", "''")
+    model_escaped = llm_model.replace("'", "''") if llm_model else ""
+    model_sql = f"'{model_escaped}'" if model_escaped else "NULL"
 
     sql = (
         f"INSERT INTO {catalog}.{schema}.genie_opt_runs "
         f"(run_id, space_id, domain, catalog, uc_schema, status, started_at, "
         f"max_iterations, levers, apply_mode, updated_at, "
-        f"experiment_name, triggered_by, config_snapshot) VALUES ("
+        f"experiment_name, triggered_by, config_snapshot, llm_model) VALUES ("
         f"'{run_id}', '{space_id}', '{domain}', '{catalog}', "
         f"'{catalog}.{schema}', 'QUEUED', current_timestamp(), "
         f"{MAX_ITERATIONS}, '{levers_json}', '{apply_mode}', current_timestamp(), "
-        f"'{exp}', '{user}', '{snap_json}')"
+        f"'{exp}', '{user}', '{snap_json}', {model_sql})"
     )
     sql_warehouse_execute(ws, warehouse_id, sql)
     logger.info("Created run %s via SQL warehouse", run_id)

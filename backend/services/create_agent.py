@@ -88,8 +88,11 @@ class CreateGenieAgent:
     """Conversational agent that guides users through Genie space creation."""
 
     def __init__(self):
-        self.model = get_llm_model()
         self._schema_content: str | None = None
+
+    @staticmethod
+    def _effective_model(session: AgentSession) -> str:
+        return session.llm_model or get_llm_model()
 
     def _get_schema_content(self) -> str:
         if self._schema_content is None:
@@ -196,7 +199,8 @@ class CreateGenieAgent:
             content_parts: list[str] = []
             tool_calls_acc: dict[int, dict] = {}
             tool_call_signaled = False
-            async for chunk in self._async_stream_llm(messages, tools=step_tool_defs):
+            effective_model = self._effective_model(session)
+            async for chunk in self._async_stream_llm(messages, tools=step_tool_defs, model=effective_model):
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
@@ -656,13 +660,13 @@ class CreateGenieAgent:
         for idx, msg in reversed(inserts):
             session.history.insert(idx, msg)
 
-    def _repair_config(self, config: dict, error_msg: str) -> dict | None:
+    def _repair_config(self, config: dict, error_msg: str, model: str | None = None) -> dict | None:
         """Use the LLM to repair a config that failed space creation.
 
         Sends the error message and the failing config section to the LLM,
         which returns a corrected config.  Returns None if repair fails.
         """
-        from backend.services.llm_utils import call_serving_endpoint, parse_json_from_llm_response, get_llm_model
+        from backend.services.llm_utils import call_serving_endpoint, parse_json_from_llm_response
         try:
             # Send both sections — use a generous limit so the LLM sees the full config
             repair_context = {
@@ -683,7 +687,7 @@ class CreateGenieAgent:
             )
             response = call_serving_endpoint(
                 [{"role": "user", "content": prompt}],
-                model=get_llm_model(),
+                model=model or get_llm_model(),
                 max_tokens=16000,
             )
             repaired = parse_json_from_llm_response(response)
@@ -827,7 +831,10 @@ class CreateGenieAgent:
             if "Invalid" in err or "configuration" in err.lower() or "proto" in err.lower():
                 yield {"event": "thinking", "data": {"message": "Config rejected by API — repairing automatically...", "step": "create", "round": 0}}
 
-                fixed = await loop.run_in_executor(None, run_in_context(self._repair_config, config, err))
+                fixed = await loop.run_in_executor(
+                    None,
+                    run_in_context(self._repair_config, config, err, self._effective_model(session)),
+                )
                 if fixed:
                     config = fixed
                     session.space_config = config
@@ -951,7 +958,12 @@ class CreateGenieAgent:
     _MAX_LLM_RETRIES = 4
     _RETRY_BACKOFF_BASE = 2  # seconds
 
-    def _stream_llm(self, messages: list[dict], tools: list[dict] | None = None) -> Generator[dict, None, None]:
+    def _stream_llm(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+    ) -> Generator[dict, None, None]:
         """Stream LLM response chunks from the serving endpoint (sync).
 
         Uses the SDK's pre-authenticated requests.Session so auth works
@@ -972,8 +984,9 @@ class CreateGenieAgent:
         if effective_tools:
             body["tools"] = effective_tools
 
-        url = f"{host}/serving-endpoints/{self.model}/invocations"
-        logger.info("Streaming LLM call to %s with %d messages", self.model, len(messages))
+        effective_model = model or get_llm_model()
+        url = f"{host}/serving-endpoints/{effective_model}/invocations"
+        logger.info("Streaming LLM call to %s with %d messages", effective_model, len(messages))
         if logger.isEnabledFor(logging.DEBUG):
             for i, m in enumerate(messages):
                 role = m.get("role", "?")
@@ -1023,7 +1036,12 @@ class CreateGenieAgent:
         finally:
             resp.close()
 
-    async def _async_stream_llm(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncGenerator[dict, None]:
+    async def _async_stream_llm(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Async wrapper that bridges the sync streaming generator to async.
 
         Captures context once and reuses across all iterations (can't use
@@ -1032,7 +1050,7 @@ class CreateGenieAgent:
         import contextvars as _cv
         loop = asyncio.get_event_loop()
         ctx = _cv.copy_context()
-        gen = self._stream_llm(messages, tools=tools)
+        gen = self._stream_llm(messages, tools=tools, model=model)
         _sentinel = object()
 
         while True:
@@ -1180,7 +1198,12 @@ class CreateGenieAgent:
             len(tables_context), len(inspection_summaries), len(user_requirements),
         )
 
-        raw_plan = plan_builder.generate_plan(tables_context, inspection_summaries, user_requirements)
+        raw_plan = plan_builder.generate_plan(
+            tables_context,
+            inspection_summaries,
+            user_requirements,
+            model=session.llm_model,
+        )
 
         if "error" in raw_plan and "tables" not in raw_plan:
             return raw_plan

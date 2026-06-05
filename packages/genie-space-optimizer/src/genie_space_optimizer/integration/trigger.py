@@ -209,6 +209,7 @@ def trigger_optimization(
         triggered_by=caller_email,
         experiment_name=experiment_name,
         config_snapshot=space_snapshot if space_snapshot else None,
+        llm_model=config.llm_model or None,
     )
 
     from genie_space_optimizer.backend.job_launcher import submit_optimization

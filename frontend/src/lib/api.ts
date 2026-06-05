@@ -4,6 +4,7 @@
 
 import type {
   AppSettings,
+  LLMModelInfo,
   FetchSpaceResponse,
   SpaceDetailResponse,
   SpaceListItem,
@@ -176,6 +177,10 @@ export async function parseSpaceJson(
  */
 export async function getSettings(): Promise<AppSettings> {
   return fetchWithTimeout<AppSettings>(`${API_BASE}/settings`, {}, DEFAULT_TIMEOUT)
+}
+
+export async function getModels(): Promise<LLMModelInfo[]> {
+  return fetchWithTimeout<LLMModelInfo[]>(`${API_BASE}/models`, {}, DEFAULT_TIMEOUT)
 }
 
 // ===== GenieIQ / Workbench API =====
@@ -374,6 +379,7 @@ export function streamAgentChat(
   selections: Record<string, unknown> | null,
   callbacks: AgentChatCallbacks,
   spaceId?: string | null,
+  model?: string | null,
 ): () => void {
   const abortController = new AbortController()
 
@@ -383,6 +389,7 @@ export function streamAgentChat(
     selections,
   }
   if (spaceId) body.space_id = spaceId
+  if (model) body.model = model
 
   fetch(`${API_BASE}/create/agent/chat`, {
     method: "POST",

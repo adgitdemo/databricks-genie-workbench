@@ -42,6 +42,7 @@ import remarkGfm from "remark-gfm"
 import { streamAgentChat, fetchCreatePreflight } from "@/lib/api"
 import type { AgentChatMessage, AgentUIElement } from "@/types"
 import { TableBrowserDrawer } from "@/components/TableBrowserDrawer"
+import { ChatModelMenu } from "@/components/ModelPicker"
 import { Tooltip } from "@/components/ui/tooltip"
 interface CreateAgentChatProps {
   onCreated: (spaceId: string, displayName: string, spaceUrl?: string, initialTab?: string) => void
@@ -231,6 +232,7 @@ interface PersistedState {
   usedElements: string[]
   panelOpen: boolean
   editedPlan?: EditablePlan | null
+  selectedModel?: string | null
 }
 
 function saveState(s: PersistedState) {
@@ -382,6 +384,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
   const [fixResult, setFixResult] = useState<{ spaceId: string; url: string } | null>(null)
   const queuedMessageRef = useRef<string | null>(null)
   const [preflight, setPreflight] = useState<{ warehouses_available: boolean; obo_enabled: boolean; app_name: string } | null>(null)
+  const [selectedModel, setSelectedModel] = useState<string | null>(restored.current?.selectedModel ?? null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -409,8 +412,9 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
       usedElements: Array.from(usedElements),
       panelOpen,
       editedPlan,
+      selectedModel,
     })
-  }, [messages, sessionId, progress, usedElements, panelOpen, editedPlan])
+  }, [messages, sessionId, progress, usedElements, panelOpen, editedPlan, selectedModel])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -461,6 +465,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
     fixModeRef.current = false
     setFixStep(0)
     setFixResult(null)
+    setSelectedModel(null)
     sessionStorage.removeItem(STORAGE_KEY)
   }
 
@@ -853,9 +858,9 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             requestAnimationFrame(() => sendMessage(pending))
           }
         },
-      }, spaceIdForRequest)
+      }, spaceIdForRequest, selectedModel)
     },
-    [sessionId, isStreaming],
+    [sessionId, isStreaming, selectedModel],
   )
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -3057,7 +3062,10 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="relative">
+        <form
+          onSubmit={handleSubmit}
+          className="rounded-xl border border-default bg-surface shadow-sm transition-all focus-within:border-accent/50 focus-within:ring-2 focus-within:ring-accent/20"
+        >
           <textarea
             ref={inputRef}
             value={input}
@@ -3071,7 +3079,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
                 : "Describe your Genie space or answer a question..."
             }
             rows={1}
-            className="w-full border border-default rounded-xl pl-4 pr-11 py-2.5 text-sm bg-surface text-primary resize-none focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent/50 transition-all"
+            className="block w-full resize-none rounded-t-xl bg-transparent px-4 pb-2 pt-3 text-sm text-primary placeholder:text-muted focus:outline-none"
             style={{ minHeight: "40px", maxHeight: "120px" }}
             onInput={(e) => {
               const target = e.target as HTMLTextAreaElement
@@ -3079,23 +3087,32 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
               target.style.height = Math.min(target.scrollHeight, 120) + "px"
             }}
           />
-          {isStreaming ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center w-7 h-7 rounded-lg border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors"
-            >
-              <div className="w-2.5 h-2.5 rounded-sm bg-red-400" />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={!input.trim()}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center w-7 h-7 rounded-lg bg-accent text-white disabled:opacity-30 hover:bg-accent/90 transition-colors"
-            >
-              <Send className="w-3.5 h-3.5" />
-            </button>
-          )}
+          <div className="flex items-center justify-end gap-2 px-2.5 pb-2">
+            <ChatModelMenu
+              value={selectedModel}
+              onChange={setSelectedModel}
+              disabled={isStreaming}
+            />
+            {isStreaming ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-red-500/30 text-red-400 transition-colors hover:bg-red-500/10"
+                aria-label="Stop streaming"
+              >
+                <div className="h-2.5 w-2.5 rounded-sm bg-red-400" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-accent text-white transition-colors hover:bg-accent/90 disabled:opacity-30"
+                aria-label="Send message"
+              >
+                <Send className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </form>
       </div>
 

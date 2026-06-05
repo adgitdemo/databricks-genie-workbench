@@ -25,6 +25,12 @@ export interface AppSettings {
   workspace_directory: string | null
 }
 
+export interface LLMModelInfo {
+  name: string
+  displayName: string
+  isDefault: boolean
+}
+
 // Space fetch/detail response types
 export interface FetchSpaceResponse {
   genie_space_id: string
@@ -265,6 +271,7 @@ export interface GSOTriggerRequest {
   apply_mode?: "genie_config" | "uc_artifact" | "both"
   levers?: number[]
   deploy_target?: string
+  llm_model?: string | null
 }
 
 export interface GSOTriggerResponse {
@@ -313,6 +320,7 @@ export interface GSORunSummary {
   best_iteration: number | null
   convergence_reason: string | null
   triggered_by: string | null
+  llm_model?: string | null
 }
 
 export interface GSOPipelineStep {
