@@ -121,10 +121,38 @@ def normalize_metric_view_sources(space_data: dict, client=None) -> dict:
     return space_data
 
 
-def _is_scope_error(e: Exception) -> bool:
+def is_scope_error(e: Exception) -> bool:
     """Check if exception is a missing OAuth scope error."""
     msg = str(e).lower()
     return "scope" in msg or "insufficient_scope" in msg
+
+
+def call_with_sp_fallback(fn, *, what: str = "genie API call"):
+    """Run ``fn(client)`` with the OBO/workspace client; on an OAuth scope error,
+    retry once with the service principal client.
+
+    Some Genie Conversation API endpoints (e.g. permissions, message comments)
+    are not covered by the app's ``dashboards.genie`` user_api_scope, so a
+    correctly-deployed app can still get ``insufficient_scope`` on those calls.
+    The SP fallback keeps those reads working. We log a WARNING when it fires so
+    a genuine scope/deploy misconfiguration stays visible (the request then runs
+    under the SP identity rather than the user's own permissions).
+    """
+    client = get_workspace_client()
+    try:
+        return fn(client)
+    except Exception as e:
+        if is_scope_error(e):
+            sp_client = get_service_principal_client()
+            if sp_client is not client:
+                logger.warning(
+                    "%s: OBO token lacks required scope; falling back to the "
+                    "service principal (runs under SP identity, not the user's). "
+                    "Verify the app's user_api_scopes if this is unexpected.",
+                    what,
+                )
+                return fn(sp_client)
+        raise
 
 
 def get_genie_space(
@@ -162,7 +190,7 @@ def get_genie_space(
     try:
         return _get_space_with_client(client, genie_space_id)
     except Exception as e:
-        if _is_scope_error(e):
+        if is_scope_error(e):
             logger.info("OBO token lacks genie scope, retrying with service principal")
             sp_client = get_service_principal_client()
             if sp_client is not client:
@@ -187,16 +215,7 @@ def list_genie_spaces() -> list[dict]:
     Returns list of dicts with: id, display_name, description, create_time, update_time
     Raises an Exception on failure (callers should handle as appropriate).
     """
-    client = get_workspace_client()
-    try:
-        return _list_spaces_with_client(client)
-    except Exception as e:
-        if _is_scope_error(e):
-            logger.info("OBO token lacks genie scope, retrying with service principal")
-            sp_client = get_service_principal_client()
-            if sp_client is not client:
-                return _list_spaces_with_client(sp_client)
-        raise
+    return call_with_sp_fallback(_list_spaces_with_client, what="list_genie_spaces")
 
 
 def _list_spaces_with_client(client) -> list[dict]:

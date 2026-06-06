@@ -9,12 +9,23 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_RE = re.compile(
+    r"\bDEFAULT\s+(?:'[^']*'|[A-Za-z0-9_\-.+]+)",
+    re.IGNORECASE,
+)
+
+_REQUIRED_RUN_COLUMNS = (
+    "job_id",
+    "llm_model",
+)
 
 
 def sql_warehouse_query(
@@ -66,6 +77,183 @@ def sql_warehouse_execute(
         if resp.status.error:
             error_msg = resp.status.error.message or str(resp.status.error)
         raise RuntimeError(f"SQL warehouse execute failed: {error_msg}")
+
+
+def _column_names_from_describe(df: Any) -> set[str]:
+    if getattr(df, "empty", True) or "col_name" not in getattr(df, "columns", []):
+        return set()
+
+    names: set[str] = set()
+    for raw in df["col_name"].tolist():
+        if raw is None:
+            continue
+        name = str(raw).strip()
+        if not name or name.startswith("#"):
+            continue
+        names.add(name.lower())
+    return names
+
+
+def _strip_inline_default(col_def: str) -> tuple[str, str | None]:
+    default_match = _DEFAULT_RE.search(col_def)
+    if not default_match:
+        return col_def, None
+    return _DEFAULT_RE.sub("", col_def).strip(), default_match.group()
+
+
+def _wh_apply_one_migration(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    *,
+    fqn: str,
+    col: str,
+    col_def: str,
+) -> None:
+    add_def, default_clause = _strip_inline_default(col_def)
+    try:
+        sql_warehouse_execute(
+            ws,
+            warehouse_id,
+            f"ALTER TABLE {fqn} ADD COLUMN {col} {add_def}",
+        )
+        logger.info("Added missing Delta column %s.%s via SQL warehouse", fqn, col)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already exists" in msg:
+            return
+        logger.error("Could not ADD COLUMN %s.%s via SQL warehouse: %s", fqn, col, exc)
+        return
+
+    if default_clause:
+        try:
+            sql_warehouse_execute(
+                ws,
+                warehouse_id,
+                f"ALTER TABLE {fqn} ALTER COLUMN {col} SET {default_clause}",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Column %s.%s was added, but SET DEFAULT was rejected "
+                "(writers set explicit values): %s",
+                fqn,
+                col,
+                exc,
+            )
+
+
+def _wh_describe_columns(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    fqn: str,
+) -> set[str]:
+    df = sql_warehouse_query(ws, warehouse_id, f"DESCRIBE TABLE {fqn}")
+    return _column_names_from_describe(df)
+
+
+def _wh_verify_required_run_columns(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+) -> None:
+    fqn = f"{catalog}.{schema}.genie_opt_runs"
+    try:
+        present = _wh_describe_columns(ws, warehouse_id, fqn)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not verify required columns on {fqn}: {exc}"
+        ) from exc
+
+    missing = [col for col in _REQUIRED_RUN_COLUMNS if col.lower() not in present]
+    if missing:
+        raise RuntimeError(
+            f"{fqn} is missing columns required to launch optimization runs: "
+            f"{', '.join(missing)}. Run the GSO table migration or grant the "
+            "app service principal permission to ALTER the table."
+        )
+
+
+def wh_ensure_optimization_tables(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+) -> None:
+    """Create and migrate GSO Delta state tables via SQL Warehouse.
+
+    The Databricks App trigger path is warehouse-first because Spark Connect can
+    lose credentials in Apps. Keep this path in lockstep with the Spark
+    bootstrapper so newly added columns exist before ``wh_create_run`` inserts.
+    """
+    from genie_space_optimizer.optimization.ddl import (
+        ADDITIVE_COLUMN_MIGRATIONS,
+        _ALL_DDL,
+    )
+
+    try:
+        sql_warehouse_execute(
+            ws,
+            warehouse_id,
+            f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}",
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "PERMISSION_DENIED" in msg or "ACCESS_DENIED" in msg:
+            logger.warning(
+                "Cannot CREATE SCHEMA %s.%s via SQL warehouse; assuming it "
+                "already exists and continuing with table initialization.",
+                catalog,
+                schema,
+            )
+        else:
+            raise
+
+    for name, ddl in _ALL_DDL.items():
+        resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
+        try:
+            sql_warehouse_execute(ws, warehouse_id, resolved)
+            logger.info("Ensured GSO table %s.%s.%s via SQL warehouse", catalog, schema, name)
+        except Exception as exc:
+            msg = str(exc)
+            if "PERMISSION_DENIED" in msg or "ACCESS_DENIED" in msg:
+                logger.warning(
+                    "Cannot create table %s.%s.%s via SQL warehouse; it may "
+                    "already exist or the principal may lack CREATE_TABLE.",
+                    catalog,
+                    schema,
+                    name,
+                )
+            elif "SCHEMA_NOT_FOUND" in msg:
+                raise RuntimeError(
+                    f"Schema {catalog}.{schema} does not exist and could not be created."
+                ) from exc
+            else:
+                raise
+
+    for table, col, col_def in ADDITIVE_COLUMN_MIGRATIONS:
+        fqn = f"{catalog}.{schema}.{table}"
+        try:
+            existing = _wh_describe_columns(ws, warehouse_id, fqn)
+        except Exception:
+            logger.warning(
+                "Could not DESCRIBE %s via SQL warehouse while checking migrations",
+                fqn,
+                exc_info=True,
+            )
+            continue
+
+        if col.lower() in existing:
+            continue
+
+        _wh_apply_one_migration(
+            ws,
+            warehouse_id,
+            fqn=fqn,
+            col=col,
+            col_def=col_def,
+        )
+
+    _wh_verify_required_run_columns(ws, warehouse_id, catalog, schema)
 
 
 def wh_create_run(

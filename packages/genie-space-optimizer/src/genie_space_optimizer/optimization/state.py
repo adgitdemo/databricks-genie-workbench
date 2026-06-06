@@ -39,6 +39,7 @@ from genie_space_optimizer.common.delta_helpers import (
     update_row,
 )
 from genie_space_optimizer.optimization.ddl import (
+    ADDITIVE_COLUMN_MIGRATIONS,
     TABLE_DATA_ACCESS_GRANTS,
     TABLE_GT_CORRECTION_CANDIDATES,
     TABLE_HUMAN_REQUIRED,
@@ -127,38 +128,7 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
     """Add columns introduced after initial DDL (safe to run repeatedly)."""
     _try_enable_column_defaults(spark, _fqn(catalog, schema, TABLE_ITERATIONS))
 
-    migrations = [
-        (TABLE_RUNS, "job_id", "STRING COMMENT 'Databricks Job definition ID'"),
-        (TABLE_PATCHES, "provenance_json", "STRING COMMENT 'JSON: full provenance chain from judge verdicts to this patch'"),
-        (TABLE_ASI, "mlflow_run_id", "STRING COMMENT 'MLflow run ID from the evaluation that produced this ASI row'"),
-        (TABLE_RUNS, "labeling_session_name", "STRING COMMENT 'MLflow labeling session name for human review'"),
-        (TABLE_RUNS, "labeling_session_run_id", "STRING COMMENT 'MLflow run ID associated with the labeling session'"),
-        (TABLE_RUNS, "labeling_session_url", "STRING COMMENT 'URL to the MLflow Review App labeling session'"),
-        (TABLE_RUNS, "llm_model", "STRING COMMENT 'Databricks Model Serving endpoint selected for this optimization run'"),
-        (TABLE_ITERATIONS, "reflection_json", "STRING COMMENT 'JSON: adaptive loop reflection entry for this iteration'"),
-        (TABLE_DATA_ACCESS_GRANTS, "grant_type", "STRING DEFAULT 'read' COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'"),
-        (TABLE_ITERATIONS, "evaluated_count", "INT COMMENT 'Denominator of overall_accuracy (total_questions minus runtime exclusions; see Bug #2 denominator contract)'"),
-        (TABLE_ITERATIONS, "excluded_count", "INT COMMENT 'Number of rows removed from the denominator at runtime (ground-truth excluded, both empty, Genie unavailable, temporally stale, etc.)'"),
-        (TABLE_ITERATIONS, "quarantined_benchmarks_json", "STRING COMMENT 'JSON: array of benchmarks removed by pre-evaluation quarantine ({question_id, reason_code, reason_detail, question})'"),
-        (TABLE_ITERATIONS, "leakage_count_by_type", "STRING COMMENT 'JSON MAP<STRING,BIGINT>: Bug #4 - persisted leak count grouped by patch_type, measured by post-apply audit'"),
-        (TABLE_ITERATIONS, "firewall_rejection_count_by_type", "STRING COMMENT 'JSON MAP<STRING,BIGINT>: Bug #4 - firewall rejections during this iteration grouped by patch_type'"),
-        (TABLE_ITERATIONS, "secondary_mining_blocked", "BIGINT COMMENT 'Bug #4 - count of times the _resolve_lever5_llm_result secondary mining path was blocked this iteration'"),
-        (TABLE_ITERATIONS, "synthesis_slots_persisted", "BIGINT COMMENT 'Bug #4 (Phase 3) - structurally-synthesized example_sqls persisted this iteration'"),
-        (TABLE_ITERATIONS, "arbiter_rejection_count", "BIGINT COMMENT 'Bug #4 (Phase 3) - synthesis proposals rejected by the arbiter gate this iteration'"),
-        (TABLE_ITERATIONS, "cluster_fallback_to_instruction_count", "BIGINT COMMENT 'Bug #4 (Phase 3) - clusters that fell back to instruction-only after synthesis failed repeatedly'"),
-        (TABLE_ITERATIONS, "synthesis_archetype_distribution", "STRING COMMENT 'JSON MAP<STRING,BIGINT>: Bug #4 (Phase 3) - count of persisted synthesized example_sqls per archetype this iteration'"),
-        (TABLE_ITERATIONS, "rolled_back", "BOOLEAN DEFAULT false COMMENT 'Tier 1.1: true if this iteration was rolled back by the accept/rollback gate. Readers that represent current state must filter this out (see _get_baseline_and_best_accuracy, promote_best_model, load_latest_full_iteration).'"),
-        (TABLE_ITERATIONS, "rolled_back_at", "TIMESTAMP COMMENT 'Tier 1.1: timestamp of rollback'"),
-        (TABLE_ITERATIONS, "rollback_reason", "STRING COMMENT 'Tier 1.1: human-readable rollback reason (mirrors genie_opt_patches.rollback_reason)'"),
-        (TABLE_ITERATIONS, "both_correct_count", "INT COMMENT 'Tier 1.7: count of rows with arbiter verdict == both_correct. Used to anchor best_accuracy to both_correct_rate when rc=yes overrides inflate overall_accuracy.'"),
-        (TABLE_ITERATIONS, "both_correct_rate", "DOUBLE COMMENT 'Tier 1.7: both_correct_count / evaluated_count * 100. Stricter than overall_accuracy (which counts arbiter override rows as correct). Lever loop anchors acceptance to this to avoid ghost-ceiling rejections.'"),
-        (TABLE_PATCHES, "applied_patch_type", "STRING COMMENT 'T2.13: actual patch_type that was applied after any applier-side transformations (e.g. update_instruction_section emitted by the rewrite_instruction downgrade splitter). May differ from patch_type (the proposal type).'"),
-        (TABLE_PATCHES, "applied_patch_detail", "STRING COMMENT 'T2.13: human-readable detail describing the applied transformation (e.g. section_name for update_instruction_section, or a note when a rewrite_instruction was split into children).'"),
-        (TABLE_RUNS, "warehouse_id", "STRING COMMENT 'SQL warehouse ID resolved at preflight; Delta-fallback for the preflight.warehouse_id taskValue'"),
-        (TABLE_RUNS, "human_corrections_json", "STRING COMMENT 'JSON array of carry-forward human corrections; Delta-fallback for the preflight.human_corrections taskValue'"),
-        (TABLE_RUNS, "max_benchmark_count", "INT COMMENT 'Effective max benchmark count; Delta-fallback for the preflight.max_benchmark_count taskValue'"),
-    ]
-    for table, col, col_def in migrations:
+    for table, col, col_def in ADDITIVE_COLUMN_MIGRATIONS:
         fqn = _fqn(catalog, schema, table)
         try:
             existing = {

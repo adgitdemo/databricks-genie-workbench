@@ -18,6 +18,7 @@ sync:
   include:
     - .build
     - .build/**
+    - dashboards/**
     - packages/genie-space-optimizer/src/genie_space_optimizer/jobs
     - packages/genie-space-optimizer/src/genie_space_optimizer/jobs/**
     - packages/genie-space-optimizer/src/genie_space_optimizer/_metadata.py

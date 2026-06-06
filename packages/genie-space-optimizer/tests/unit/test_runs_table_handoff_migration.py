@@ -5,6 +5,8 @@ recovered from Delta when taskValues do not propagate on Repair Run.
 """
 from unittest.mock import MagicMock
 
+import pandas as pd
+
 from genie_space_optimizer.optimization.ddl import _GENIE_OPT_RUNS_DDL
 from genie_space_optimizer.optimization.state import _migrate_add_columns
 
@@ -62,4 +64,60 @@ def test_migration_idempotent_when_columns_already_exist():
     assert handoff_alters == [], (
         f"expected zero handoff ALTERs when columns already exist, got: "
         f"{handoff_alters}"
+    )
+
+
+def test_warehouse_ensure_adds_llm_model_when_runs_table_is_old(monkeypatch):
+    """Warehouse-first trigger must migrate old run tables before INSERT."""
+    from genie_space_optimizer.common import warehouse
+
+    ws = MagicMock()
+    warehouse_id = "wh"
+    executed: list[str] = []
+    columns_by_table: dict[str, set[str]] = {
+        "test_catalog.test_schema.genie_opt_runs": {
+            "run_id",
+            "space_id",
+            "domain",
+            "catalog",
+            "uc_schema",
+            "status",
+            "started_at",
+            "job_run_id",
+            "max_iterations",
+            "levers",
+            "apply_mode",
+            "experiment_name",
+            "triggered_by",
+            "config_snapshot",
+            "updated_at",
+        }
+    }
+
+    def fake_execute(_ws, _warehouse_id, sql):
+        executed.append(sql)
+        parts = sql.split()
+        if parts[:5] == ["ALTER", "TABLE", parts[2], "ADD", "COLUMN"]:
+            columns_by_table.setdefault(parts[2], set()).add(parts[5].lower())
+
+    def fake_query(_ws, _warehouse_id, sql):
+        fqn = sql.split()[-1]
+        return pd.DataFrame(
+            [{"col_name": col} for col in sorted(columns_by_table.get(fqn, set()))]
+        )
+
+    monkeypatch.setattr(warehouse, "sql_warehouse_execute", fake_execute)
+    monkeypatch.setattr(warehouse, "sql_warehouse_query", fake_query)
+
+    warehouse.wh_ensure_optimization_tables(
+        ws,
+        warehouse_id,
+        "test_catalog",
+        "test_schema",
+    )
+
+    assert "llm_model" in columns_by_table["test_catalog.test_schema.genie_opt_runs"]
+    assert any(
+        "ALTER TABLE test_catalog.test_schema.genie_opt_runs ADD COLUMN llm_model" in sql
+        for sql in executed
     )

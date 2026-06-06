@@ -11,7 +11,7 @@ import json
 from backend.routers._validators import SpaceId
 
 from backend.services.auth import get_workspace_client, get_service_principal_client
-from backend.services.genie_client import list_genie_spaces, _is_scope_error
+from backend.services.genie_client import list_genie_spaces, is_scope_error
 from backend.services.lakebase import (
     get_latest_score,
     get_latest_scores_batch,
@@ -133,7 +133,7 @@ async def get_space_detail(space_id: SpaceId) -> dict:
                 path=f"/api/2.0/genie/spaces/{space_id}",
             )
         except Exception as e:
-            if _is_scope_error(e):
+            if is_scope_error(e):
                 logger.info("OBO token lacks genie scope, retrying with service principal")
                 sp_client = get_service_principal_client()
                 if sp_client is not client:

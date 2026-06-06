@@ -53,6 +53,7 @@ from genie_space_optimizer.common.warehouse import (
     sql_warehouse_execute as _sql_warehouse_execute,
     sql_warehouse_query as _sql_warehouse_query,
     wh_create_run as _wh_create_run,
+    wh_ensure_optimization_tables as _wh_ensure_optimization_tables,
 )
 
 
@@ -791,6 +792,12 @@ def do_start_optimization(
                     )
                     use_warehouse_fallback = True
                     spark = get_spark()
+                    _wh_ensure_optimization_tables(
+                        sp_ws,
+                        config.warehouse_id,
+                        config.catalog,
+                        config.schema_name,
+                    )
                     runs_df = _sql_warehouse_query(
                         ws,
                         config.warehouse_id,

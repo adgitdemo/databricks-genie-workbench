@@ -22,6 +22,26 @@ SP_SCHEMA_PRIVILEGES = {
     "MANAGE",
 }
 
+# GenieWatch (observability) system-table SELECTs the app SP needs to power
+# cost / usage / feedback / lineage reads under /api/watch/*. This is the single
+# source of truth for both install paths — `scripts/grant_permissions.py` (CLI)
+# imports this list. Best-effort: only a workspace admin can issue these, so
+# failures degrade to a warning rather than blocking install.
+WATCH_SYSTEM_GRANTS: list[tuple[str, str, str]] = [
+    # (securable_type, fully_qualified_name, privilege)
+    ("CATALOG", "system",                         "USE_CATALOG"),
+    ("SCHEMA",  "system.query",                   "USE_SCHEMA"),
+    ("SCHEMA",  "system.billing",                 "USE_SCHEMA"),
+    ("SCHEMA",  "system.access",                  "USE_SCHEMA"),
+    ("TABLE",   "system.query.history",           "SELECT"),
+    ("TABLE",   "system.billing.usage",           "SELECT"),
+    ("TABLE",   "system.billing.list_prices",     "SELECT"),
+    ("TABLE",   "system.access.audit",            "SELECT"),
+    ("TABLE",   "system.access.table_lineage",    "SELECT"),
+    # workspaces_latest is optional / newer; absence is handled in code.
+    ("TABLE",   "system.access.workspaces_latest", "SELECT"),
+]
+
 
 def api_do(w, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     return w.api_client.do(method=method, path=path, body=body)
@@ -193,11 +213,37 @@ def verify_required_privileges(w, catalog: str, schema: str, principal: str) -> 
     }
 
 
+def grant_watch_system_tables(w, principal: str) -> list[str]:
+    """Grant SELECTs on `system.*` to the app SP so /api/watch/* SQL can run.
+
+    Mirrors the CLI path (`scripts/grant_permissions.py::_grant_watch_system_tables`)
+    using the same WATCH_SYSTEM_GRANTS list. Idempotent and best-effort: each
+    grant that fails (missing table, or the deployer lacks admin) is recorded and
+    returned, but does not block install. Returns the list of failures.
+    """
+    failures: list[str] = []
+    for securable_type, full_name, privilege in WATCH_SYSTEM_GRANTS:
+        try:
+            update_grants(
+                w,
+                securable_type=securable_type.lower(),
+                full_name=full_name,
+                principal=principal,
+                add=[privilege],
+            )
+        except Exception as exc:
+            failures.append(f"{securable_type} {full_name}: {str(exc).splitlines()[-1]}")
+    return failures
+
+
 def ensure_uc_objects_and_grants(w, cfg: InstallConfig, app_sp_client_id: str) -> dict[str, Any]:
     ensure_schema(w, cfg.catalog, cfg.gso_schema, cfg.warehouse_id)
     ensure_volume(w, cfg.catalog, cfg.gso_schema, cfg.warehouse_id)
     ensure_tables(w, cfg.catalog, cfg.gso_schema, cfg.warehouse_id)
     grant_schema_privileges(w, cfg.catalog, cfg.gso_schema, app_sp_client_id)
     grant_volume_privileges(w, cfg.catalog, cfg.gso_schema, app_sp_client_id)
-    return verify_required_privileges(w, cfg.catalog, cfg.gso_schema, app_sp_client_id)
+    watch_grant_failures = grant_watch_system_tables(w, app_sp_client_id)
+    verification = verify_required_privileges(w, cfg.catalog, cfg.gso_schema, app_sp_client_id)
+    verification["watch_system_table_grant_failures"] = watch_grant_failures
+    return verification
 
