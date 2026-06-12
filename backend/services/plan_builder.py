@@ -35,11 +35,23 @@ _CONCURRENCY = 3
 # Higher parallelism than plan generation since each task is a SQL warehouse call.
 _VALIDATION_CONCURRENCY = 8
 
+_METRIC_VIEW_SQL_RULES = """\
+## Metric View SQL Rules
+When querying a Databricks metric view:
+- Explicitly select dimensions and measures; never use SELECT *.
+- Wrap every metric-view measure column in MEASURE(), for example MEASURE(`Net Sales`) AS net_sales.
+- Group by selected dimensions using GROUP BY ALL or an explicit GROUP BY dimension list.
+- Do not join a metric view directly to another table. Query the metric view in a CTE first, then join the CTE result.
+"""
+
+_METRIC_VIEW_MEASURE_ERROR = "METRIC_VIEW_MISSING_MEASURE_FUNCTION"
+
 
 def generate_plan(
     tables_context: list[dict],
     inspection_summaries: dict[str, Any],
     user_requirements: str,
+    model: str | None = None,
 ) -> dict:
     """Generate a complete Genie Space plan via parallel LLM calls.
 
@@ -55,11 +67,11 @@ def generate_plan(
     shared_context = _build_shared_context(tables_context, inspection_summaries, user_requirements)
 
     section_specs: list[tuple[str, callable, dict]] = [
-        ("tables", _gen_tables, {"shared": shared_context, "tables_context": tables_context}),
-        ("questions", _gen_questions_instructions, {"shared": shared_context}),
-        ("example_sqls", _gen_example_sqls, {"shared": shared_context}),
-        ("benchmarks", _gen_benchmarks, {"shared": shared_context}),
-        ("analytics", _gen_analytics, {"shared": shared_context}),
+        ("tables", _gen_tables, {"shared": shared_context, "tables_context": tables_context, "model": model}),
+        ("questions", _gen_questions_instructions, {"shared": shared_context, "model": model}),
+        ("example_sqls", _gen_example_sqls, {"shared": shared_context, "model": model}),
+        ("benchmarks", _gen_benchmarks, {"shared": shared_context, "model": model}),
+        ("analytics", _gen_analytics, {"shared": shared_context, "model": model}),
     ]
 
     results: dict[str, dict] = {}
@@ -82,7 +94,7 @@ def generate_plan(
     plan = _assemble(results, tables_context)
 
     # Validate example SQLs and benchmarks (test execution + repair)
-    validated = _validate_plan_sqls(plan, shared_context=shared_context)
+    validated = _validate_plan_sqls(plan, shared_context=shared_context, model=model)
     if validated:
         errors.extend(validated)
 
@@ -92,7 +104,7 @@ def generate_plan(
         errors.extend(analytics_warnings)
 
     # Check benchmark question-SQL alignment (LLM-based)
-    alignment_warnings = _validate_benchmark_alignment(plan, shared_context)
+    alignment_warnings = _validate_benchmark_alignment(plan, shared_context, model=model)
     if alignment_warnings:
         errors.extend(alignment_warnings)
 
@@ -108,7 +120,55 @@ def _table_id(t: dict) -> str:
     return t.get("table") or t.get("table_name") or t.get("identifier", "?")
 
 
-def _call_llm_section(prompt: str, max_tokens: int, section_name: str) -> dict:
+def _is_metric_view_context(t: dict) -> bool:
+    return "METRIC_VIEW" in str(t.get("table_type") or "").upper()
+
+
+def _table_plan_entry(t: dict) -> dict:
+    """Convert a describe_table result into a plan table entry."""
+    name = _table_id(t)
+    cols = t.get("columns", [])
+    recs = t.get("recommendations", {})
+    exclude = set(recs.get("exclude_etl", []))
+
+    column_configs = []
+    for c in cols:
+        col_name = c.get("name", "?")
+        entry: dict = {"column_name": col_name}
+        if c.get("description"):
+            entry["description"] = c["description"]
+        if col_name in exclude:
+            entry["excluded"] = True
+        column_configs.append(entry)
+
+    return {
+        "identifier": name,
+        "description": t.get("comment", ""),
+        "column_configs": column_configs,
+    }
+
+
+def _metric_view_plan_entry(t: dict) -> dict:
+    """Convert a describe_table result into a plan metric-view entry."""
+    cols = t.get("columns", [])
+    column_configs = []
+    for c in cols:
+        entry: dict = {
+            "column_name": c.get("name", "?"),
+            "enable_format_assistance": True,
+        }
+        if c.get("description"):
+            entry["description"] = c["description"]
+        column_configs.append(entry)
+
+    return {
+        "identifier": _table_id(t),
+        "description": t.get("comment", ""),
+        "column_configs": column_configs,
+    }
+
+
+def _call_llm_section(prompt: str, max_tokens: int, section_name: str, model: str | None = None) -> dict:
     """Call the LLM serving endpoint and parse the JSON response.
 
     Raises RuntimeError (re-raised from the original) on failure so the
@@ -117,13 +177,30 @@ def _call_llm_section(prompt: str, max_tokens: int, section_name: str) -> dict:
     try:
         response = call_serving_endpoint(
             [{"role": "user", "content": prompt}],
-            model=get_llm_model(),
+            model=model or get_llm_model(),
             max_tokens=max_tokens,
         )
         return parse_json_from_llm_response(response)
     except Exception as e:
         logger.exception("%s generation failed", section_name)
         raise RuntimeError(f"{section_name} LLM call failed: {e}") from e
+
+
+def _call_llm_section_for_model(
+    prompt: str,
+    *,
+    max_tokens: int,
+    section_name: str,
+    model: str | None = None,
+) -> dict:
+    if model:
+        return _call_llm_section(
+            prompt,
+            max_tokens=max_tokens,
+            section_name=section_name,
+            model=model,
+        )
+    return _call_llm_section(prompt, max_tokens=max_tokens, section_name=section_name)
 
 
 def _build_shared_context(
@@ -138,15 +215,19 @@ def _build_shared_context(
         parts.append(f"## User Requirements\n{user_requirements}")
 
     table_lines = []
+    has_metric_view = False
     for t in tables_context:
         name = _table_id(t)
         comment = t.get("comment", "")
         cols = t.get("columns", [])
+        is_metric_view = _is_metric_view_context(t)
+        has_metric_view = has_metric_view or is_metric_view
         col_summary = ", ".join(c.get("name", "?") for c in cols[:20])
         if len(cols) > 20:
             col_summary += f" (+{len(cols) - 20} more)"
         row_count = t.get("row_count", "?")
-        table_lines.append(f"- **{name}** ({len(cols)} cols, ~{row_count} rows): {comment}")
+        type_label = " [METRIC_VIEW]" if is_metric_view else ""
+        table_lines.append(f"- **{name}**{type_label} ({len(cols)} cols, ~{row_count} rows): {comment}")
         table_lines.append(f"  Columns: {col_summary}")
 
         recs = t.get("recommendations", {})
@@ -155,6 +236,8 @@ def _build_shared_context(
 
     if table_lines:
         parts.append("## Tables\n" + "\n".join(table_lines))
+    if has_metric_view:
+        parts.append(_METRIC_VIEW_SQL_RULES)
 
     quality = inspection_summaries.get("quality")
     if quality and not quality.get("error"):
@@ -268,7 +351,7 @@ def _summarize_profiles(profiles: dict) -> str:
     return "IMPORTANT — Use ONLY these actual values in SQL and instructions:\n" + "\n".join(lines)
 
 
-def _gen_tables(shared: str, tables_context: list[dict]) -> dict:
+def _gen_tables(shared: str, tables_context: list[dict], model: str | None = None) -> dict:
     """Generate table descriptions and column_configs.
 
     Mostly programmatic (columns come from inspection), with an LLM call
@@ -276,30 +359,15 @@ def _gen_tables(shared: str, tables_context: list[dict]) -> dict:
     Falls back to raw metadata on LLM failure — table configs are optional enrichment.
     """
     tables = []
+    metric_views = []
     for t in tables_context:
-        name = _table_id(t)
-        cols = t.get("columns", [])
-        recs = t.get("recommendations", {})
-        exclude = set(recs.get("exclude_etl", []))
-
-        column_configs = []
-        for c in cols:
-            col_name = c.get("name", "?")
-            entry: dict = {"column_name": col_name}
-            if c.get("description"):
-                entry["description"] = c["description"]
-            if col_name in exclude:
-                entry["excluded"] = True
-            column_configs.append(entry)
-
-        tables.append({
-            "identifier": name,
-            "description": t.get("comment", ""),
-            "column_configs": column_configs,
-        })
+        if _is_metric_view_context(t):
+            metric_views.append(_metric_view_plan_entry(t))
+        else:
+            tables.append(_table_plan_entry(t))
 
     if not tables:
-        return {"tables": []}
+        return {"tables": [], "metric_views": metric_views}
 
     prompt = (
         "You are enriching table and column metadata for a Databricks Genie Space.\n\n"
@@ -318,14 +386,26 @@ def _gen_tables(shared: str, tables_context: list[dict]) -> dict:
     )
 
     try:
-        result = _call_llm_section(prompt, max_tokens=2048, section_name="tables")
-        return result if "tables" in result else {"tables": tables}
+        result = _call_llm_section_for_model(
+            prompt,
+            max_tokens=4096,
+            section_name="tables",
+            model=model,
+        )
+        if "tables" not in result:
+            result = {"tables": tables}
+        if metric_views:
+            result["metric_views"] = metric_views
+        return result
     except Exception:
         logger.warning("Table description enrichment failed, using raw metadata")
-        return {"tables": tables}
+        result = {"tables": tables}
+        if metric_views:
+            result["metric_views"] = metric_views
+        return result
 
 
-def _gen_questions_instructions(shared: str) -> dict:
+def _gen_questions_instructions(shared: str, model: str | None = None) -> dict:
     """Generate sample_questions and text_instructions."""
     prompt = (
         "You are creating sample questions and text instructions for a Databricks Genie Space.\n\n"
@@ -347,8 +427,8 @@ def _gen_questions_instructions(shared: str) -> dict:
         "- `## CONSTRAINTS` — hard guardrails: what never to show (PII columns, secrets), what not to do.\n"
         "- `## Instructions you must follow when providing summaries` — summary-customization behavior "
         "(rounding rules, mandatory caveats). **Use this exact heading — it is Databricks's blessed string.**\n\n"
-        "IMPORTANT: Keep text_instructions UNDER 2,000 characters total. Be concise — use bullet points, "
-        "not paragraphs. If you have more than 2,000 chars of context, prioritize the most important rules "
+        "IMPORTANT: Keep text_instructions UNDER 2,500 characters total. Be concise — use bullet points, "
+        "not paragraphs. If you have more than 2,500 chars of context, prioritize the most important rules "
         "and drop the rest. Long instructions push out higher-value SQL context in Genie's prompt window.\n"
         "NEVER include SQL code (SELECT, WHERE, JOIN, GROUP BY, etc.) in text instructions — "
         "those patterns belong in Example SQLs, Measures, Filters, or Expressions.\n"
@@ -361,10 +441,15 @@ def _gen_questions_instructions(shared: str) -> dict:
         '"## CONSTRAINTS\\n- Never show PII columns."]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=3000, section_name="questions/instructions")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=3000,
+        section_name="questions/instructions",
+        model=model,
+    )
 
 
-def _gen_example_sqls(shared: str) -> dict:
+def _gen_example_sqls(shared: str, model: str | None = None) -> dict:
     """Generate example_sqls (question + SQL pairs that teach Genie query patterns).
 
     Hard cap: exactly 12 pairs. At ~350 tokens each (question + SQL + params + guidance + JSON),
@@ -387,14 +472,24 @@ def _gen_example_sqls(shared: str) -> dict:
         "   - IMPORTANT: Generate no more than 12 pairs total.\n"
         "   - CRITICAL: Only use filter values that appear in the Column Profiles section below.\n"
         "     Do NOT invent status values, tier names, or category labels — use real data.\n\n"
+        "METRIC VIEW SQL RULES:\n"
+        "   - If a query uses a table marked [METRIC_VIEW], wrap measure columns with MEASURE(`Measure Name`).\n"
+        "   - Select/group metric-view dimensions normally; use GROUP BY ALL or explicit dimension grouping.\n"
+        "   - Never use SELECT * with metric views.\n"
+        "   - Do not join a metric view directly to another table; query it in a CTE first, then join the CTE.\n\n"
         "Return ONLY valid JSON:\n"
         '{"example_sqls": [{"question": "...", "sql": "...", "usage_guidance": "...", "parameters": [...]}]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=6000, section_name="example_sqls")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=6000,
+        section_name="example_sqls",
+        model=model,
+    )
 
 
-def _gen_benchmarks(shared: str) -> dict:
+def _gen_benchmarks(shared: str, model: str | None = None) -> dict:
     """Generate benchmark questions (ground-truth Q+SQL for space quality scoring).
 
     Hard cap: exactly 10 benchmarks. At ~300 tokens each (question + SQL + JSON),
@@ -412,6 +507,11 @@ def _gen_benchmarks(shared: str) -> dict:
         "   - IMPORTANT: Generate no more than 10 pairs total.\n"
         "   - CRITICAL: Only use filter values that appear in the Column Profiles section below.\n"
         "     Do NOT invent status values, tier names, or category labels — use real data.\n\n"
+        "METRIC VIEW SQL RULES:\n"
+        "   - If a query uses a table marked [METRIC_VIEW], wrap measure columns with MEASURE(`Measure Name`).\n"
+        "   - Select/group metric-view dimensions normally; use GROUP BY ALL or explicit dimension grouping.\n"
+        "   - Never use SELECT * with metric views.\n"
+        "   - Do not join a metric view directly to another table; query it in a CTE first, then join the CTE.\n\n"
         "BENCHMARK QUALITY RULES:\n"
         "   - The expected SQL must be the MOST DIRECT, NATURAL answer to the question.\n"
         "   - Do NOT add extra WHERE clauses the question didn't ask for (e.g., IS NOT NULL checks).\n"
@@ -424,10 +524,15 @@ def _gen_benchmarks(shared: str) -> dict:
         '{"benchmarks": [{"question": "...", "expected_sql": "..."}]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=5000, section_name="benchmarks")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=5000,
+        section_name="benchmarks",
+        model=model,
+    )
 
 
-def _gen_analytics(shared: str) -> dict:
+def _gen_analytics(shared: str, model: str | None = None) -> dict:
     """Generate join_specs, measures, filters, and expressions.
 
     Hard cap: ~20 items total (up to 5 joins + 5 measures + 5 filters + 4 expressions).
@@ -458,10 +563,20 @@ def _gen_analytics(shared: str) -> dict:
         '{"join_specs": [...], "measures": [...], "filters": [...], "expressions": [...]}\n\n'
         f"Context:\n{shared}"
     )
-    return _call_llm_section(prompt, max_tokens=5000, section_name="analytics")
+    return _call_llm_section_for_model(
+        prompt,
+        max_tokens=5000,
+        section_name="analytics",
+        model=model,
+    )
 
 
-def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | None:
+def _repair_unbound_sql(
+    item: dict,
+    kind: str,
+    shared_context: str,
+    model: str | None = None,
+) -> dict | None:
     """Ask the LLM to fix missing parameter default_values in a parameterized SQL.
 
     For example_sqls: fills in default_value for each :param so _substitute_params
@@ -485,7 +600,12 @@ def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | No
             f"Context:\n{shared_context[:2000]}"
         )
         try:
-            result = _call_llm_section(prompt, max_tokens=512, section_name="param repair")
+            result = _call_llm_section_for_model(
+                prompt,
+                max_tokens=512,
+                section_name="param repair",
+                model=model,
+            )
             repaired_params = result.get("parameters")
             if repaired_params:
                 return {**item, "parameters": repaired_params}
@@ -505,7 +625,12 @@ def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | No
             f"Context:\n{shared_context[:2000]}"
         )
         try:
-            result = _call_llm_section(prompt, max_tokens=512, section_name="benchmark repair")
+            result = _call_llm_section_for_model(
+                prompt,
+                max_tokens=512,
+                section_name="benchmark repair",
+                model=model,
+            )
             repaired_sql = result.get("expected_sql", "")
             # Verify no :param placeholders remain anywhere in the repaired SQL
             if repaired_sql and not re.search(r":[a-zA-Z_]\w*", repaired_sql):
@@ -513,6 +638,66 @@ def _repair_unbound_sql(item: dict, kind: str, shared_context: str) -> dict | No
         except Exception:
             logger.warning("Benchmark SQL repair failed: %s", sql[:80])
         return None
+
+
+def _is_metric_view_measure_error(error: str) -> bool:
+    return _METRIC_VIEW_MEASURE_ERROR in error
+
+
+def _repair_metric_view_sql(
+    item: dict,
+    kind: str,
+    shared_context: str,
+    error: str,
+    model: str | None = None,
+) -> dict | None:
+    """Rewrite SQL that failed because metric-view measures need MEASURE()."""
+    sql_key = "sql" if kind == "example_sql" else "expected_sql"
+    sql = item.get(sql_key, "")
+    if not sql:
+        return None
+
+    prompt = (
+        "The following Databricks SQL query failed because it queries a metric view measure "
+        "without the required MEASURE() aggregate function.\n\n"
+        f"Error: {error}\n\n"
+        f"Question: {item.get('question', '')}\n\n"
+        f"SQL:\n{sql}\n\n"
+        "Rewrite the whole SQL using valid Databricks metric-view syntax:\n"
+        "- Wrap every metric-view measure column with MEASURE(`Measure Name`) and give it a SQL alias.\n"
+        "- Keep metric-view dimensions unwrapped and include them in GROUP BY ALL or an explicit GROUP BY.\n"
+        "- Never use SELECT * with metric views.\n"
+        "- If the metric view must be joined to another table, query the metric view in a CTE first, then join the CTE result.\n"
+        "- Preserve parameter placeholders and existing parameters for example SQLs.\n\n"
+        "Return ONLY valid JSON:\n"
+        f'{{"{sql_key}": "..."}}\n\n'
+        f"Context:\n{shared_context[:4000]}"
+    )
+    try:
+        result = _call_llm_section_for_model(
+            prompt,
+            max_tokens=2048,
+            section_name="metric view SQL repair",
+            model=model,
+        )
+        repaired_sql = result.get(sql_key, "")
+        if repaired_sql:
+            return {**item, sql_key: repaired_sql}
+    except Exception:
+        logger.warning("Metric-view SQL repair failed: %s", sql[:80])
+    return None
+
+
+def _repair_sql_validation_failure(
+    item: dict,
+    kind: str,
+    shared_context: str,
+    reason: str,
+    model: str | None = None,
+) -> dict | None:
+    if _is_metric_view_measure_error(reason):
+        return _repair_metric_view_sql(item, kind, shared_context, reason, model=model)
+    return _repair_unbound_sql(item, kind, shared_context, model=model)
 
 
 def _validate_analytics_sql(plan: dict) -> list[str]:
@@ -601,7 +786,11 @@ def _extract_table_from_sql(sql_fragment: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _validate_benchmark_alignment(plan: dict, shared_context: str) -> list[str]:
+def _validate_benchmark_alignment(
+    plan: dict,
+    shared_context: str,
+    model: str | None = None,
+) -> list[str]:
     """Check that benchmark expected_sql is the most direct answer to the question.
 
     Uses an LLM to verify alignment — flags benchmarks where the SQL has unnecessary
@@ -616,7 +805,7 @@ def _validate_benchmark_alignment(plan: dict, shared_context: str) -> list[str]:
 
     with ThreadPoolExecutor(max_workers=_CONCURRENCY) as pool:
         futures = {
-            pool.submit(run_in_context(_check_benchmark_alignment, bm, shared_context)): i
+            pool.submit(run_in_context(_check_benchmark_alignment, bm, shared_context, model)): i
             for i, bm in enumerate(benchmarks)
         }
         for future in as_completed(futures):
@@ -641,7 +830,11 @@ def _validate_benchmark_alignment(plan: dict, shared_context: str) -> list[str]:
     return warnings
 
 
-def _check_benchmark_alignment(benchmark: dict, shared_context: str) -> dict | None:
+def _check_benchmark_alignment(
+    benchmark: dict,
+    shared_context: str,
+    model: str | None = None,
+) -> dict | None:
     """Check a single benchmark for question-SQL alignment."""
     question = benchmark.get("question", "")
     sql = benchmark.get("expected_sql", "")
@@ -665,13 +858,22 @@ def _check_benchmark_alignment(benchmark: dict, shared_context: str) -> dict | N
         "Return ONLY valid JSON."
     )
     try:
-        result = _call_llm_section(prompt, max_tokens=1024, section_name="benchmark alignment")
+        result = _call_llm_section_for_model(
+            prompt,
+            max_tokens=1024,
+            section_name="benchmark alignment",
+            model=model,
+        )
         return result
     except Exception:
         return None
 
 
-def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
+def _validate_plan_sqls(
+    plan: dict,
+    shared_context: str = "",
+    model: str | None = None,
+) -> list[str]:
     """Test all example_sqls and benchmark SQLs in parallel.
 
     Unbound-parameter failures get an LLM repair pass (example_sqls have
@@ -704,6 +906,7 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
     # repeated thread-creation overhead. Phases are sequential by necessity.
     test_results: dict[tuple[str, int], dict] = {}
     needs_repair: list[tuple[str, int]] = []
+    repair_reasons: dict[tuple[str, int], str] = {}
     hard_failures: dict[tuple[str, int], str] = {}
     repaired: dict[tuple[str, int], dict] = {}
     warnings: list[str] = []
@@ -726,8 +929,9 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
         for (kind, idx), result in test_results.items():
             if not result.get("success"):
                 err = result.get("error", "unknown")
-                if "Unbound SQL parameters" in err:
+                if "Unbound SQL parameters" in err or _is_metric_view_measure_error(err):
                     needs_repair.append((kind, idx))
+                    repair_reasons[(kind, idx)] = err
                 else:
                     hard_failures[(kind, idx)] = err
             elif kind == "benchmark" and result.get("success"):
@@ -735,6 +939,7 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
                 if row_count == 0:
                     # Benchmark SQL ran but returned no rows — filter values likely hallucinated
                     needs_repair.append((kind, idx))
+                    repair_reasons[(kind, idx)] = "zero-row benchmark"
                     warnings.append(f"Benchmark #{idx+1} returned 0 rows — attempting repair with real values")
 
         # Phase 2: repair unbound-param failures
@@ -744,7 +949,16 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
                 for kind, idx in needs_repair
             ]
             repair_futures = {
-                pool.submit(run_in_context(_repair_unbound_sql, item, kind, shared_context)): (kind, idx)
+                pool.submit(
+                    run_in_context(
+                        _repair_sql_validation_failure,
+                        item,
+                        kind,
+                        shared_context,
+                        repair_reasons.get((kind, idx), ""),
+                        model,
+                    )
+                ): (kind, idx)
                 for kind, idx, item in repair_items
             }
             for future in as_completed(repair_futures):
@@ -775,12 +989,20 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
                         result = future.result()
                         if result.get("success"):
                             q = repaired[key].get("question", "?")[:80]
+                            reason = repair_reasons.get(key, "")
+                            metric_view_repair = _is_metric_view_measure_error(reason)
                             if kind == "example_sql":
                                 example_sqls[idx] = repaired[key]
-                                warnings.append(f"Repaired example SQL #{idx+1} ({q}): filled in missing parameter defaults")
+                                if metric_view_repair:
+                                    warnings.append(f"Repaired example SQL #{idx+1} ({q}): added MEASURE() for metric view measures")
+                                else:
+                                    warnings.append(f"Repaired example SQL #{idx+1} ({q}): filled in missing parameter defaults")
                             else:
                                 benchmarks[idx] = repaired[key]
-                                warnings.append(f"Repaired benchmark #{idx+1} ({q}): converted to hardcoded SQL")
+                                if metric_view_repair:
+                                    warnings.append(f"Repaired benchmark #{idx+1} ({q}): added MEASURE() for metric view measures")
+                                else:
+                                    warnings.append(f"Repaired benchmark #{idx+1} ({q}): converted to hardcoded SQL")
                         else:
                             hard_failures[key] = result.get("error", "repair re-test failed")
                     except Exception as e:
@@ -793,7 +1015,11 @@ def _validate_plan_sqls(plan: dict, shared_context: str = "") -> list[str]:
 
         elif needs_repair:
             for kind, idx in needs_repair:
-                hard_failures[(kind, idx)] = "unbound parameters (no context for repair)"
+                reason = repair_reasons.get((kind, idx), "")
+                if _is_metric_view_measure_error(reason):
+                    hard_failures[(kind, idx)] = "metric-view measure syntax (no context for repair)"
+                else:
+                    hard_failures[(kind, idx)] = "unbound parameters (no context for repair)"
 
     # Drop hard failures
     failed_example_idxs = {idx for (kind, idx) in hard_failures if kind == "example_sql"}
@@ -824,18 +1050,19 @@ def _assemble(results: dict[str, dict], tables_context: list[dict]) -> dict:
 
     tables_result = results.get("tables", {})
     plan["tables"] = tables_result.get("tables", [])
+    plan["metric_views"] = tables_result.get("metric_views", [])
 
     if not plan["tables"] and tables_context:
         plan["tables"] = [
-            {
-                "identifier": _table_id(t),
-                "description": t.get("comment", ""),
-                "column_configs": [
-                    {"column_name": c.get("name", "?")}
-                    for c in t.get("columns", [])
-                ],
-            }
+            _table_plan_entry(t)
             for t in tables_context
+            if not _is_metric_view_context(t)
+        ]
+    if not plan["metric_views"] and tables_context:
+        plan["metric_views"] = [
+            _metric_view_plan_entry(t)
+            for t in tables_context
+            if _is_metric_view_context(t)
         ]
 
     qi = results.get("questions", {})

@@ -16,15 +16,18 @@ from typing import TYPE_CHECKING
 from mlflow.entities import Feedback
 from mlflow.genai.scorers import scorer
 
-from genie_space_optimizer.common.config import LLM_ENDPOINT
+from genie_space_optimizer.common.config import get_llm_endpoint
 from genie_space_optimizer.common.genie_client import resolve_sql, sanitize_sql
 from genie_space_optimizer.optimization.evaluation import (
-    LLM_SOURCE,
+    get_llm_source,
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
     format_asi_markdown,
     get_registered_prompt_name,
+)
+from genie_space_optimizer.optimization.genie_eval_taxonomy import (
+    with_genie_equivalent_eval,
 )
 
 if TYPE_CHECKING:
@@ -56,7 +59,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                     rationale="No analysis text available from Genie.",
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
             )
 
         genie_sql = sanitize_sql(_extract_response_text(outputs))
@@ -75,7 +78,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
             "2. Correctly answers the user's question\n"
             "3. Does not make claims unsupported by the query/data\n\n"
             'Respond with JSON only: {"accurate": true/false, '
-            '"failure_type": "<inaccurate_description|unsupported_claim|misleading_summary>", '
+            '"failure_type": "<inaccurate_description|unsupported_claim|misleading_summary|formatting_error|misinterpreted_request>", '
             '"counterfactual_fix": "<specific change to Genie Space metadata or instructions that would fix this response quality issue>", '
             '"rationale": "<brief explanation>"}\n'
             'If accurate, set failure_type to "" and counterfactual_fix to "".'
@@ -111,13 +114,18 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                 "│ Prompt len:  %d chars\n"
                 "│ LLM endpoint: %s\n"
                 "└─────────────────────────────────────────────────────────────────────────",
-                question[:80], str(e)[:300], len(prompt), LLM_ENDPOINT,
+                question[:80], str(e)[:300], len(prompt), get_llm_endpoint(),
             )
             metadata = build_asi_metadata(
                 failure_type="other",
                 severity="info",
                 confidence=0.0,
                 counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
+            metadata = with_genie_equivalent_eval(
+                metadata,
+                judge_name="response_quality",
+                value="unknown",
             )
             return Feedback(
                 name="response_quality",
@@ -129,7 +137,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                     metadata=metadata,
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
                 metadata=metadata,
             )
 
@@ -158,7 +166,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                     extra={"llm_response": result},
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
             )
 
         metadata = build_asi_metadata(
@@ -168,6 +176,12 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
             counterfactual_fix=result.get("counterfactual_fix") or (
                 f"Fix {result.get('failure_type', 'response quality issue')} in Genie response"
             ),
+        )
+        metadata = with_genie_equivalent_eval(
+            metadata,
+            judge_name="response_quality",
+            value="no",
+            failure_type=result.get("failure_type", "inaccurate_description"),
         )
         return Feedback(
             name="response_quality",
@@ -180,7 +194,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                 extra={"llm_response": result},
                 question_id=question_id,
             ),
-            source=LLM_SOURCE,
+            source=get_llm_source(),
             metadata=metadata,
         )
 

@@ -64,6 +64,7 @@ export function RunHistoryTable({ spaceId, onSelectRun }: RunHistoryTableProps) 
                 <TableHead>Date</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Accuracy</TableHead>
+                <TableHead>Model</TableHead>
                 <TableHead>Triggered By</TableHead>
                 <TableHead></TableHead>
               </TableRow>
@@ -89,6 +90,9 @@ export function RunHistoryTable({ spaceId, onSelectRun }: RunHistoryTableProps) 
                   </TableCell>
                   <TableCell className="text-sm">
                     {fmtAccuracy(run.best_accuracy)}
+                  </TableCell>
+                  <TableCell className="text-sm text-muted max-w-[12rem] truncate" title={run.llm_model ?? undefined}>
+                    {run.llm_model ?? "—"}
                   </TableCell>
                   <TableCell className="text-sm text-muted">
                     {run.triggered_by ?? "—"}

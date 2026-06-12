@@ -192,6 +192,7 @@ dbutils.widgets.text("deploy_target", "")
 dbutils.widgets.text("warehouse_id", "")
 dbutils.widgets.text("triggered_by", "")
 dbutils.widgets.text("target_benchmark_count", "")
+dbutils.widgets.text("llm_model", "")
 
 run_id = dbutils.widgets.get("run_id")
 space_id = dbutils.widgets.get("space_id")
@@ -206,6 +207,9 @@ deploy_target = dbutils.widgets.get("deploy_target") or None
 triggered_by = dbutils.widgets.get("triggered_by") or ""
 _target_benchmark_count_raw = dbutils.widgets.get("target_benchmark_count").strip()
 target_benchmark_count = int(_target_benchmark_count_raw) if _target_benchmark_count_raw else None
+llm_model = dbutils.widgets.get("llm_model").strip()
+if llm_model:
+    os.environ["LLM_MODEL"] = llm_model
 
 effective_target = target_benchmark_count or TARGET_BENCHMARK_COUNT
 effective_max = (
@@ -229,6 +233,7 @@ _log(
     deploy_target=deploy_target,
     triggered_by=triggered_by,
     target_benchmark_count=target_benchmark_count,
+    llm_model=llm_model or "(default)",
 )
 
 # COMMAND ----------
@@ -274,13 +279,14 @@ from genie_space_optimizer.common.config import CONNECTION_POOL_SIZE
 configure_connection_pool(w, CONNECTION_POOL_SIZE)
 configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
 
-import os as _os
-warehouse_id = (
-    dbutils.widgets.get("warehouse_id").strip()
-    or _os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "")
+from genie_space_optimizer.common.warehouse import (
+    export_warehouse_id,
+    resolve_warehouse_id,
 )
+
+warehouse_id = resolve_warehouse_id(dbutils.widgets.get("warehouse_id").strip())
 if warehouse_id:
-    _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = warehouse_id
+    export_warehouse_id(warehouse_id)
 _log("SQL warehouse", warehouse_id=warehouse_id or "(not set — using Spark SQL)")
 
 _banner("Ensuring Delta State Tables")
@@ -426,6 +432,20 @@ except Exception as exc:
 # MAGIC Validate each benchmark's SQL via `EXPLAIN` to ensure it compiles against the
 # MAGIC current schema. Invalid benchmarks (unresolved columns, missing tables, syntax errors)
 # MAGIC are quarantined. If fewer than 5 valid benchmarks remain, regeneration is triggered.
+# MAGIC
+# MAGIC ### Pre-EXPLAIN Gates (Tier 3.8 / 3.10 / 3.14)
+# MAGIC
+# MAGIC Several deterministic checks run **before** the gRPC `EXPLAIN` round-trip so
+# MAGIC operators don't see triplicated stack traces from gRPC reattach retries on
+# MAGIC well-classified failure modes:
+# MAGIC
+# MAGIC | Check | Where | Effect on classification |
+# MAGIC |---|---|---|
+# MAGIC | Balanced-backtick precheck (Tier 3.8) | `scorers/syntax_validity.py::_has_unbalanced_backticks`, also `synthesis._gate_parse` | Odd `` ` `` count short-circuits to `failure_type="unbalanced_identifier_quoting"` without an EXPLAIN call |
+# MAGIC | METRIC_VIEW_JOIN upstream pre-check (Tier 3.10) | `evaluation._precheck_benchmarks_for_eval` | Direct JOINs between two metric views without a CTE wrapper are quarantined locally with `reason="metric_view_join"` |
+# MAGIC | Strict `sqlglot.parse` in synthesis (Tier 3.14) | `optimization/synthesis.py::_gate_parse` | Synthesis proposals fail closed on any parse exception — no substring fallback, no malformed SQL leaks downstream |
+# MAGIC
+# MAGIC > **💡 Tip:** When a benchmark is quarantined upstream of EXPLAIN, the rejection record carries the local-classifier reason so log readers can distinguish "Genie Space schema doesn't support this SQL pattern" from "the SQL itself is malformed."
 
 # COMMAND ----------
 
@@ -541,6 +561,16 @@ update_run_status(
     status="IN_PROGRESS",
     experiment_name=ctx_exp["experiment_name"],
     experiment_id=_experiment_id,
+    warehouse_id=warehouse_id,
+    human_corrections=ctx_feedback["human_corrections"],
+    max_benchmark_count=effective_max,
+    llm_model=llm_model or None,
+)
+_log(
+    "Persisted handoff columns to genie_opt_runs",
+    warehouse_id=warehouse_id or "(unset)",
+    human_corrections=len(ctx_feedback["human_corrections"]),
+    max_benchmark_count=effective_max,
 )
 
 preflight_out = {
@@ -552,9 +582,17 @@ preflight_out = {
     "human_corrections": ctx_feedback["human_corrections"],
 }
 
+persisted_benchmark_count = int(ctx_exp.get("benchmark_count", len(_benchmarks)))
+
+_train_n = sum(1 for _b in _benchmarks if _b.get("split") != "held_out")
+_held_n = len(_benchmarks) - _train_n
 _log(
     "Preflight complete",
-    benchmark_count=len(_benchmarks),
+    benchmark_count=persisted_benchmark_count,
+    train_count=_train_n,
+    held_out_count=_held_n,
+    held_out_ratio=f"{HELD_OUT_RATIO:.0%}",
+    held_out_note="reserved for Finalize generalization check; baseline/lever_loop see train only",
     model_creation="deferred to baseline eval",
     experiment_name=preflight_out["experiment_name"],
 )
@@ -591,12 +629,13 @@ dbutils.jobs.taskValues.set(key="catalog", value=catalog)
 dbutils.jobs.taskValues.set(key="schema", value=schema)
 dbutils.jobs.taskValues.set(key="experiment_name", value=preflight_out["experiment_name"])
 dbutils.jobs.taskValues.set(key="experiment_id", value=preflight_out.get("experiment_id", ""))
-dbutils.jobs.taskValues.set(key="benchmark_count", value=len(preflight_out["benchmarks"]))
+dbutils.jobs.taskValues.set(key="benchmark_count", value=persisted_benchmark_count)
 dbutils.jobs.taskValues.set(key="max_iterations", value=max_iterations)
 dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))
 dbutils.jobs.taskValues.set(key="apply_mode", value=apply_mode)
 dbutils.jobs.taskValues.set(key="deploy_target", value=deploy_target or "")
 dbutils.jobs.taskValues.set(key="warehouse_id", value=warehouse_id)
+dbutils.jobs.taskValues.set(key="llm_model", value=llm_model)
 dbutils.jobs.taskValues.set(key="triggered_by", value=triggered_by)
 dbutils.jobs.taskValues.set(key="human_corrections", value=json.dumps(preflight_out.get("human_corrections", []), default=str))
 dbutils.jobs.taskValues.set(key="max_benchmark_count", value=effective_max)
@@ -604,13 +643,13 @@ dbutils.jobs.taskValues.set(key="max_benchmark_count", value=effective_max)
 _log(
     "Task values published",
     run_id=run_id,
-    benchmark_count=len(preflight_out["benchmarks"]),
+    benchmark_count=persisted_benchmark_count,
     model_creation="deferred to baseline eval",
 )
 _banner("Task 1 Completed")
 dbutils.notebook.exit(json.dumps({
     "run_id": run_id,
-    "benchmark_count": len(preflight_out["benchmarks"]),
+    "benchmark_count": persisted_benchmark_count,
 }, default=str))
 
 # COMMAND ----------

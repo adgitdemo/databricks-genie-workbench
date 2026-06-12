@@ -74,9 +74,48 @@ def _sql_escape_like(s: str) -> str:
     return s.replace("'", "''").replace("%", "\\%").replace("_", "\\_")
 
 
+def _enum_value_upper(value: Any) -> str:
+    """Normalize SDK enum-like values for stable comparisons."""
+    raw = getattr(value, "value", value)
+    return str(raw or "").upper()
+
+
 def _base_col_type(type_text: str) -> str:
     """Normalize a column type to its base name (strip generics and precision)."""
     return type_text.lower().split("<")[0].split("(")[0].strip()
+
+
+def _reconcile_metric_view_sources(config: dict) -> dict:
+    """Remove duplicate table entries when the same identifier is a metric view.
+
+    Genie treats column configs as unique by (identifier, column_name) across the
+    entire space, so the same asset cannot appear in both tables and metric_views.
+    Metric view entries are authoritative when both sections contain the same id.
+    """
+    data_sources = config.get("data_sources")
+    if not isinstance(data_sources, dict):
+        return config
+
+    tables = data_sources.get("tables")
+    metric_views = data_sources.get("metric_views")
+    if not isinstance(tables, list) or not isinstance(metric_views, list):
+        return config
+
+    metric_ids = {
+        mv.get("identifier")
+        for mv in metric_views
+        if isinstance(mv, dict) and mv.get("identifier")
+    }
+    if not metric_ids:
+        return config
+
+    data_sources["tables"] = [
+        tbl for tbl in tables
+        if not (isinstance(tbl, dict) and tbl.get("identifier") in metric_ids)
+    ]
+    data_sources["tables"].sort(key=lambda x: x.get("identifier", "") if isinstance(x, dict) else "")
+    metric_views.sort(key=lambda x: x.get("identifier", "") if isinstance(x, dict) else "")
+    return config
 
 
 # ── Tool definitions (OpenAI function-calling format) ────────────────────────
@@ -233,6 +272,35 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["table_identifiers"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assess_readiness",
+            "description": (
+                "Assess whether the selected tables can answer the user's business questions. "
+                "Crawls Unity Catalog metadata and evaluates readiness across four pillars: "
+                "semantic coverage, data quality & freshness signals, modelability, and GenAI context readiness. "
+                "Returns per-question confidence bands (High/Medium/Low) and prioritized recommendations. "
+                "Call this AFTER inspection is complete, BEFORE plan generation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_identifiers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Fully qualified table names (catalog.schema.table) — the tables selected for the Genie Space.",
+                    },
+                    "business_questions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The user's business questions from the requirements step (up to 10).",
+                    },
+                },
+                "required": ["table_identifiers", "business_questions"],
             },
         },
     },
@@ -737,10 +805,11 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "display_name": {"type": "string", "description": "Display name for the space"},
+                    "description": {"type": "string", "description": "1-2 sentence description of what this Genie Space enables users to explore"},
                     "config": {"type": "object", "description": "The validated serialized_space dict (optional — defaults to last generated config)"},
                     "parent_path": {"type": "string", "description": "Workspace folder path for the space (optional)"},
                 },
-                "required": ["display_name"],
+                "required": ["display_name", "description"],
             },
         },
     },
@@ -903,6 +972,7 @@ def handle_tool_call(name: str, arguments: dict, session_config: dict | None = N
         "assess_data_quality": _assess_data_quality,
         "profile_table_usage": _profile_table_usage,
         "profile_columns": _profile_columns,
+        "assess_readiness": _assess_readiness,
         "test_sql": _test_sql,
         "discover_warehouses": _discover_warehouses,
         "generate_plan": _generate_plan_fallback,
@@ -976,7 +1046,10 @@ def handle_tool_call(name: str, arguments: dict, session_config: dict | None = N
 def _search_tables(keywords: list[str], catalogs: list[str] | None = None, max_results: int = 50) -> dict:
     """Search for tables across Unity Catalog using information_schema."""
     from backend.services.uc_client import search_tables
-    return search_tables(keywords, catalogs=catalogs, max_results=max_results)
+    result = search_tables(keywords, catalogs=catalogs, max_results=max_results)
+    if result.get("tables"):
+        result["ui_hint"] = {"type": "multi_select", "id": "table_selection", "label": "Select tables to include"}
+    return result
 
 
 def _discover_catalogs() -> dict:
@@ -1096,7 +1169,7 @@ def _describe_table(table_identifier: str) -> dict:
         if host:
             uc_url = f"{host}/explore/data/{parts[0]}/{parts[1]}/{parts[2]}"
 
-    table_type = str(table_info.table_type) if table_info.table_type else None
+    table_type = _enum_value_upper(table_info.table_type) if table_info.table_type else None
 
     result_dict: dict[str, Any] = {
         "table": table_identifier,
@@ -1794,6 +1867,276 @@ def _strip_leading_comments(sql: str) -> str:
     return "\n".join(lines).strip()
 
 
+# ── Readiness assessment (adapted from Genie Readiness Profiler) ────────────
+
+# Terms for matching business questions to metadata
+_MEASURE_TERMS = (
+    "revenue", "sales", "spend", "cost", "expense", "budget", "forecast", "amount",
+    "quantity", "count", "growth", "margin", "profit", "loss", "earnings",
+    "balance", "utilization", "consumption", "rate", "percentage", "pct",
+)
+_ENTITY_TERMS = (
+    "quarter", "month", "year", "region", "product", "customer", "vendor",
+    "cost center", "department", "segment", "category", "division", "account",
+)
+_TIME_TERMS = ("qoq", "yoy", "quarter", "month", "year", "daily", "weekly", "trend")
+
+
+def _extract_question_terms(questions: list[str]) -> dict[str, set[str]]:
+    """Extract plausible measures, entities, and time references from question text."""
+    all_text = " ".join(q.lower() for q in questions)
+    measures = {t for t in _MEASURE_TERMS if t in all_text}
+    entities = {t for t in _ENTITY_TERMS if t in all_text}
+    time_refs = {t for t in _TIME_TERMS if t in all_text}
+    words = set(re.findall(r"\b[a-z][a-z0-9_]*\b", all_text))
+    return {"measures": measures, "entities": entities, "time": time_refs, "words": words}
+
+
+@mlflow.trace(name="assess_readiness", span_type=SpanType.TOOL)
+def _assess_readiness(table_identifiers: list[str], business_questions: list[str]) -> dict:
+    """Assess data readiness for answering business questions via Genie.
+
+    Crawls UC metadata for the given tables and scores readiness across four
+    pillars: semantic coverage, data quality/freshness, modelability, and
+    GenAI context readiness. Also produces per-question confidence bands.
+    """
+    client = get_workspace_client()
+    questions = business_questions[:10]
+
+    # ── Crawl metadata for selected tables ──
+    all_col_names: list[str] = []
+    all_table_names: list[str] = []
+    all_comments: list[str] = []
+    total_columns = 0
+    columns_with_comments = 0
+    tables_with_comments = 0
+    tables_metadata: list[dict] = []
+    schemas_seen: set[str] = set()
+
+    for tbl_id in table_identifiers:
+        try:
+            table_info = client.tables.get(tbl_id)
+        except Exception as e:
+            logger.warning("assess_readiness: cannot access %s: %s", tbl_id, e)
+            continue
+
+        tbl_name = (table_info.name or "").lower()
+        all_table_names.append(tbl_name)
+        if table_info.comment:
+            all_comments.append(table_info.comment.lower())
+            tables_with_comments += 1
+
+        parts = tbl_id.split(".")
+        if len(parts) >= 2:
+            schemas_seen.add(parts[1])
+
+        cols_meta = []
+        for col in (table_info.columns or []):
+            col_name = (col.name or "").lower()
+            all_col_names.append(col_name)
+            total_columns += 1
+            if col.comment:
+                all_comments.append(col.comment.lower())
+                columns_with_comments += 1
+            cols_meta.append({
+                "name": col.name,
+                "type": str(col.type_text or col.type_name or ""),
+                "has_comment": bool(col.comment),
+            })
+
+        tables_metadata.append({
+            "identifier": tbl_id,
+            "name": tbl_name,
+            "has_comment": bool(table_info.comment),
+            "column_count": len(cols_meta),
+            "columns": cols_meta,
+        })
+
+    total_tables = len(tables_metadata)
+    if total_tables == 0:
+        return {
+            "overall_readiness": "Low",
+            "error": "Could not access any of the specified tables.",
+            "pillars": [],
+            "question_readiness": {},
+            "recommendations": ["Verify table permissions and try again."],
+        }
+
+    corpus = " ".join(all_col_names + all_table_names + all_comments).lower()
+    col_doc_pct = (columns_with_comments / total_columns * 100) if total_columns > 0 else 0
+    tbl_doc_pct = (tables_with_comments / total_tables * 100) if total_tables > 0 else 0
+
+    # ── Extract terms from questions ──
+    extracted = _extract_question_terms(questions) if questions else {}
+    exp_measures = len(extracted.get("measures", set()))
+    exp_entities = len(extracted.get("entities", set()))
+    measure_hits = sum(1 for m in extracted.get("measures", set()) if m in corpus)
+    entity_hits = sum(1 for e in extracted.get("entities", set()) if e in corpus)
+
+    # ── Per-question confidence bands ──
+    question_readiness: dict[str, dict] = {}
+    if questions:
+        for i, q in enumerate(questions):
+            q_terms = _extract_question_terms([q])
+            total_expected = (
+                len(q_terms.get("measures", set()))
+                + len(q_terms.get("entities", set()))
+                + len(q_terms.get("time", set()))
+            )
+            hits = sum(1 for w in q_terms.get("words", set()) if w in corpus)
+            coverage = hits / max(total_expected, 1) if q_terms.get("words") else 0.5
+            if coverage >= 0.8:
+                band = "High"
+            elif coverage >= 0.6:
+                band = "Medium"
+            else:
+                band = "Low"
+            question_readiness[q] = {
+                "band": band,
+                "matched_terms": sorted(q_terms.get("words", set()) & set(corpus.split()))[:10],
+            }
+
+    # ── Pillar 1: Semantic coverage ──
+    semantic_reasons: list[str] = []
+    if questions and (exp_measures > 0 or exp_entities > 0):
+        if exp_measures > 0 and measure_hits == 0:
+            semantic_band = "Low"
+            semantic_reasons.append(
+                f"Questions reference measures ({sorted(extracted.get('measures', set()))[:3]}) "
+                "but no matching columns found."
+            )
+        elif exp_entities > 0 and entity_hits == 0:
+            semantic_band = "Low"
+            semantic_reasons.append(
+                f"Questions reference dimensions ({sorted(extracted.get('entities', set()))[:3]}) "
+                "but no matching columns found."
+            )
+        elif measure_hits >= exp_measures * 0.5 and entity_hits >= max(exp_entities * 0.5, 0):
+            semantic_band = "High"
+            semantic_reasons.append(
+                f"Metadata covers measures and dimensions implied by {len(questions)} questions."
+            )
+        else:
+            semantic_band = "Medium"
+            semantic_reasons.append(
+                f"Partial coverage: {measure_hits}/{exp_measures} measure-like, "
+                f"{entity_hits}/{exp_entities} entity-like columns matched."
+            )
+    elif total_tables < 3:
+        semantic_band = "Low"
+        semantic_reasons.append(f"Only {total_tables} table(s) — limited analytical coverage.")
+    else:
+        semantic_band = "Medium"
+        semantic_reasons.append(f"{total_tables} tables across {len(schemas_seen)} schema(s).")
+
+    # ── Pillar 2: Data quality & freshness ──
+    dq_reasons: list[str] = []
+    if total_columns == 0:
+        dq_band = "Low"
+        dq_reasons.append("No columns detected.")
+    else:
+        typed_cols = sum(
+            1 for t in tables_metadata for c in t["columns"] if c.get("type")
+        )
+        typed_pct = typed_cols / total_columns * 100
+        if typed_pct > 90:
+            dq_band = "Medium"
+            dq_reasons.append(
+                f"{typed_pct:.0f}% of columns have type info. "
+                "Full DQ assessment was done in the inspection step."
+            )
+        else:
+            dq_band = "Low"
+            dq_reasons.append(f"Only {typed_pct:.0f}% of columns have type info.")
+
+    # ── Pillar 3: Modelability ──
+    model_reasons: list[str] = []
+    if len(schemas_seen) >= 2 and total_tables >= 5:
+        model_band = "Medium"
+        model_reasons.append("Multiple schemas with several tables — potential for dimensional modeling.")
+    elif total_tables >= 2:
+        model_band = "Low"
+        model_reasons.append("Limited table set; assess join keys and grain clarity manually.")
+    else:
+        model_band = "Low"
+        model_reasons.append("Insufficient tables to evaluate modelability.")
+
+    # ── Pillar 4: GenAI context readiness ──
+    genai_reasons: list[str] = []
+    if col_doc_pct > 60 and tbl_doc_pct > 60:
+        genai_band = "High"
+        genai_reasons.append(
+            f"{col_doc_pct:.0f}% column docs, {tbl_doc_pct:.0f}% table docs — strong context for Genie."
+        )
+    elif col_doc_pct > 20 or tbl_doc_pct > 20:
+        genai_band = "Medium"
+        genai_reasons.append(
+            f"{col_doc_pct:.0f}% column docs, {tbl_doc_pct:.0f}% table docs — partial coverage."
+        )
+    else:
+        genai_band = "Low"
+        genai_reasons.append(
+            f"Only {col_doc_pct:.0f}% column docs and {tbl_doc_pct:.0f}% table docs — "
+            "Genie will struggle without descriptions."
+        )
+
+    pillars = [
+        {"name": "Semantic coverage", "band": semantic_band, "reasons": semantic_reasons},
+        {"name": "Data quality & freshness", "band": dq_band, "reasons": dq_reasons},
+        {"name": "Modelability", "band": model_band, "reasons": model_reasons},
+        {"name": "GenAI context readiness", "band": genai_band, "reasons": genai_reasons},
+    ]
+
+    # ── Overall readiness ──
+    band_scores = {"High": 3, "Medium": 2, "Low": 1}
+    avg = sum(band_scores.get(p["band"], 0) for p in pillars) / len(pillars)
+    overall = "High" if avg >= 2.5 else ("Medium" if avg >= 1.5 else "Low")
+
+    # ── Recommendations ──
+    recommendations: list[str] = []
+    if genai_band != "High":
+        missing_tbl_descs = [t["identifier"] for t in tables_metadata if not t["has_comment"]]
+        if missing_tbl_descs:
+            recommendations.append(
+                f"Add descriptions to {len(missing_tbl_descs)} table(s): {', '.join(missing_tbl_descs[:3])}"
+            )
+        cols_without = total_columns - columns_with_comments
+        if cols_without > 0:
+            recommendations.append(
+                f"{cols_without} column(s) ({100 - col_doc_pct:.0f}%) have no descriptions — "
+                "these will be generated in the Genie Space configuration."
+            )
+    if semantic_band == "Low" and extracted.get("entities"):
+        missing_dims = sorted(extracted["entities"] - set(corpus.split()))
+        if missing_dims:
+            recommendations.append(
+                f"Consider adding tables for missing dimensions: {', '.join(missing_dims[:5])}"
+            )
+    if semantic_band == "Low" and extracted.get("measures"):
+        missing_measures = sorted(extracted["measures"] - set(corpus.split()))
+        if missing_measures:
+            recommendations.append(
+                f"No columns match these measure terms: {', '.join(missing_measures[:5])}. "
+                "Consider adding relevant tables or adjusting questions."
+            )
+    low_qs = [q for q, info in question_readiness.items() if info["band"] == "Low"]
+    if low_qs:
+        recommendations.append(
+            f"{len(low_qs)} question(s) have Low confidence — consider adjusting them or adding more tables."
+        )
+
+    return {
+        "overall_readiness": overall,
+        "pillars": pillars,
+        "question_readiness": question_readiness,
+        "recommendations": recommendations,
+        "tables_assessed": total_tables,
+        "total_columns": total_columns,
+        "column_doc_pct": round(col_doc_pct, 1),
+        "table_doc_pct": round(tbl_doc_pct, 1),
+    }
+
+
 def _test_sql(sql: str, parameters: list[dict] | None = None) -> dict:
     test_query = _substitute_params(sql, parameters)
     test_query = _strip_leading_comments(test_query)
@@ -1832,7 +2175,8 @@ def _discover_warehouses() -> dict:
     eligible = []
     for wh in warehouses:
         is_serverless = getattr(wh, "enable_serverless_compute", False)
-        wh_type_str = str(getattr(wh, "warehouse_type", "")) if hasattr(wh, "warehouse_type") else ""
+        warehouse_type = getattr(wh, "warehouse_type", "")
+        wh_type_str = getattr(warehouse_type, "value", warehouse_type)
         is_pro = wh_type_str == "PRO"
         if is_serverless or is_pro:
             eligible.append({
@@ -1965,13 +2309,18 @@ def _generate_config(
     Use this for INITIAL creation only. For post-creation modifications,
     use update_config instead.
     """
-    if not tables:
+    if tables is None:
+        tables = []
+    if metric_views is None:
+        metric_views = []
+
+    if not tables and not metric_views:
         return {
-            "error": "tables is required and must contain at least one table",
+            "error": "At least one table or metric view is required",
             "hint": (
-                "Pass tables as a list of objects with at least 'identifier' "
-                "(catalog.schema.table). Review describe_table results for the "
-                "identifiers you inspected earlier."
+                "Pass tables and/or metric_views as lists of objects with at "
+                "least 'identifier'. Review describe_table results for the "
+                "data sources you inspected earlier."
             ),
         }
     if sample_questions is None:
@@ -1989,6 +2338,8 @@ def _generate_config(
     # ── data_sources.tables ──
     ds_tables = []
     for tbl in tables:
+        if isinstance(tbl, str):
+            tbl = {"identifier": tbl}
         entry: dict[str, Any] = {"identifier": tbl["identifier"]}
         if tbl.get("description"):
             entry["description"] = [tbl["description"]]
@@ -2039,6 +2390,7 @@ def _generate_config(
         data_sources["metric_views"] = mv_items
 
     config["data_sources"] = data_sources
+    _reconcile_metric_view_sources(config)
 
     # ── instructions ──
     instructions: dict[str, Any] = {}
@@ -2560,8 +2912,13 @@ def _update_config(actions: list[dict], config: dict | None = None) -> dict:
 
 _ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TABLE_ID_PATTERN = re.compile(r"^[^.]+\.[^.]+\.[^.]+$")
-_SQL_IN_TEXT_RE = re.compile(
-    r"\b(SELECT|WHERE|JOIN|GROUP\s+BY|ORDER\s+BY|HAVING)\b", re.IGNORECASE
+# Re-export from GSO so create-agent validation, the runtime scanner, and
+# the optimizer use ONE detector. ``_SQL_IN_TEXT_RE`` stays for any caller
+# that grabs the naïve keyword regex directly; ``sql_in_text_findings`` is
+# the structure-aware scanner v2 entry point and should be preferred.
+from genie_space_optimizer.iq_scan.scoring import (  # noqa: E402
+    _SQL_IN_TEXT_RE,
+    sql_in_text_findings,
 )
 
 
@@ -2575,10 +2932,13 @@ _SIZE_CHECK_FIELDS = {"description", "content", "question", "sql", "instruction"
 _GUIDANCE_FIELDS = {"comment", "instruction", "usage_guidance"}
 
 
-def _validate_config(config: dict | None = None) -> dict:
+def _validate_config(config: dict | None = None, reconcile_sources: bool = True) -> dict:
     """Validate a serialized_space config. Returns errors and warnings."""
     if not config:
         return {"error": "No config to validate — call generate_config first"}
+    config = copy.deepcopy(config)
+    if reconcile_sources:
+        _reconcile_metric_view_sources(config)
     errors = []
     warnings = []
 
@@ -2601,17 +2961,35 @@ def _validate_config(config: dict | None = None) -> dict:
         for i, sq in enumerate(sqs):
             _check_id(f"config.sample_questions[{i}].id", sq.get("id"), error)
 
+    data_sources = config.get("data_sources", {})
+    tables = data_sources.get("tables", [])
+    mvs = data_sources.get("metric_views", [])
+    col_keys: set[tuple[str, str]] = set()
+
+    def check_column_configs(source_type: str, source_index: int, ident: str, ccs: list) -> None:
+        for j, cc in enumerate(ccs):
+            key = (ident, cc.get("column_name", ""))
+            if key in col_keys:
+                error(
+                    f"data_sources.{source_type}[{source_index}].column_configs",
+                    f"Duplicate column config: {key}",
+                )
+            col_keys.add(key)
+            if cc.get("enable_entity_matching") and not cc.get("enable_format_assistance"):
+                error(
+                    f"data_sources.{source_type}[{source_index}].column_configs[{j}]",
+                    f"enable_entity_matching requires enable_format_assistance to be true (column: {cc.get('column_name', '')})"
+                )
+
+    # data sources
+    if not tables and not mvs:
+        error("data_sources", "At least one table or metric view is required")
+
     # tables
-    tables = config.get("data_sources", {}).get("tables", [])
-    if not tables:
-        error("data_sources.tables", "No tables defined")
-    else:
+    if tables:
         _check_sorted(tables, lambda x: x.get("identifier", ""), "identifier", "data_sources.tables", error)
         if len(tables) > _MAX_TABLES:
             error("data_sources.tables", f"Maximum {_MAX_TABLES} tables allowed (found {len(tables)})")
-        elif len(tables) >= 9:
-            warning("data_sources.tables", f"{len(tables)} tables — consider splitting into focused rooms for >8 tables")
-        col_keys: set[tuple[str, str]] = set()
         for i, tbl in enumerate(tables):
             ident = tbl.get("identifier", "")
             if not _TABLE_ID_PATTERN.match(ident):
@@ -2619,25 +2997,19 @@ def _validate_config(config: dict | None = None) -> dict:
             ccs = tbl.get("column_configs", [])
             if ccs:
                 _check_sorted(ccs, lambda x: x.get("column_name", ""), "column_name", f"data_sources.tables[{i}].column_configs", error)
-            for j, cc in enumerate(ccs):
-                key = (ident, cc.get("column_name", ""))
-                if key in col_keys:
-                    error(f"data_sources.tables[{i}].column_configs", f"Duplicate column config: {key}")
-                col_keys.add(key)
-                if cc.get("enable_entity_matching") and not cc.get("enable_format_assistance"):
-                    error(
-                        f"data_sources.tables[{i}].column_configs[{j}]",
-                        f"enable_entity_matching requires enable_format_assistance to be true (column: {cc.get('column_name', '')})"
-                    )
+            check_column_configs("tables", i, ident, ccs)
 
     # metric_views
-    mvs = config.get("data_sources", {}).get("metric_views", [])
     if mvs:
         _check_sorted(mvs, lambda x: x.get("identifier", ""), "identifier", "data_sources.metric_views", error)
         for i, mv in enumerate(mvs):
+            ident = mv.get("identifier", "")
+            if not _TABLE_ID_PATTERN.match(ident):
+                error(f"data_sources.metric_views[{i}].identifier", f"'{ident}' must be catalog.schema.metric_view")
             ccs = mv.get("column_configs", [])
             if ccs:
                 _check_sorted(ccs, lambda x: x.get("column_name", ""), "column_name", f"data_sources.metric_views[{i}].column_configs", error)
+            check_column_configs("metric_views", i, ident, ccs)
 
     # text_instructions
     ti = config.get("instructions", {}).get("text_instructions", [])
@@ -2821,15 +3193,24 @@ def _validate_config(config: dict | None = None) -> dict:
                 "instructions.text_instructions",
                 f"Text instructions only {ti_total_chars} chars — add more business context (>50 chars recommended)"
             )
-        if ti_total_chars > 2000:
+        if ti_total_chars > 2500:
             warning(
                 "instructions.text_instructions",
-                f"Text instructions are {ti_total_chars:,} chars — keep under 2,000 to avoid pushing out higher-value SQL context"
+                f"Text instructions are {ti_total_chars:,} chars — keep under 2,500 to avoid pushing out higher-value SQL context"
             )
-        if _SQL_IN_TEXT_RE.search(ti_all_text):
+        # Scanner v2 — structure-aware detection. Natural-language prose
+        # like "Do not join X to Y" or "Where applicable" is no longer
+        # flagged; only SQL fragments with clause structure (SELECT ...
+        # FROM, WHERE ident op, JOIN ident ON, etc.) are surfaced.
+        sql_offenders = sql_in_text_findings(ti_all_text)
+        if sql_offenders:
+            sample = sql_offenders[0].strip()
+            if len(sample) > 100:
+                sample = sample[:97] + "..."
             warning(
                 "instructions.text_instructions",
-                "SQL patterns (SELECT, WHERE, JOIN, etc.) found in text instructions — move to Example SQLs or SQL Expressions"
+                f"SQL patterns found in text instructions — move to Example SQLs or "
+                f"SQL Expressions. First offender: {sample!r}"
             )
 
     # 4. Join specs: warn if missing when >1 table
@@ -2839,16 +3220,16 @@ def _validate_config(config: dict | None = None) -> dict:
             f"No join specs for {len(tables)} tables — add join specifications to help Genie correctly join your tables"
         )
 
-    # 5. Table count: 9-12 warning already handled above (structural check changed to warn at >=9)
+    # 5. Table count: hard structural limits are handled above.
 
-    # 6. Example SQLs: warn if <8; warn at 8-14; warn if >50% lack usage_guidance
+    # 6. Example SQLs: warn if <8; warn at 8-9; warn if >50% lack usage_guidance
     n_examples = len(eqs)
     if n_examples < 8:
         warning(
             "instructions.example_question_sqls",
             f"Only {n_examples} example SQLs — 8+ required for good accuracy"
         )
-    elif n_examples < 15:
+    elif n_examples < 10:
         warning(
             "instructions.example_question_sqls",
             f"{n_examples} example SQLs — 10-15 is the sweet spot for largest accuracy jump"
@@ -2966,7 +3347,7 @@ def _check_sorted(items: list, key_fn, key_name: str, path: str, error_fn) -> No
 
 
 @mlflow.trace(name="create_space", span_type=SpanType.TOOL)
-def _create_space(display_name: str, config: dict | None = None, parent_path: str | None = None) -> dict:
+def _create_space(display_name: str, description: str = "", config: dict | None = None, parent_path: str | None = None) -> dict:
     """Create the Genie space via the API.
 
     Path resolution is automatic: configured directory -> /Shared/.
@@ -2974,9 +3355,11 @@ def _create_space(display_name: str, config: dict | None = None, parent_path: st
     """
     if not config:
         return {"success": False, "error": "No config provided — call generate_config first"}
+    config = _reconcile_metric_view_sources(copy.deepcopy(config))
     try:
         result = create_genie_space(
             display_name=display_name,
+            description=description,
             merged_config=config,
             parent_path=parent_path,
         )
@@ -3006,6 +3389,7 @@ def _update_space(space_id: str, config: dict | None = None, display_name: str |
         body: dict[str, Any] = {}
 
         if config:
+            config = _reconcile_metric_view_sources(copy.deepcopy(config))
             constrained = _enforce_constraints(config)
             cleaned = _clean_config(constrained)
             body["serialized_space"] = json.dumps(cleaned)

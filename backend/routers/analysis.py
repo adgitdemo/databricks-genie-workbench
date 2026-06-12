@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-from backend.services.genie_client import get_serialized_space
+from backend.services.genie_client import get_serialized_space, normalize_metric_view_sources
+from backend.services.model_catalog import ModelCatalogError, list_chat_models
+from backend.models import LLMModelInfo
 
 router = APIRouter(prefix="/api")
 
@@ -117,6 +119,8 @@ async def parse_space_json(request: ParseJsonRequest):
             space_data = json.loads(serialized)
         else:
             space_data = serialized
+        if isinstance(space_data, dict):
+            normalize_metric_view_sources(space_data)
 
         # Generate placeholder ID
         genie_space_id = f"pasted-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -194,3 +198,12 @@ async def get_settings():
         databricks_host=get_databricks_host(),
         workspace_directory=os.environ.get("GENIE_TARGET_DIRECTORY", "").strip() or None,
     )
+
+
+@router.get("/models", response_model=list[LLMModelInfo])
+async def get_models():
+    """List curated chat models for user selection."""
+    try:
+        return list_chat_models(allow_sp_fallback=True)
+    except ModelCatalogError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))

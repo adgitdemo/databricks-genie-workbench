@@ -19,6 +19,7 @@ from genie_space_optimizer.common.warehouse import (
     sql_warehouse_execute,
     sql_warehouse_query,
     wh_create_run,
+    wh_ensure_optimization_tables,
     wh_reconcile_active_runs,
 )
 
@@ -91,6 +92,13 @@ def trigger_optimization(
             "You need CAN_EDIT or CAN_MANAGE permission on this "
             "Genie Space to start optimization."
         )
+
+    wh_ensure_optimization_tables(
+        sp_ws,
+        config.warehouse_id,
+        config.catalog,
+        config.schema_name,
+    )
 
     runs_df = sql_warehouse_query(
         ws,
@@ -209,6 +217,7 @@ def trigger_optimization(
         triggered_by=caller_email,
         experiment_name=experiment_name,
         config_snapshot=space_snapshot if space_snapshot else None,
+        llm_model=config.llm_model or None,
     )
 
     from genie_space_optimizer.backend.job_launcher import submit_optimization
@@ -228,6 +237,7 @@ def trigger_optimization(
             experiment_name=experiment_name or "",
             deploy_target=deploy_target or "",
             warehouse_id=config.warehouse_id or "",
+            llm_model=config.llm_model or "",
         )
 
         sql_warehouse_execute(

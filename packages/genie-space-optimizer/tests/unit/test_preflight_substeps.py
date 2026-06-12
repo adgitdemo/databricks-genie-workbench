@@ -137,7 +137,7 @@ class TestPreflightCollectUcMetadata:
         """warehouse_id is forwarded to _collect_data_profile."""
         from genie_space_optimizer.optimization.preflight import preflight_collect_uc_metadata
 
-        mock_profile.return_value = {}
+        mock_profile.return_value = ({}, [])
         preflight_collect_uc_metadata(
             MagicMock(), mock_spark, "run-1", "cat", "gold",
             config={}, snapshot={}, genie_table_refs=[],
@@ -260,6 +260,71 @@ class TestPreflightValidateBenchmarks:
         _, kwargs = mock_validate.call_args
         assert kwargs.get("warehouse_id") == "wh-789"
 
+    @patch("genie_space_optimizer.optimization.preflight.write_stage")
+    @patch("genie_space_optimizer.optimization.preflight.validate_benchmarks")
+    @patch("genie_space_optimizer.optimization.preflight.generate_benchmarks")
+    @patch("genie_space_optimizer.optimization.preflight.extract_genie_space_benchmarks")
+    def test_post_validation_topup_does_not_reextract_curated_benchmarks(
+        self,
+        mock_extract,
+        mock_generate,
+        mock_validate,
+        mock_write_stage,
+    ):
+        """Top-up must fill only the synthetic gap after validation.
+
+        Regression for the 30 -> 19 handoff mismatch: re-extracting curated
+        Genie benchmark rows during top-up reintroduced gs_001.. IDs that were
+        already present in the validated corpus.
+        """
+        from genie_space_optimizer.optimization.preflight import preflight_validate_benchmarks
+
+        initial = [
+            {
+                "id": f"sales_gs_{i + 1:03d}",
+                "question": f"validated question {i + 1}",
+                "expected_sql": "SELECT 1",
+            }
+            for i in range(18)
+        ]
+        topped_up = initial + [
+            {
+                "id": f"sales_{i + 19:03d}",
+                "question": f"synthetic top-up question {i + 1}",
+                "expected_sql": "SELECT 1",
+            }
+            for i in range(12)
+        ]
+
+        mock_validate.side_effect = [
+            [{"valid": True}] * 18,
+            [{"valid": True}] * 30,
+        ]
+        mock_generate.return_value = topped_up
+
+        result = preflight_validate_benchmarks(
+            MagicMock(),
+            MagicMock(),
+            "run-1",
+            "cat",
+            "gold",
+            {"_parsed_space": {}},
+            initial,
+            [],
+            [],
+            [],
+            "sales",
+            target_benchmark_count=30,
+            max_benchmark_count=30,
+        )
+
+        assert len(result["benchmarks"]) == 30
+        assert result["benchmarks"] == topped_up
+        mock_extract.assert_not_called()
+        _, kwargs = mock_generate.call_args
+        assert kwargs["genie_space_benchmarks"] == []
+        assert kwargs["existing_benchmarks"] == initial
+
 
 # ---------------------------------------------------------------------------
 # Step 5: preflight_load_human_feedback
@@ -371,9 +436,27 @@ class TestPreflightSetupExperiment:
         )
         assert set(result.keys()) == {
             "model_id", "experiment_name", "experiment_id",
+            "benchmark_count", "evaluation_dataset",
         }
         assert result["model_id"] is None
         assert result["experiment_name"] == "/exp/path"
+
+    def test_returns_writer_benchmark_count_from_create_dataset(self):
+        """preflight_setup_experiment exposes writer count for downstream task values."""
+        writer_result = {
+            "dataset": object(),
+            "table_name": "cat.gold.genie_benchmarks_default",
+            "input_count": 30,
+            "record_count": 24,
+            "unique_question_id_count": 24,
+        }
+
+        result = self._call_setup(
+            create_ds_side_effect=lambda *a, **kw: writer_result,
+        )
+
+        assert result["benchmark_count"] == 24
+        assert result["evaluation_dataset"] == writer_result
 
     def test_sets_sql_context_with_use_catalog_and_schema(self):
         """USE CATALOG / USE SCHEMA must be issued with the correct values."""
@@ -514,3 +597,97 @@ class TestPreflightWrapperEquivalence:
         assert isinstance(config, dict)
         assert isinstance(benchmarks, list)
         assert isinstance(corrections, list)
+
+    @patch("genie_space_optimizer.optimization.preflight.preflight_setup_experiment")
+    @patch("genie_space_optimizer.optimization.preflight.preflight_load_human_feedback")
+    @patch("genie_space_optimizer.optimization.preflight.preflight_validate_benchmarks")
+    @patch("genie_space_optimizer.optimization.preflight.preflight_generate_benchmarks")
+    @patch("genie_space_optimizer.optimization.preflight.preflight_collect_uc_metadata")
+    @patch("genie_space_optimizer.optimization.preflight.preflight_fetch_config")
+    def test_wrapper_forwards_warehouse_id_to_warehouse_aware_substeps(
+        self, mock_cfg, mock_uc, mock_gen, mock_val, mock_fb, mock_exp
+    ):
+        from genie_space_optimizer.optimization.preflight import run_preflight
+
+        mock_cfg.return_value = {
+            "config": {}, "snapshot": {}, "genie_table_refs": [],
+            "domain": "default", "apply_mode": "genie_config", "configured_cols": 0,
+        }
+        mock_uc.return_value = {"uc_columns": [], "uc_tags": [], "uc_routines": [], "uc_fk": []}
+        mock_gen.return_value = {"benchmarks": [{"q": "test"}], "regenerated": False}
+        mock_val.return_value = {"benchmarks": [{"q": "test"}], "pre_count": 1, "invalid_errors": []}
+        mock_fb.return_value = {"human_corrections": []}
+        mock_exp.return_value = {
+            "model_id": "mv-1", "experiment_name": "/exp",
+            "experiment_id": "exp-1", "prompt_registrations": [],
+        }
+
+        run_preflight(
+            MagicMock(), MagicMock(), "run-1", "space-1", "cat", "gold", "revenue",
+            warehouse_id="wh-test",
+        )
+
+        assert mock_uc.call_args.kwargs["warehouse_id"] == "wh-test"
+        assert mock_gen.call_args.kwargs["warehouse_id"] == "wh-test"
+        assert mock_val.call_args.kwargs["warehouse_id"] == "wh-test"
+
+
+class TestHarnessPreflightWarehouseID:
+    @patch("genie_space_optimizer.optimization.harness.update_run_status")
+    @patch("genie_space_optimizer.optimization.harness.resolve_warehouse_id", return_value="wh-env")
+    @patch("genie_space_optimizer.optimization.harness._safe_stage")
+    def test_run_preflight_resolves_and_forwards_warehouse_id(
+        self, mock_safe_stage, mock_resolve, mock_update, mock_spark
+    ):
+        from genie_space_optimizer.optimization import harness
+
+        mock_safe_stage.return_value = (
+            {"_gso_iq_scan_recommended_levers": [], "_gso_iq_scan_summary": None},
+            [],
+            "model-1",
+            "/exp",
+            [],
+        )
+
+        with patch.object(harness, "mlflow", create=True) as mock_mlflow:
+            mock_mlflow.get_experiment_by_name.return_value = MagicMock(
+                experiment_id="exp-1",
+            )
+            out = harness._run_preflight(
+                MagicMock(), mock_spark, "run-1", "space-1",
+                "cat", "gold", "revenue",
+            )
+
+        mock_resolve.assert_called_once_with("")
+        assert mock_safe_stage.call_args.args[-1] == "wh-env"
+        assert out["model_id"] == "model-1"
+
+
+def test_update_run_status_retries_delta_concurrent_append(monkeypatch) -> None:
+    from genie_space_optimizer.optimization import state
+
+    calls: list[dict] = []
+
+    class ConcurrentAppendLike(Exception):
+        pass
+
+    def fake_update_row(_spark, _catalog, _schema, _table, _keys, updates):
+        calls.append(updates)
+        if len(calls) == 1:
+            raise ConcurrentAppendLike(
+                "[DELTA_CONCURRENT_APPEND.WITH_PARTITION_HINT] Transaction conflict detected"
+            )
+
+    monkeypatch.setattr(state, "update_row", fake_update_row)
+    monkeypatch.setattr(state.time, "sleep", lambda _seconds: None)
+
+    state.update_run_status(
+        spark=object(),
+        run_id="run_1",
+        catalog="cat",
+        schema="sch",
+        config_snapshot={"serialized_space": {"name": "snapshot"}},
+    )
+
+    assert len(calls) == 2
+    assert "config_snapshot" in calls[1]

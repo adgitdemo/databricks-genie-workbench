@@ -320,6 +320,7 @@ def test_trigger_proceeds_when_prompt_registry_available(
         auto_optimize, "get_service_principal_client", lambda: mock_sp_ws
     )
     monkeypatch.setattr(auto_optimize, "get_workspace_client", lambda: mock_user_ws)
+    monkeypatch.setenv("LLM_MODEL", "custom-trigger-model")
 
     ok_probe = ProbeResult(
         available=True, reason_code="ok", actionable_by="customer"
@@ -352,6 +353,74 @@ def test_trigger_proceeds_when_prompt_registry_available(
         "status": "QUEUED",
     }
     trigger_mock.assert_called_once()
+    config = trigger_mock.call_args.kwargs["config"]
+    assert config.llm_model == "custom-trigger-model"
+
+
+def test_trigger_uses_selected_llm_model(
+    client, mock_sp_ws, mock_user_ws, monkeypatch,
+) -> None:
+    """Explicit llm_model overrides the env default after metadata validation."""
+    monkeypatch.setattr(
+        auto_optimize, "get_service_principal_client", lambda: mock_sp_ws
+    )
+    monkeypatch.setattr(auto_optimize, "get_workspace_client", lambda: mock_user_ws)
+    monkeypatch.setenv("LLM_MODEL", "env-default-model")
+    monkeypatch.setattr(
+        auto_optimize,
+        "validate_chat_model",
+        lambda model, client=None: model,
+    )
+
+    fake_result = MagicMock(
+        run_id="run-selected",
+        job_run_id=123,
+        job_url=None,
+        status="QUEUED",
+    )
+
+    with patch(
+        "backend.services.prompt_registry.check_prompt_registry",
+        return_value=ProbeResult(available=True, reason_code="ok", actionable_by="customer"),
+    ), patch.object(
+        auto_optimize, "trigger_optimization", return_value=fake_result
+    ) as trigger_mock:
+        resp = client.post(
+            "/api/auto-optimize/trigger",
+            json={
+                "space_id": "space-abc",
+                "apply_mode": "genie_config",
+                "llm_model": "selected-chat",
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    config = trigger_mock.call_args.kwargs["config"]
+    assert config.llm_model == "selected-chat"
+
+
+def test_trigger_rejects_invalid_llm_model(
+    client, mock_sp_ws, mock_user_ws, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        auto_optimize, "get_service_principal_client", lambda: mock_sp_ws
+    )
+    monkeypatch.setattr(auto_optimize, "get_workspace_client", lambda: mock_user_ws)
+
+    def reject(model, client=None):
+        raise auto_optimize.ModelValidationError("not a chat model")
+
+    monkeypatch.setattr(auto_optimize, "validate_chat_model", reject)
+
+    with patch.object(auto_optimize, "trigger_optimization") as trigger_mock:
+        resp = client.post(
+            "/api/auto-optimize/trigger",
+            json={"space_id": "space-abc", "llm_model": "bad-model"},
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "not a chat model"
+    trigger_mock.assert_not_called()
 
 
 def test_trigger_blocks_on_probe_error_fail_closed(
@@ -499,6 +568,14 @@ def test_derived_accuracy_handles_zero_evaluated() -> None:
     }
     # evaluated is 0, so we fall back to stored (0.0)
     assert _derived_accuracy(row) == 0.0
+
+
+def test_iteration_select_includes_rolled_back_for_score_selection() -> None:
+    """Run score derivation can only exclude rejected iterations when the
+    lightweight iteration query carries the rollback marker through."""
+    from backend.routers.auto_optimize import _ITER_COLS_V2
+
+    assert "rolled_back" in _ITER_COLS_V2
 
 
 # ── Bug #2 regression — pre-migration Delta schema fallback ──────────────

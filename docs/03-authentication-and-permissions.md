@@ -143,7 +143,6 @@ The `user_api_scopes` in `app.yaml` request these scopes for the user's OBO toke
 | `catalog.schemas:read` | Browse Unity Catalog schemas |
 | `catalog.tables:read` | Browse Unity Catalog tables |
 | `files.files` | Access workspace files |
-| `iam.access-control:read` | Read ACLs for permission checks |
 
 If the workspace or user's OAuth consent doesn't grant all scopes, the app degrades gracefully — the SP fallback handles the most common gap (`dashboards.genie`).
 
@@ -155,7 +154,7 @@ If the workspace or user's OAuth consent doesn't grant all scopes, the app degra
 |-----------|---------|
 | `CAN_MANAGE` | API fallback when user token lacks Genie scope; applying optimization patches during the GSO pipeline |
 
-Grant via the Genie Space sharing UI or the installer (`scripts/install.sh` automates this).
+Grant via the Genie Space sharing UI or through an installer. `scripts/install.sh` handles this for the local terminal path, and `notebooks/install.py` grants visible Genie Spaces for the Databricks notebook path.
 
 ### Per referenced data schema
 
@@ -188,7 +187,60 @@ The SP needs full access to the optimizer state schema (`<GSO_CATALOG>.genie_spa
 | `EXECUTE` | Execute functions |
 | `MANAGE` | Schema management |
 
-These are granted automatically by `scripts/grant_permissions.py` during deployment.
+These are granted automatically during deployment. The local terminal path uses `scripts/grant_permissions.py`; the notebook path uses the shared `scripts.deploy_lib.uc` implementation.
+
+## Installer Permissions
+
+The two install paths — `scripts/install.sh` + `scripts/deploy.sh` (local terminal) and `notebooks/install.py` (Databricks notebook) — both create and configure resources across Databricks Apps, Unity Catalog, Lakebase, MLflow, Jobs, and the workspace filesystem. **The person running the installer typically needs workspace-admin equivalents**, because no single non-admin role spans all of the actions below. Non-admins can install only if they hold every entitlement listed.
+
+This is distinct from the runtime identities documented above: installer permissions are needed once, at install time, to provision and grant. Day-to-day operation only uses the OBO user token and the app SP.
+
+### Required entitlements for the installer
+
+| Area | Required permission |
+|------|---------------------|
+| Databricks Apps | Workspace entitlement to create apps; `CAN_MANAGE` on the app after it is created |
+| Workspace files | Write on your workspace home (`/Workspace/Users/<you>/...`) for `databricks sync`, `workspace import-dir`, bundle state, and the notebook installer's generated source folder |
+| SQL Warehouse | `CAN_USE` on the configured warehouse (used for UC DDL during install) |
+| Unity Catalog (target catalog) | `USE CATALOG` on the catalog and `CREATE SCHEMA` (or catalog ownership). Either ownership of the catalog or `MANAGE` on the new schema is needed to grant the app SP |
+| UC schema (`<catalog>.genie_space_optimizer`) | `CREATE TABLE`, `CREATE VOLUME`, and `MANAGE` after the schema is created |
+| Lakebase | Lakebase Autoscaling project creation entitlement; ownership of the project to create roles and run `GRANT CONNECT, CREATE ON DATABASE databricks_postgres` |
+| MLflow | Workspace files write at the experiment path (default `/Shared/genie-workbench-agent-tracing`); workspace admin to enable Prompt Registry if it is disabled (required by Auto-Optimize) |
+| Jobs (GSO optimization job) | Jobs create entitlement; `CAN_MANAGE` on the resulting job and on the bundle workspace directory |
+| Genie Spaces (optional grants) | `CAN_MANAGE` on each space the installer grants the app SP access to |
+| Model Serving | The configured `LLM_MODEL` endpoint must exist and be callable by both the installer (validation) and the app SP at runtime |
+
+### Install step → permission map
+
+| Install step | Code reference | Required installer permission |
+|--------------|----------------|-------------------------------|
+| Create the Databricks App | `scripts/deploy.sh` step 3, `scripts/deploy_lib/apps.py` | Apps create entitlement |
+| Patch app OAuth scopes and resources | `scripts/deploy.sh` step 7 (`databricks apps update`), `scripts/deploy_lib/apps.py` | `CAN_MANAGE` on the app |
+| Sync app source to workspace | `databricks sync --full`, `databricks workspace import-dir` (local path); `scripts/deploy_lib/workspace_source.py` (notebook path) | Write on `/Workspace/Users/<you>/...` |
+| Create UC schema, volume, GSO state tables | `scripts/grant_permissions.py`, `scripts/deploy_lib/uc.py` `ensure_uc_objects_and_grants()` | `USE CATALOG` + `CREATE SCHEMA` on the catalog; `CREATE VOLUME` + `CREATE TABLE` on the new schema |
+| Grant SP privileges on UC schema/volume | `scripts/deploy_lib/uc.py` `grant_schema_privileges()` / `grant_volume_privileges()` | Catalog/schema ownership or `MANAGE` privilege |
+| Create the Lakebase Autoscaling project | `scripts/setup_lakebase.py`, `scripts/deploy_lib/lakebase.py` `ensure_project()` | Lakebase project creation entitlement |
+| Create Postgres role for the app SP | `scripts/deploy_lib/lakebase.py` `ensure_role()` | Lakebase project ownership |
+| `GRANT CONNECT, CREATE ON DATABASE databricks_postgres` to the app SP | `scripts/deploy_lib/lakebase.py` `grant_database_permissions()` | Role with `GRANT` on the Lakebase database (effectively project owner / superuser) |
+| Create or look up MLflow experiment for tracing (optional) | `scripts/install.sh` step 6; dormant in the notebook installer | Workspace files write at the experiment path |
+| Probe / require MLflow Prompt Registry for Auto-Optimize | `backend/routers/auto_optimize.py` (Prompt Registry probe) | Workspace admin to enable Prompt Registry on the workspace if it is not already on |
+| Build and deploy the GSO optimization job | `databricks bundle deploy -t app` (local), `scripts/deploy_lib/gso_job.py` (notebook) | Jobs create entitlement; write on the bundle workspace directory |
+| Set GSO job ACL (owner=installer, SP=`CAN_MANAGE`, users=`CAN_VIEW`) | `scripts/deploy.sh` step 6 (`PUT /api/2.0/permissions/jobs/<id>`) | `CAN_MANAGE` on the job |
+| Grant SP `CAN_MANAGE` on the bundle workspace directory | `scripts/deploy.sh` step 6, `scripts/deploy_lib/gso_job.py` `grant_directory_permissions()` | `CAN_MANAGE` on the directory |
+| Grant SP `CAN_MANAGE` on existing Genie Spaces (automatic in notebook, prompted in local installer) | `scripts/install.sh` step 12, `scripts/deploy_lib/genie_spaces.py` `grant_can_manage_on_space()` | `CAN_MANAGE` on each selected space |
+
+### Pre-flight checks today
+
+The installer runs lightweight pre-flight checks before deploying:
+
+- `scripts/preflight.sh` validates CLI version, profile authentication, warehouse `CAN_USE`, catalog access, and app state.
+- A deeper permission audit (MLflow, LLM serving, UC, Lakebase) is tracked under the Pre-Flight Permissions Check epic (issue #115) and is not yet implemented.
+
+If a step fails because of a missing permission, the installer reports the underlying API error and stops. Re-run the installer after the missing grant is in place — there is no automated recovery path.
+
+### Note on the user's `dashboards.genie` OAuth scope
+
+`dashboards.genie` is requested in `app.yaml` `user_api_scopes`, but it is granted at the user's OAuth consent screen on first sign-in, not by the installer. If a user denies that scope or the workspace strips it, the SP fallback in `services/genie_client.py` handles the gap transparently. The installer does not (and cannot) grant this on the user's behalf.
 
 ## Complete Permission Boundary
 

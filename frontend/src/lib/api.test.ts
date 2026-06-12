@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest"
-import { ApiError, extractDetailMessage } from "./api"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { ApiError, extractDetailMessage, getModels, streamAgentChat, triggerAutoOptimize } from "./api"
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 describe("extractDetailMessage", () => {
   it("returns the string detail directly", () => {
@@ -71,5 +75,97 @@ describe("ApiError", () => {
   it("defaults detail to null when not provided", () => {
     const err = new ApiError("boom", 500)
     expect(err.detail).toBeNull()
+  })
+})
+
+describe("model selection API payloads", () => {
+  it("fetches /api/models", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { name: "chat", displayName: "Chat", isDefault: true },
+      ],
+    }))
+    vi.stubGlobal("fetch", fetchMock)
+
+    const models = await getModels()
+
+    expect(models).toEqual([
+      { name: "chat", displayName: "Chat", isDefault: true },
+    ])
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/models",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it("sends llm_model when triggering optimization", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        runId: "run",
+        jobRunId: "job-run",
+        jobUrl: null,
+        status: "QUEUED",
+      }),
+    }))
+    vi.stubGlobal("fetch", fetchMock)
+
+    await triggerAutoOptimize({
+      space_id: "space",
+      apply_mode: "genie_config",
+      levers: [1, 2],
+      llm_model: "selected-chat",
+    })
+
+    const [, options] = fetchMock.mock.calls[0]
+    expect(JSON.parse(String(options.body))).toEqual({
+      space_id: "space",
+      apply_mode: "genie_config",
+      levers: [1, 2],
+      llm_model: "selected-chat",
+    })
+  })
+
+  it("sends model in Create Agent chat request", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => ({ done: true, value: undefined }),
+        }),
+      },
+    }))
+    vi.stubGlobal("fetch", fetchMock)
+
+    streamAgentChat(
+      "hello",
+      "session",
+      null,
+      {
+        onSession: () => {},
+        onStep: () => {},
+        onThinking: () => {},
+        onToolCall: () => {},
+        onToolResult: () => {},
+        onMessageDelta: () => {},
+        onMessage: () => {},
+        onCreated: () => {},
+        onUpdated: () => {},
+        onError: () => {},
+        onDone: () => {},
+      },
+      "space",
+      "selected-chat",
+    )
+
+    const [, options] = fetchMock.mock.calls[0]
+    expect(JSON.parse(String(options.body))).toEqual({
+      message: "hello",
+      session_id: "session",
+      selections: null,
+      space_id: "space",
+      model: "selected-chat",
+    })
   })
 })

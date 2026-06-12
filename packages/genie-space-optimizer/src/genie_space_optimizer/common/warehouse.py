@@ -9,12 +9,23 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_RE = re.compile(
+    r"\bDEFAULT\s+(?:'[^']*'|[A-Za-z0-9_\-.+]+)",
+    re.IGNORECASE,
+)
+
+_REQUIRED_RUN_COLUMNS = (
+    "job_id",
+    "llm_model",
+)
 
 
 def sql_warehouse_query(
@@ -68,6 +79,183 @@ def sql_warehouse_execute(
         raise RuntimeError(f"SQL warehouse execute failed: {error_msg}")
 
 
+def _column_names_from_describe(df: Any) -> set[str]:
+    if getattr(df, "empty", True) or "col_name" not in getattr(df, "columns", []):
+        return set()
+
+    names: set[str] = set()
+    for raw in df["col_name"].tolist():
+        if raw is None:
+            continue
+        name = str(raw).strip()
+        if not name or name.startswith("#"):
+            continue
+        names.add(name.lower())
+    return names
+
+
+def _strip_inline_default(col_def: str) -> tuple[str, str | None]:
+    default_match = _DEFAULT_RE.search(col_def)
+    if not default_match:
+        return col_def, None
+    return _DEFAULT_RE.sub("", col_def).strip(), default_match.group()
+
+
+def _wh_apply_one_migration(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    *,
+    fqn: str,
+    col: str,
+    col_def: str,
+) -> None:
+    add_def, default_clause = _strip_inline_default(col_def)
+    try:
+        sql_warehouse_execute(
+            ws,
+            warehouse_id,
+            f"ALTER TABLE {fqn} ADD COLUMN {col} {add_def}",
+        )
+        logger.info("Added missing Delta column %s.%s via SQL warehouse", fqn, col)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already exists" in msg:
+            return
+        logger.error("Could not ADD COLUMN %s.%s via SQL warehouse: %s", fqn, col, exc)
+        return
+
+    if default_clause:
+        try:
+            sql_warehouse_execute(
+                ws,
+                warehouse_id,
+                f"ALTER TABLE {fqn} ALTER COLUMN {col} SET {default_clause}",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Column %s.%s was added, but SET DEFAULT was rejected "
+                "(writers set explicit values): %s",
+                fqn,
+                col,
+                exc,
+            )
+
+
+def _wh_describe_columns(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    fqn: str,
+) -> set[str]:
+    df = sql_warehouse_query(ws, warehouse_id, f"DESCRIBE TABLE {fqn}")
+    return _column_names_from_describe(df)
+
+
+def _wh_verify_required_run_columns(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+) -> None:
+    fqn = f"{catalog}.{schema}.genie_opt_runs"
+    try:
+        present = _wh_describe_columns(ws, warehouse_id, fqn)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not verify required columns on {fqn}: {exc}"
+        ) from exc
+
+    missing = [col for col in _REQUIRED_RUN_COLUMNS if col.lower() not in present]
+    if missing:
+        raise RuntimeError(
+            f"{fqn} is missing columns required to launch optimization runs: "
+            f"{', '.join(missing)}. Run the GSO table migration or grant the "
+            "app service principal permission to ALTER the table."
+        )
+
+
+def wh_ensure_optimization_tables(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+) -> None:
+    """Create and migrate GSO Delta state tables via SQL Warehouse.
+
+    The Databricks App trigger path is warehouse-first because Spark Connect can
+    lose credentials in Apps. Keep this path in lockstep with the Spark
+    bootstrapper so newly added columns exist before ``wh_create_run`` inserts.
+    """
+    from genie_space_optimizer.optimization.ddl import (
+        ADDITIVE_COLUMN_MIGRATIONS,
+        _ALL_DDL,
+    )
+
+    try:
+        sql_warehouse_execute(
+            ws,
+            warehouse_id,
+            f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}",
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "PERMISSION_DENIED" in msg or "ACCESS_DENIED" in msg:
+            logger.warning(
+                "Cannot CREATE SCHEMA %s.%s via SQL warehouse; assuming it "
+                "already exists and continuing with table initialization.",
+                catalog,
+                schema,
+            )
+        else:
+            raise
+
+    for name, ddl in _ALL_DDL.items():
+        resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
+        try:
+            sql_warehouse_execute(ws, warehouse_id, resolved)
+            logger.info("Ensured GSO table %s.%s.%s via SQL warehouse", catalog, schema, name)
+        except Exception as exc:
+            msg = str(exc)
+            if "PERMISSION_DENIED" in msg or "ACCESS_DENIED" in msg:
+                logger.warning(
+                    "Cannot create table %s.%s.%s via SQL warehouse; it may "
+                    "already exist or the principal may lack CREATE_TABLE.",
+                    catalog,
+                    schema,
+                    name,
+                )
+            elif "SCHEMA_NOT_FOUND" in msg:
+                raise RuntimeError(
+                    f"Schema {catalog}.{schema} does not exist and could not be created."
+                ) from exc
+            else:
+                raise
+
+    for table, col, col_def in ADDITIVE_COLUMN_MIGRATIONS:
+        fqn = f"{catalog}.{schema}.{table}"
+        try:
+            existing = _wh_describe_columns(ws, warehouse_id, fqn)
+        except Exception:
+            logger.warning(
+                "Could not DESCRIBE %s via SQL warehouse while checking migrations",
+                fqn,
+                exc_info=True,
+            )
+            continue
+
+        if col.lower() in existing:
+            continue
+
+        _wh_apply_one_migration(
+            ws,
+            warehouse_id,
+            fqn=fqn,
+            col=col,
+            col_def=col_def,
+        )
+
+    _wh_verify_required_run_columns(ws, warehouse_id, catalog, schema)
+
+
 def wh_create_run(
     ws: WorkspaceClient,
     warehouse_id: str,
@@ -82,6 +270,7 @@ def wh_create_run(
     triggered_by: str | None = None,
     experiment_name: str | None = None,
     config_snapshot: dict | None = None,
+    llm_model: str | None = None,
 ) -> None:
     """Insert a QUEUED run row via SQL warehouse."""
     from genie_space_optimizer.common.config import DEFAULT_LEVER_ORDER, MAX_ITERATIONS
@@ -90,16 +279,18 @@ def wh_create_run(
     levers_json = json.dumps(levers if levers is not None else DEFAULT_LEVER_ORDER)
     exp = (experiment_name or "").replace("'", "''")
     user = (triggered_by or "").replace("'", "''")
+    model_escaped = llm_model.replace("'", "''") if llm_model else ""
+    model_sql = f"'{model_escaped}'" if model_escaped else "NULL"
 
     sql = (
         f"INSERT INTO {catalog}.{schema}.genie_opt_runs "
         f"(run_id, space_id, domain, catalog, uc_schema, status, started_at, "
         f"max_iterations, levers, apply_mode, updated_at, "
-        f"experiment_name, triggered_by, config_snapshot) VALUES ("
+        f"experiment_name, triggered_by, config_snapshot, llm_model) VALUES ("
         f"'{run_id}', '{space_id}', '{domain}', '{catalog}', "
         f"'{catalog}.{schema}', 'QUEUED', current_timestamp(), "
         f"{MAX_ITERATIONS}, '{levers_json}', '{apply_mode}', current_timestamp(), "
-        f"'{exp}', '{user}', '{snap_json}')"
+        f"'{exp}', '{user}', '{snap_json}', {model_sql})"
     )
     sql_warehouse_execute(ws, warehouse_id, sql)
     logger.info("Created run %s via SQL warehouse", run_id)
@@ -223,3 +414,55 @@ def wh_reconcile_active_runs(
             changed = True
 
     return changed
+
+
+# ── Warehouse ID resolution ──────────────────────────────────────────
+#
+# The optimization pipeline historically read only
+# ``GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID`` at each call site. In deployed
+# Databricks Apps the resource is usually named ``SQL_WAREHOUSE_ID`` or
+# ``GSO_WAREHOUSE_ID`` first, then job notebooks copy it into the legacy
+# name. A single resolver prevents enrichment subtasks from silently
+# falling back to Spark Connect when that copy is missing.
+
+import os as _os
+
+
+WAREHOUSE_ENV_KEYS: tuple[str, ...] = (
+    "GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID",
+    "GSO_WAREHOUSE_ID",
+    "SQL_WAREHOUSE_ID",
+)
+
+
+def resolve_warehouse_id(explicit: str | None = None) -> str:
+    """Return the first non-empty SQL warehouse ID.
+
+    Precedence:
+    1. Explicit function argument.
+    2. Legacy optimizer env var ``GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID``.
+    3. GSO app env var ``GSO_WAREHOUSE_ID``.
+    4. Databricks Apps SQL warehouse resource env var ``SQL_WAREHOUSE_ID``.
+    """
+    explicit_s = str(explicit or "").strip()
+    if explicit_s:
+        return explicit_s
+    for key in WAREHOUSE_ENV_KEYS:
+        val = _os.getenv(key, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def export_warehouse_id(warehouse_id: str | None) -> str:
+    """Export a resolved warehouse ID under every runtime env key.
+
+    Returns the resolved value so job notebooks can log it directly.
+    Empty input leaves the environment unchanged and returns ``""``.
+    """
+    resolved = str(warehouse_id or "").strip()
+    if not resolved:
+        return ""
+    for key in WAREHOUSE_ENV_KEYS:
+        _os.environ[key] = resolved
+    return resolved

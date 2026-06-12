@@ -2,7 +2,7 @@
 
 ## App Environment Variables (`app.yaml`)
 
-These variables are defined in `app.yaml` and injected into the app runtime. Placeholder values (e.g., `__GSO_CATALOG__`) are patched by `deploy.sh` before deployment.
+These variables are defined in `app.yaml` and injected into the app runtime. Placeholder values (e.g., `__GSO_CATALOG__`) are patched before deployment by either `deploy.sh` or the Databricks notebook installer.
 
 ### MLflow Tracing
 
@@ -16,7 +16,8 @@ These variables are defined in `app.yaml` and injected into the app runtime. Pla
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `LLM_MODEL` | `__LLM_MODEL__` | Databricks model serving endpoint for analysis, fix agent, create agent. Default: `databricks-claude-sonnet-4-6` |
+| `LLM_MODEL` | `__LLM_MODEL__` | Default Databricks model serving endpoint for LLM-backed features. Create Agent sessions and Auto-Optimize runs can override it with a user-selected endpoint from the curated compatibility list. Default: `databricks-claude-sonnet-4-6` |
+| `GSO_LLM_ENDPOINT` | unset | Optional GSO-only override for emergency/debug use. If unset, GSO uses `LLM_MODEL` |
 
 ### SQL Warehouse
 
@@ -43,20 +44,22 @@ These variables are defined in `app.yaml` and injected into the app runtime. Pla
 | `LAKEBASE_HOST` | `valueFrom: postgres` | Hostname, injected from the `postgres` app resource |
 | `LAKEBASE_PORT` | `5432` | PostgreSQL port |
 | `LAKEBASE_DATABASE` | `databricks_postgres` | Database name (standard Lakebase default) |
-| `LAKEBASE_INSTANCE_NAME` | `__LAKEBASE_INSTANCE__` | Lakebase Autoscaling project name (patched by deploy script) |
+| `LAKEBASE_INSTANCE_NAME` | `__LAKEBASE_INSTANCE__` | Lakebase Autoscaling project name (patched by deploy path) |
 
 ### Auto-Optimize (GSO Engine)
 
 | Variable | Source | Description |
 |----------|--------|-------------|
-| `GSO_CATALOG` | `__GSO_CATALOG__` | Unity Catalog for optimizer state tables. Patched from `.env.deploy` |
+| `GSO_CATALOG` | `__GSO_CATALOG__` | Unity Catalog for optimizer state tables. Patched from `.env.deploy` or notebook widgets |
 | `GSO_SCHEMA` | `genie_space_optimizer` | Schema within the catalog for GSO tables (fixed name) |
-| `GSO_JOB_ID` | `__GSO_JOB_ID__` | Databricks Job ID for the optimization DAG. Patched from bundle deploy state |
+| `GSO_JOB_ID` | `__GSO_JOB_ID__` | Databricks Job ID for the optimization DAG. Patched from bundle deploy state or notebook-created job |
 | `GSO_WAREHOUSE_ID` | `valueFrom: sql-warehouse` | SQL Warehouse for GSO queries |
 
 ## Deploy Configuration Variables (`.env.deploy`)
 
-These variables are used by `deploy.sh` and `install.sh` at deploy time. They are **not** injected into the app runtime directly — instead, deploy scripts use them to patch `app.yaml` placeholders and configure resources.
+These variables are used by the local terminal path (`install.sh` and `deploy.sh`) at deploy time. They are **not** injected into the app runtime directly - instead, deploy scripts use them to patch `app.yaml` placeholders and configure resources.
+
+The Databricks notebook path does not write `.env.deploy`; it collects equivalent values through `notebooks/install.py` widgets.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -64,31 +67,34 @@ These variables are used by `deploy.sh` and `install.sh` at deploy time. They ar
 | `GENIE_CATALOG` | Yes | — | Unity Catalog name (you need CREATE SCHEMA permission) |
 | `GENIE_APP_NAME` | No | `genie-workbench` | Databricks App name (must be unique in your workspace) |
 | `GENIE_DEPLOY_PROFILE` | No | `DEFAULT` | Databricks CLI profile name |
-| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM serving endpoint for analysis |
-| `GENIE_LAKEBASE_INSTANCE` | No | `<app-name>` | Lakebase Autoscaling project name (auto-provisioned by deploy) |
+| `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | Default LLM serving endpoint for the app and GSO optimization job |
+| `GENIE_LAKEBASE_INSTANCE` | No | empty | Lakebase Autoscaling project to use or create; installer defaults new installs to `<app-name>-lakebase`; keep stable for the same app, use a fresh project for a new app instance |
 
 ## How Variables Flow
 
-```
-.env.deploy                    app.yaml (template)              app.yaml (deployed)
-┌──────────────────┐          ┌───────────────────┐           ┌───────────────────┐
-│ GENIE_CATALOG=foo│─────────▶│ GSO_CATALOG:      │──────────▶│ GSO_CATALOG: foo  │
-│ GENIE_WAREHOUSE  │          │   __GSO_CATALOG__  │           │                   │
-│ GENIE_LLM_MODEL │          │ LLM_MODEL:        │           │ LLM_MODEL:        │
-│ ...              │          │   __LLM_MODEL__    │           │   claude-sonnet   │
-└──────────────────┘          └───────────────────┘           └───────────────────┘
-                                                                       │
-                                 deploy.sh patches                     │
-                                 placeholders with                     ▼
-                                 real values                    App Runtime
-                                                               (env vars available)
+Local terminal path:
+
+```text
+.env.deploy -> app.yaml template -> patched app.yaml -> databricks apps deploy
 ```
 
 1. `install.sh` collects values and writes `.env.deploy`
 2. `deploy.sh` reads `.env.deploy` and patches `__PLACEHOLDER__` strings in `app.yaml`
-3. `databricks apps deploy` uploads the patched `app.yaml`
+3. `databricks apps deploy` deploys the patched source
 4. The Databricks Apps platform injects env vars into the running container
 5. `valueFrom` variables (e.g., `LAKEBASE_HOST`, `SQL_WAREHOUSE_ID`) are resolved from app resources at runtime
+
+Databricks notebook path:
+
+```text
+notebook widgets -> app.yaml template -> generated workspace source/app.yaml -> Apps API deploy
+```
+
+1. `notebooks/install.py` reads widget values and builds an `InstallConfig`
+2. The notebook generates a clean source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app`
+3. The notebook writes a patched `app.yaml` only into that generated source folder
+4. The checked-in `app.yaml` remains a template
+5. The Databricks Apps platform injects env vars and resolves `valueFrom` resources at runtime
 
 ## Related Documentation
 

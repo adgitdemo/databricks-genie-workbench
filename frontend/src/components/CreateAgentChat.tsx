@@ -11,6 +11,8 @@ import {
   Check,
   ExternalLink,
   AlertCircle,
+  AlertTriangle,
+  Info,
   Sparkles,
   Copy,
   CheckCheck,
@@ -37,9 +39,11 @@ import {
 } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
-import { streamAgentChat } from "@/lib/api"
+import { streamAgentChat, fetchCreatePreflight } from "@/lib/api"
 import type { AgentChatMessage, AgentUIElement } from "@/types"
 import { TableBrowserDrawer } from "@/components/TableBrowserDrawer"
+import { ChatModelMenu } from "@/components/ModelPicker"
+import { Tooltip } from "@/components/ui/tooltip"
 interface CreateAgentChatProps {
   onCreated: (spaceId: string, displayName: string, spaceUrl?: string, initialTab?: string) => void
 }
@@ -53,6 +57,7 @@ const TOOL_LABELS: Record<string, string> = {
   discover_tables: "Browsing tables",
   describe_table: "Inspecting table",
   assess_data_quality: "Assessing data quality",
+  assess_readiness: "Assessing data readiness",
   profile_table_usage: "Profiling table usage & lineage",
   profile_columns: "Profiling columns",
   test_sql: "Testing SQL",
@@ -98,6 +103,8 @@ interface BuildProgress {
   tables: string[]
   inspectionDone: boolean
   inspectionSummary: { qualityIssues: number; lineageCount: number; columnsProfiled: number }
+  profilingDone: boolean
+  profilingSummary: { overall: string; questionsAssessed: number; lowConfidence: number }
   planReady: boolean
   planSummary: PlanSummary
   configReady: boolean
@@ -118,6 +125,8 @@ const EMPTY_PROGRESS: BuildProgress = {
   tables: [],
   inspectionDone: false,
   inspectionSummary: { qualityIssues: 0, lineageCount: 0, columnsProfiled: 0 },
+  profilingDone: false,
+  profilingSummary: { overall: "", questionsAssessed: 0, lowConfidence: 0 },
   planReady: false,
   planSummary: { ...EMPTY_PLAN_SUMMARY },
   configReady: false,
@@ -132,6 +141,7 @@ const STEPS = [
   { key: "discovery", label: "Discovery", Icon: Database, backtrackMsg: "Let's go back to data selection. I want to change which tables to use." },
   { key: "feasibility", label: "Feasibility", Icon: ShieldCheck, backtrackMsg: "Let's re-assess data feasibility." },
   { key: "inspection", label: "Inspection", Icon: Search, backtrackMsg: "Let's re-inspect the data. I want to review quality or profiles again." },
+  { key: "profiling", label: "Profiling", Icon: BarChart3, backtrackMsg: "Let's re-assess data readiness against my business questions." },
   { key: "plan", label: "Plan", Icon: ListChecks, backtrackMsg: "Let's go back to the plan. I want to adjust questions, instructions, or benchmarks." },
   { key: "config", label: "Configuration", Icon: Settings, backtrackMsg: "Let's revisit the configuration before creating the space." },
   { key: "create", label: "Create Space", Icon: Rocket, backtrackMsg: "" },
@@ -144,9 +154,10 @@ const FIX_STEPS = [
 ] as const
 
 function currentStep(p: BuildProgress): number {
-  if (p.spaceId) return 6
-  if (p.configReady) return 5
-  if (p.planReady) return 4
+  if (p.spaceId) return 7
+  if (p.configReady) return 6
+  if (p.planReady) return 5
+  if (p.profilingDone) return 4
   if (p.inspectionDone) return 3
   if (p.tables?.length) return 2  // feasibility (tables selected)
   if (p.catalog || p.schemas?.length) return 1  // discovery
@@ -170,6 +181,7 @@ interface EditableTable {
 
 interface EditablePlan {
   tables: EditableTable[]
+  metric_views: EditableTable[]
   sample_questions: string[]
   text_instructions: string
   join_specs: Record<string, string>[]
@@ -184,17 +196,20 @@ function planFromResult(result: Record<string, unknown>): EditablePlan {
   const s = (result.sections as Record<string, unknown[]>) || {}
   const tiArr = (s.text_instructions as string[]) || []
   const rawTables = (s.tables as Record<string, unknown>[]) || []
-  return {
-    tables: rawTables.map((t) => ({
-      identifier: (t.identifier as string) || "",
-      description: (t.description as string) || "",
-      column_configs: ((t.column_configs as Record<string, unknown>[]) || []).map((c) => ({
-        column_name: (c.column_name as string) || "",
-        description: (c.description as string) || undefined,
-        type_hint: (c.type_hint as string) || undefined,
-        excluded: (c.excluded as boolean) || false,
-      })),
+  const rawMetricViews = (s.metric_views as Record<string, unknown>[]) || []
+  const mapSource = (t: Record<string, unknown>): EditableTable => ({
+    identifier: (t.identifier as string) || "",
+    description: (t.description as string) || "",
+    column_configs: ((t.column_configs as Record<string, unknown>[]) || []).map((c) => ({
+      column_name: (c.column_name as string) || "",
+      description: (c.description as string) || undefined,
+      type_hint: (c.type_hint as string) || undefined,
+      excluded: (c.excluded as boolean) || false,
     })),
+  })
+  return {
+    tables: rawTables.map(mapSource),
+    metric_views: rawMetricViews.map(mapSource),
     sample_questions: [...((s.sample_questions as string[]) || [])],
     text_instructions: tiArr.join("\n"),
     join_specs: (((s.join_specs || s.joins) as Record<string, string>[]) || []).map((j) => ({ ...j })),
@@ -217,6 +232,7 @@ interface PersistedState {
   usedElements: string[]
   panelOpen: boolean
   editedPlan?: EditablePlan | null
+  selectedModel?: string | null
 }
 
 function saveState(s: PersistedState) {
@@ -250,6 +266,11 @@ function loadState(): PersistedState | null {
       delete p.instructionCounts
       delete p.benchmarks
     }
+    // Migrate: add profilingDone/profilingSummary for sessions created before the profiling step
+    if (p && !("profilingDone" in p)) {
+      p.profilingDone = false
+      p.profilingSummary = { overall: "", questionsAssessed: 0, lowConfidence: 0 }
+    }
     // Migrate editedPlan: ensure benchmarks array exists
     if (parsed.editedPlan && !Array.isArray(parsed.editedPlan.benchmarks)) {
       parsed.editedPlan.benchmarks = []
@@ -257,6 +278,10 @@ function loadState(): PersistedState | null {
     // Migrate editedPlan: ensure tables array exists
     if (parsed.editedPlan && !Array.isArray(parsed.editedPlan.tables)) {
       parsed.editedPlan.tables = []
+    }
+    // Migrate editedPlan: ensure metric_views array exists
+    if (parsed.editedPlan && !Array.isArray(parsed.editedPlan.metric_views)) {
+      parsed.editedPlan.metric_views = []
     }
     // Migrate text_instructions from string[] to single string
     if (parsed.editedPlan && Array.isArray((parsed.editedPlan as any).text_instructions)) {
@@ -358,6 +383,8 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
   const [fixStep, setFixStep] = useState(0) // 0=analyze, 1=update_config, 2=apply, 3=done
   const [fixResult, setFixResult] = useState<{ spaceId: string; url: string } | null>(null)
   const queuedMessageRef = useRef<string | null>(null)
+  const [preflight, setPreflight] = useState<{ warehouses_available: boolean; obo_enabled: boolean; app_name: string } | null>(null)
+  const [selectedModel, setSelectedModel] = useState<string | null>(restored.current?.selectedModel ?? null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -385,8 +412,9 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
       usedElements: Array.from(usedElements),
       panelOpen,
       editedPlan,
+      selectedModel,
     })
-  }, [messages, sessionId, progress, usedElements, panelOpen, editedPlan])
+  }, [messages, sessionId, progress, usedElements, panelOpen, editedPlan, selectedModel])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -395,6 +423,12 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
   useEffect(() => {
     if (!isStreaming) inputRef.current?.focus()
   }, [isStreaming])
+
+  useEffect(() => {
+    fetchCreatePreflight()
+      .then(setPreflight)
+      .catch(() => setPreflight({ warehouses_available: false, obo_enabled: false, app_name: "this app" }))
+  }, [])
 
   // Shared session reset — used by both confirmClear and prefill
   const resetSession = () => {
@@ -431,6 +465,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
     fixModeRef.current = false
     setFixStep(0)
     setFixResult(null)
+    setSelectedModel(null)
     sessionStorage.removeItem(STORAGE_KEY)
   }
 
@@ -481,6 +516,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
           case "discover_tables": return schema ? `Finding tables in ${schema}...` : "Discovering tables..."
           case "describe_table": return tableName ? `Inspecting ${tableName}...` : "Inspecting table..."
           case "assess_data_quality": return "Assessing data quality..."
+          case "assess_readiness": return "Assessing data readiness..."
           case "profile_table_usage": return "Checking table usage & lineage..."
           case "profile_columns": return tableName ? `Profiling ${tableName}...` : "Profiling data..."
           case "test_sql": return "Testing SQL..."
@@ -600,6 +636,20 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
               return updated
             })
           }
+          if (tool === "assess_readiness" && !result.error) {
+            const r = result as Record<string, unknown>
+            const qr = r.question_readiness as Record<string, { band: string }> | undefined
+            const lowCount = qr ? Object.values(qr).filter((v) => v.band === "Low").length : 0
+            setProgress((p) => ({
+              ...p,
+              profilingDone: true,
+              profilingSummary: {
+                overall: (r.overall_readiness as string) || "",
+                questionsAssessed: qr ? Object.keys(qr).length : 0,
+                lowConfidence: lowCount,
+              },
+            }))
+          }
           if ((tool === "present_plan" || tool === "generate_plan") && !result.error) {
             if (resolvedId) setExpandedTools((et) => new Set(et).add(resolvedId))
             const plan = planFromResult(result as Record<string, unknown>)
@@ -681,7 +731,6 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
 
           const streamId = streamingMsgIdRef.current
           if (streamId) {
-            // Finalize the streaming message with full content and ui_elements
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === streamId
@@ -692,12 +741,12 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             streamingContentRef.current = ""
             streamingMsgIdRef.current = null
           } else {
-            // Fallback: no preceding deltas (e.g. reasoning text before tool calls)
             setMessages((prev) => [
               ...prev,
               { id: nextId(), role: "assistant", content, timestamp: Date.now(), ui_elements: uiElements as AgentUIElement[] | null | undefined },
             ])
           }
+
         },
         onCreated: (spaceId, url, displayName) => {
           setMessages((prev) => [
@@ -809,9 +858,9 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             requestAnimationFrame(() => sendMessage(pending))
           }
         },
-      }, spaceIdForRequest)
+      }, spaceIdForRequest, selectedModel)
     },
-    [sessionId, isStreaming],
+    [sessionId, isStreaming, selectedModel],
   )
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -1386,6 +1435,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
     if (!plan) return null
 
     const sqlExpressionCount = plan.measures.length + plan.filters.length + plan.expressions.length
+    const dataSourceCount = plan.tables.length + plan.metric_views.length
 
     const PLAN_SECTIONS: { key: string; label: string; description: string; Icon: typeof MessageSquare; count: number }[] = [
       { key: "sample_questions", label: "Sample Questions", description: "Click-to-ask suggestions shown to users in the Genie Space UI", Icon: MessageSquare, count: plan.sample_questions.length },
@@ -1436,7 +1486,10 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             }`}
           >
             Data Schema
-            <span className="ml-1.5 text-[10px] text-muted">{plan.tables.length} tables</span>
+            <span className="ml-1.5 text-[10px] text-muted">
+              {plan.tables.length} table{plan.tables.length !== 1 ? "s" : ""}
+              {plan.metric_views.length > 0 ? ` · ${plan.metric_views.length} metric view${plan.metric_views.length !== 1 ? "s" : ""}` : ""}
+            </span>
           </button>
           <button
             onClick={() => setPlanTab("instructions")}
@@ -1455,6 +1508,11 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
         {planTab === "schema" && (
           expandedTableId === null ? (
             <div className="divide-y divide-[var(--border-color)]">
+              {plan.tables.length > 0 && plan.metric_views.length > 0 && (
+                <div className="px-3 py-1.5 text-[10px] font-semibold text-muted uppercase tracking-wide bg-surface-secondary">
+                  Tables
+                </div>
+              )}
               {plan.tables.map((table) => {
                 const includedCols = table.column_configs.filter(c => !c.excluded)
                 const excludedCols = table.column_configs.filter(c => c.excluded)
@@ -1500,8 +1558,43 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
                   </div>
                 )
               })}
-              {plan.tables.length === 0 && (
-                <div className="px-3 py-4 text-center text-muted text-[11px]">No tables in plan</div>
+              {plan.metric_views.length > 0 && (
+                <div className="px-3 py-1.5 text-[10px] font-semibold text-muted uppercase tracking-wide bg-surface-secondary">
+                  Metric Views
+                </div>
+              )}
+              {plan.metric_views.map((metricView) => {
+                const shortName = metricView.identifier.split(".").pop() || metricView.identifier
+                return (
+                  <div key={metricView.identifier} className="px-3 py-3">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="font-medium text-primary text-xs">{shortName}</span>
+                      <span className="text-[10px] bg-blue-500/15 text-blue-400 px-1.5 py-0.5 rounded">Metric view</span>
+                    </div>
+                    <input
+                      className="w-full text-[11px] text-muted bg-transparent border-b border-transparent hover:border-default focus:border-accent focus:outline-none py-0.5 mb-1.5"
+                      value={metricView.description}
+                      placeholder="Add metric view description..."
+                      onChange={(e) => {
+                        const updated = { ...plan, metric_views: plan.metric_views.map(mv =>
+                          mv.identifier === metricView.identifier ? { ...mv, description: e.target.value } : mv
+                        )}
+                        setEditedPlan(updated)
+                      }}
+                    />
+                    <div className="flex flex-wrap gap-1 mb-1.5">
+                      {metricView.column_configs.slice(0, 10).map(c => (
+                        <span key={c.column_name} className="text-[10px] bg-elevated px-1.5 py-0.5 rounded text-secondary">{c.column_name}</span>
+                      ))}
+                      {metricView.column_configs.length > 10 && (
+                        <span className="text-[10px] text-muted">+{metricView.column_configs.length - 10} more</span>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+              {dataSourceCount === 0 && (
+                <div className="px-3 py-4 text-center text-muted text-[11px]">No data sources in plan</div>
               )}
             </div>
           ) : (
@@ -2055,6 +2148,8 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
         totalProfiled += profiles ? Object.keys(profiles).length : 0
       }
       if (m.tool_name === "assess_data_quality") {
+        const qt = r.tables as Record<string, unknown> | undefined
+        if (qt) Object.keys(qt).forEach((t) => tables.add(t.split(".").pop() || t))
         const qs = r.summary as { total_recommended_excludes?: number; total_recommended_review?: number } | undefined
         qualityIssues += (qs?.total_recommended_excludes ?? 0) + (qs?.total_recommended_review ?? 0)
       }
@@ -2231,6 +2326,10 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
             )}
           </div>
         )
+      }
+
+      if (el.type === "multi_select" && el.id === "table_selection") {
+        return null
       }
 
       if (el.type === "multi_select" && el.options && el.options.length > 0) {
@@ -2744,6 +2843,23 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
                   </div>
                 )}
 
+                {s.key === "profiling" && progress.profilingDone && (
+                  <div className="mt-1">
+                    {(() => {
+                      const ps = progress.profilingSummary
+                      const parts: string[] = []
+                      if (ps.overall) parts.push(`Overall: ${ps.overall}`)
+                      if (ps.questionsAssessed > 0) parts.push(`${ps.questionsAssessed} question${ps.questionsAssessed !== 1 ? "s" : ""} assessed`)
+                      if (ps.lowConfidence > 0) parts.push(`${ps.lowConfidence} low confidence`)
+                      return parts.length > 0 ? (
+                        <p className="text-[10px] text-muted">{parts.join(" · ")}</p>
+                      ) : (
+                        <p className="text-[10px] text-muted">Profiling complete</p>
+                      )
+                    })()}
+                  </div>
+                )}
+
                 {s.key === "plan" && progress.planReady && (
                   <div className="mt-1">
                     {(() => {
@@ -2856,6 +2972,32 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
     <div className="flex gap-4 h-[calc(100vh-13rem)]">
       {/* Chat column */}
       <div className="flex-1 flex flex-col min-w-0 gap-1">
+        {/* Warehouse warning banner */}
+        {preflight && !preflight.warehouses_available && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs text-amber-600 dark:text-amber-400">
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+            <span>No Pro or Serverless SQL warehouse found — space creation will fail.</span>
+            <Tooltip
+              side="bottom"
+              className="w-80 text-left leading-relaxed"
+              content={
+                <div className="space-y-2">
+                  <p className="font-semibold">How to fix this:</p>
+                  {!preflight.obo_enabled && (
+                    <p><span className="font-medium">Option 1 — Enable OBO auth:</span> Ask your workspace admin to enable On-Behalf-Of User Authorization in the workspace Preview settings. This lets the app act on your behalf and access SQL warehouses you already have access to.</p>
+                  )}
+                  <p><span className="font-medium">{!preflight.obo_enabled ? "Option 2" : "Fix"} — Grant direct access:</span> Give <span className="font-mono">{preflight.app_name}</span> CAN USE permission on a Pro or Serverless SQL warehouse.</p>
+                </div>
+              }
+            >
+              <button className="ml-auto flex items-center gap-1 underline underline-offset-2 hover:text-amber-500 whitespace-nowrap">
+                <Info className="w-3 h-3" />
+                How to fix
+              </button>
+            </Tooltip>
+          </div>
+        )}
+
         {/* Chat area */}
         <div className="flex-1 overflow-y-auto border border-default rounded-xl bg-surface">
           {messages.length === 0 ? (
@@ -2920,7 +3062,10 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="relative">
+        <form
+          onSubmit={handleSubmit}
+          className="rounded-xl border border-default bg-surface shadow-sm transition-all focus-within:border-accent/50 focus-within:ring-2 focus-within:ring-accent/20"
+        >
           <textarea
             ref={inputRef}
             value={input}
@@ -2934,7 +3079,7 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
                 : "Describe your Genie space or answer a question..."
             }
             rows={1}
-            className="w-full border border-default rounded-xl pl-4 pr-11 py-2.5 text-sm bg-surface text-primary resize-none focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent/50 transition-all"
+            className="block w-full resize-none rounded-t-xl bg-transparent px-4 pb-2 pt-3 text-sm text-primary placeholder:text-muted focus:outline-none"
             style={{ minHeight: "40px", maxHeight: "120px" }}
             onInput={(e) => {
               const target = e.target as HTMLTextAreaElement
@@ -2942,23 +3087,32 @@ export function CreateAgentChat({ onCreated }: CreateAgentChatProps) {
               target.style.height = Math.min(target.scrollHeight, 120) + "px"
             }}
           />
-          {isStreaming ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center w-7 h-7 rounded-lg border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors"
-            >
-              <div className="w-2.5 h-2.5 rounded-sm bg-red-400" />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={!input.trim()}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center w-7 h-7 rounded-lg bg-accent text-white disabled:opacity-30 hover:bg-accent/90 transition-colors"
-            >
-              <Send className="w-3.5 h-3.5" />
-            </button>
-          )}
+          <div className="flex items-center justify-end gap-2 px-2.5 pb-2">
+            <ChatModelMenu
+              value={selectedModel}
+              onChange={setSelectedModel}
+              disabled={isStreaming}
+            />
+            {isStreaming ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-red-500/30 text-red-400 transition-colors hover:bg-red-500/10"
+                aria-label="Stop streaming"
+              >
+                <div className="h-2.5 w-2.5 rounded-sm bg-red-400" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-accent text-white transition-colors hover:bg-accent/90 disabled:opacity-30"
+                aria-label="Send message"
+              >
+                <Send className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </form>
       </div>
 

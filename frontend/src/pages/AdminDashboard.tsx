@@ -1,17 +1,39 @@
 /**
- * AdminDashboard - Org-wide statistics, leaderboard, and critical alerts.
+ * AdminDashboard - Org-wide statistics, leaderboard, alerts, and the
+ * GenieWatch observability surface (sub-tabs: Spaces / Cost / Resources / Settings).
  */
-import { useState, useEffect } from "react"
-import { TrendingUp, TrendingDown, AlertTriangle, Award, BarChart2, RefreshCw } from "lucide-react"
+import { Suspense, lazy, useEffect, useState } from "react"
+import {
+  TrendingUp, TrendingDown, AlertTriangle, Award, BarChart2, RefreshCw,
+  LayoutGrid, DollarSign, Database, Settings as SettingsIcon, MessageSquare,
+} from "lucide-react"
 import { getAdminDashboard, getLeaderboard, getAlerts } from "@/lib/api"
 import { getScoreColor, MATURITY_COLORS } from "@/lib/utils"
 import type { AdminDashboardStats, LeaderboardEntry, AlertItem } from "@/types"
 
+// GenieWatch sub-tab pages are lazy so they (and their force-graph / aibi-client
+// dependencies) only enter the bundle when the user opens Admin.
+const WatchSpacesList = lazy(() =>
+  import("@/watch/pages/SpacesList").then(m => ({ default: m.SpacesList })))
+const WatchSpaceDetail = lazy(() =>
+  import("@/watch/pages/SpaceDetail").then(m => ({ default: m.SpaceDetail })))
+const WatchCostExplorer = lazy(() =>
+  import("@/watch/pages/CostExplorer").then(m => ({ default: m.CostExplorer })))
+const WatchResourceRollup = lazy(() =>
+  import("@/watch/pages/ResourceRollup").then(m => ({ default: m.ResourceRollup })))
+const WatchSettings = lazy(() =>
+  import("@/watch/pages/Settings").then(m => ({ default: m.Settings })))
+const WatchFeedback = lazy(() =>
+  import("@/watch/pages/Feedback").then(m => ({ default: m.Feedback })))
+
+type AdminSubTab = "overview" | "spaces" | "cost" | "feedback" | "resources" | "settings"
+
 interface AdminDashboardProps {
   onSelectSpace?: (spaceId: string, displayName: string) => void
+  initialSubTab?: AdminSubTab
 }
 
-function StatCard({ label, value, sub, icon }: { label: string; value: string | number; sub?: string; icon: React.ReactNode }) {
+function StatCard({ label, value, sub, icon }: { label: string; value: React.ReactNode; sub?: string; icon: React.ReactNode }) {
   return (
     <div className="bg-surface border border-default rounded-xl p-4">
       <div className="flex items-center justify-between mb-2">
@@ -28,7 +50,23 @@ function ScoreBadge({ score, maturity }: { score: number; maturity?: string }) {
   return <span className={`font-bold text-lg ${getScoreColor(maturity)}`}>{score}</span>
 }
 
-export function AdminDashboard({ onSelectSpace }: AdminDashboardProps) {
+// Maturity states in score order, mirroring scanner tiers + MATURITY_COLORS.
+const MATURITY_STATES: { label: string; icon: React.ReactNode }[] = [
+  { label: "Not Ready",         icon: <AlertTriangle className="w-4 h-4" /> },
+  { label: "Ready to Optimize", icon: <TrendingUp className="w-4 h-4" /> },
+  { label: "Trusted",           icon: <Award className="w-4 h-4" /> },
+]
+
+const SUB_TABS: { id: AdminSubTab; label: string; icon: React.ReactNode }[] = [
+  { id: "overview",  label: "Overview",  icon: <BarChart2 className="w-4 h-4" /> },
+  { id: "spaces",    label: "Spaces",    icon: <LayoutGrid className="w-4 h-4" /> },
+  { id: "cost",      label: "Cost",      icon: <DollarSign className="w-4 h-4" /> },
+  { id: "feedback",  label: "Feedback",  icon: <MessageSquare className="w-4 h-4" /> },
+  { id: "resources", label: "Resources", icon: <Database className="w-4 h-4" /> },
+  { id: "settings",  label: "Settings",  icon: <SettingsIcon className="w-4 h-4" /> },
+]
+
+function AdminOverview({ onSelectSpace }: { onSelectSpace?: (spaceId: string, displayName: string) => void }) {
   const [stats, setStats] = useState<AdminDashboardStats | null>(null)
   const [leaderboard, setLeaderboard] = useState<{ top: LeaderboardEntry[]; bottom: LeaderboardEntry[] } | null>(null)
   const [alerts, setAlerts] = useState<AlertItem[]>([])
@@ -79,24 +117,27 @@ export function AdminDashboard({ onSelectSpace }: AdminDashboardProps) {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-display font-bold text-primary">Admin Dashboard</h2>
-          <p className="text-muted mt-1">Org-wide Genie Space health</p>
-        </div>
+      <div className="flex items-center justify-end">
         <button onClick={loadData} className="flex items-center gap-2 px-3 py-2 rounded-lg border border-default bg-surface hover:bg-surface-secondary text-sm text-secondary transition-colors">
           <RefreshCw className="w-4 h-4" />
           Refresh
         </button>
       </div>
 
-      {/* Stats */}
+      {/* Stats — counts per maturity state tie the cards to the maturity
+          curve, Top Spaces, and Needs Attention below. */}
       {stats && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
           <StatCard label="Total Spaces" value={stats.total_spaces} icon={<BarChart2 className="w-4 h-4" />} />
           <StatCard label="Scanned" value={stats.scanned_spaces} sub={`${stats.total_spaces > 0 ? Math.round(stats.scanned_spaces / stats.total_spaces * 100) : 0}% coverage`} icon={<BarChart2 className="w-4 h-4" />} />
-          <StatCard label="Avg Score" value={stats.avg_score} icon={<TrendingUp className="w-4 h-4" />} />
-          <StatCard label="Critical" value={stats.critical_count} sub="Not Ready" icon={<AlertTriangle className="w-4 h-4" />} />
+          {MATURITY_STATES.map(({ label, icon }) => (
+            <StatCard
+              key={label}
+              label={label}
+              value={<span className={getScoreColor(label)}>{stats.maturity_distribution[label] ?? 0}</span>}
+              icon={icon}
+            />
+          ))}
         </div>
       )}
 
@@ -196,6 +237,105 @@ export function AdminDashboard({ onSelectSpace }: AdminDashboardProps) {
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+function SubTabFallback() {
+  return (
+    <div className="flex items-center justify-center py-16 text-muted text-sm">
+      Loading…
+    </div>
+  )
+}
+
+/**
+ * Mounts its children on first activation, then keeps them mounted (hidden via
+ * display:none) so switching sub-tabs preserves component state (filters, scroll,
+ * loaded data) and doesn't re-trigger the lazy import / Suspense fallback. Lazy
+ * on first activation, so unvisited tabs don't load their chunks up front.
+ */
+function KeepAliveTab({ active, children }: { active: boolean; children: React.ReactNode }) {
+  const [mounted, setMounted] = useState(active)
+  if (active && !mounted) setMounted(true)
+  if (!mounted) return null
+  return <div hidden={!active}>{children}</div>
+}
+
+export function AdminDashboard({ onSelectSpace, initialSubTab }: AdminDashboardProps) {
+  const [subTab, setSubTab] = useState<AdminSubTab>(initialSubTab || "overview")
+  // Watch-only drill-down: when a user clicks a row inside the watch SpacesList,
+  // we open watch's own SpaceDetail in-place (not workbench's). The watch surface
+  // is read-only observability — its detail page has Overview/Usage/Cost/Resources/Evals.
+  const [watchDrillId, setWatchDrillId] = useState<string | null>(null)
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-display font-bold text-primary">Admin Dashboard</h2>
+          <p className="text-muted mt-1">Org-wide Genie Space health &amp; observability</p>
+        </div>
+      </div>
+
+      {/* Sub-tabs */}
+      <div className="border-b border-default flex items-center gap-1">
+        {SUB_TABS.map(t => (
+          <button
+            key={t.id}
+            onClick={() => { setSubTab(t.id); setWatchDrillId(null) }}
+            className={`flex items-center gap-1.5 px-3 py-2 -mb-px border-b-2 text-sm font-medium transition-colors ${
+              subTab === t.id
+                ? "border-accent text-accent"
+                : "border-transparent text-muted hover:text-secondary"
+            }`}
+          >
+            {t.icon}
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <KeepAliveTab active={subTab === "overview"}>
+        <AdminOverview onSelectSpace={onSelectSpace} />
+      </KeepAliveTab>
+
+      <KeepAliveTab active={subTab === "spaces"}>
+        <Suspense fallback={<SubTabFallback />}>
+          {watchDrillId ? (
+            <WatchSpaceDetail
+              spaceId={watchDrillId}
+              onBack={() => setWatchDrillId(null)}
+            />
+          ) : (
+            <WatchSpacesList onOpenSpace={(sid) => setWatchDrillId(sid)} />
+          )}
+        </Suspense>
+      </KeepAliveTab>
+
+      <KeepAliveTab active={subTab === "cost"}>
+        <Suspense fallback={<SubTabFallback />}>
+          <WatchCostExplorer onOpenSpace={(sid) => { setSubTab("spaces"); setWatchDrillId(sid) }} />
+        </Suspense>
+      </KeepAliveTab>
+
+      <KeepAliveTab active={subTab === "feedback"}>
+        <Suspense fallback={<SubTabFallback />}>
+          <WatchFeedback onOpenSpace={(sid) => { setSubTab("spaces"); setWatchDrillId(sid) }} />
+        </Suspense>
+      </KeepAliveTab>
+
+      <KeepAliveTab active={subTab === "resources"}>
+        <Suspense fallback={<SubTabFallback />}>
+          <WatchResourceRollup />
+        </Suspense>
+      </KeepAliveTab>
+
+      <KeepAliveTab active={subTab === "settings"}>
+        <Suspense fallback={<SubTabFallback />}>
+          <WatchSettings />
+        </Suspense>
+      </KeepAliveTab>
     </div>
   )
 }

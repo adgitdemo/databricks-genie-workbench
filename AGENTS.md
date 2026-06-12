@@ -27,14 +27,13 @@ cd frontend && npm run lint              # ESLint
 ./scripts/deploy.sh --update             # Code-only update (faster, skips app creation)
 ./scripts/deploy.sh --destroy            # Tear down app and clean up jobs (see Gotchas for scope)
 ./scripts/deploy.sh --destroy --auto-approve  # Tear down without confirmation prompt
+# Databricks notebook install path: clone into Databricks Git and run notebooks/install.py
 
 # Dependency management
 # requirements.txt is auto-generated from uv.lock — do not edit manually.
 # After adding/bumping a Python dep in pyproject.toml:
 uv lock --upgrade-package <package-name>
-uv export --frozen --no-dev --no-hashes --format requirements-txt \
-  | grep -v "^-e " > requirements.txt
-echo "-e ./packages/genie-space-optimizer" >> requirements.txt
+uv export --frozen --no-dev --no-hashes --format requirements-txt > requirements.txt
 
 # Backend unit tests (offline, no running server — pytest in backend/tests/)
 ./scripts/test.sh                 # Run full backend suite (installs dev deps if missing)
@@ -88,6 +87,7 @@ backend/
 scripts/
   install.sh               # Guided first-time setup (creates .env.deploy, provisions resources)
   deploy.sh                # Build + bundle deploy (job) + app deploy (idempotent)
+  deploy_lib/              # Shared Python deployment library used by notebooks/install.py
   preflight.sh             # Pre-deploy validation checks
   build.sh                 # Frontend build
   test.sh                  # Run the backend pytest suite (installs dev deps if missing)
@@ -95,6 +95,8 @@ scripts/
   grant_permissions.py     # Grants required permissions for app resources
   setup_lakebase.py        # Automates Lakebase Autoscaling project, SP role, and grants
   setup_synced_tables.py   # Sets up GSO synced tables in Lakebase
+notebooks/
+  install.py               # Databricks-native installer using WorkspaceClient() and generated workspace source
 frontend/
   src/
     App.tsx                # Root: SpaceList | SpaceDetail | AdminDashboard | CreateAgentChat
@@ -107,7 +109,7 @@ frontend/
   vite.config.ts           # Vite config with /api proxy to localhost:8000
 packages/
   genie-space-optimizer/   # GSO engine: separate Python package deployed as a wheel
-                           # Has its own pyproject.toml, uv.lock, package.json, bun.lock
+                           # Has its own pyproject.toml, uv.lock, package.json, package-lock.json
 ```
 
 ## Key Patterns
@@ -123,7 +125,7 @@ Two endpoints use `StreamingResponse` with `text/event-stream`:
 Frontend consumes these via manual `fetch` + `ReadableStream` in `lib/api.ts` (not EventSource). Buffer splitting on `\n\n`.
 
 ### Lakebase Persistence
-`services/lakebase.py` uses asyncpg with graceful fallback to in-memory dicts when `LAKEBASE_HOST` is not set. Supports both provisioned Lakebase and Lakebase Autoscaling — for autoscaling, uses `client.postgres.get_endpoint()` to resolve DNS and `client.postgres.generate_database_credential()` for OAuth tokens. Schema and tables are created by the app at startup via `_ensure_schema()` (the SP owns everything it creates). Lakebase project, SP role, and database-level grants (CONNECT, CREATE) are automated by `scripts/setup_lakebase.py`, called from `deploy.sh` via `uv run`.
+`services/lakebase.py` uses asyncpg with graceful fallback to in-memory dicts when `LAKEBASE_HOST` is not set. Supports both provisioned Lakebase and Lakebase Autoscaling — for autoscaling, uses `client.postgres.get_endpoint()` to resolve DNS and `client.postgres.generate_database_credential()` for OAuth tokens. Schema and tables are created by the app at startup via `_ensure_schema()` (the SP owns everything it creates). Lakebase project, SP role, and database-level grants (CONNECT, CREATE) are automated by `scripts/setup_lakebase.py` for the local terminal path and by `scripts.deploy_lib.lakebase` for the notebook path.
 
 ### LLM Calls
 All LLM calls go through Databricks model serving endpoints using OpenAI-compatible API. Model configured via `LLM_MODEL` env var (default: `databricks-claude-sonnet-4-6`). MLflow tracing is optional — controlled by `MLFLOW_EXPERIMENT_ID`.
@@ -148,33 +150,67 @@ Defined in `app.yaml`. Key ones:
 - `GSO_JOB_ID` — auto-injected by deploy script from bundle state
 - `GSO_WAREHOUSE_ID` — SQL warehouse for GSO queries (from app resource)
 
-Deploy config uses `.env.deploy` (created by `scripts/install.sh` from `.env.deploy.template`).
+Local terminal deploy config uses `.env.deploy` (created by `scripts/install.sh` from `.env.deploy.template`). The Databricks notebook installer uses widgets in `notebooks/install.py` and writes a patched `app.yaml` only into the generated workspace source folder.
 
 ## Dev/Test Workflow
 
 There is no local dev server — all testing is done by syncing code to Databricks and redeploying:
 
 1. Edit code locally
-2. Run `./scripts/deploy.sh` to build, bundle deploy, and app deploy
+2. Run `./scripts/deploy.sh --update` for local terminal installs, or rerun `notebooks/install.py` for notebook installs
 3. Test in the deployed Databricks App
 
 Do NOT suggest running `uvicorn` or `npm run dev` locally. The app depends on Databricks-managed resources (OBO auth, Lakebase, serving endpoints) that aren't available outside a Databricks App environment.
 
 ## Dependency Security Policy
 
-This project pins all dependencies to exact versions with integrity hashes following
-supply chain security hardening. Lock files are the source of truth — they prevent
-attacks like the litellm PyPI credential stealer (March 2026) and axios npm RAT
-(March 2026) by rejecting any package whose hash doesn't match the lockfile.
+This project pins all direct dependencies to exact versions and resolves
+transitive dependencies through lockfiles with integrity hashes.
+
+**Policy:**
+
+- `pyproject.toml` and `package.json` use only exact versions (`==1.2.3` for
+  Python, `1.2.3` for npm). No `^`, `~`, `>=`, `<=`, `<`, `>`, `~=`, or `*`.
+- All three lockfiles below must validate (`uv lock --check`,
+  `npm ci --dry-run --ignore-scripts`) before any deploy.
+- `mlflow` (and `mlflow-skinny` / `mlflow-tracing`) MUST resolve to the same
+  version across the workspace (today: `3.11.1`).
+- `npm` install paths must succeed without `--legacy-peer-deps`. If a peer
+  conflict appears, fix the manifest (bump the offending pin to a version
+  inside the peer-dep range) instead of reaching for the escape-hatch flag.
 
 **Lock files — always commit these:**
 
 | File | Covers | Verification |
 |---|---|---|
-| `uv.lock` | Root Python transitive deps | SHA256 hashes |
-| `packages/genie-space-optimizer/uv.lock` | GSO Python deps | SHA256 hashes |
+| `uv.lock` | Workspace-wide Python transitive deps | SHA256 hashes |
 | `frontend/package-lock.json` | Frontend npm deps | SHA-512 integrity |
-| `packages/genie-space-optimizer/bun.lock` | GSO UI deps | Integrity hashes |
+| `packages/genie-space-optimizer/package-lock.json` | GSO UI npm deps | SHA-512 integrity |
+
+The workspace uses a single root `uv.lock` for both root and
+`packages/genie-space-optimizer/` — uv writes there for any
+workspace-member invocation. There is intentionally no per-package `uv.lock`.
+
+**Updating a Python dep:**
+
+```bash
+# 1. Edit the exact version in pyproject.toml (root or GSO).
+# 2. Refresh the lock.
+uv lock --upgrade-package <package-name>
+# 3. Regenerate requirements.txt (pip-compatible reference).
+uv export --frozen --no-dev --no-hashes --format requirements-txt \
+  | grep -v "^-e " > requirements.txt
+echo "-e ./packages/genie-space-optimizer" >> requirements.txt
+git add pyproject.toml packages/genie-space-optimizer/pyproject.toml uv.lock requirements.txt
+```
+
+**Updating an npm dep:**
+
+```bash
+cd <frontend|packages/genie-space-optimizer>
+npm install <package>@<exact-version> --save-exact
+git add package.json package-lock.json
+```
 
 ## Gotchas
 
@@ -187,20 +223,21 @@ attacks like the litellm PyPI credential stealer (March 2026) and axios npm RAT
 - **Two separate optimization paths** — Quick Fix (`fix_agent.py`, from scan findings, auto-applies JSON patches) and Auto-Optimize (`auto_optimize.py` + GSO engine in `packages/genie-space-optimizer/`, full benchmark-driven optimization pipeline). They're independent.
 - **Vite proxy** — dev frontend at :5173 proxies `/api` to :8000. In production, FastAPI serves static files from `frontend/dist/` directly.
 - **Python 3.11+** required (`pyproject.toml`). Uses `uv` for dependency management (`uv.lock` present).
-- **Root `package.json`** exists solely as a build hook for Databricks Apps. `postinstall` is a no-op (frontend deps are installed by `deploy.sh` locally). `build` checks for pre-built `frontend/dist/index.html` — if present (uploaded by `deploy.sh`), skips the rebuild; falls back to a full build only if dist is missing. This prevents cross-platform Rollup failures on the Linux deploy container.
-- **Two deployment mechanisms** — `deploy.sh` manages the app (create, sync, `databricks apps deploy`) while the optimization job is managed by DABs (`databricks bundle deploy -t app`). The `app` target uses `mode: development` for per-deployer Terraform state with `presets.name_prefix: ""` for clean job names (no `[dev]` prefix). Do NOT run `databricks bundle deploy -t dev` for production — it creates prefixed orphan jobs.
+- **Root `package.json`** exists solely as a build hook for Databricks Apps. `postinstall` is a no-op. `build` checks for pre-built `frontend/dist/index.html` — if present (uploaded by `deploy.sh`), skips the rebuild; if dist is missing, runs `cd frontend && npm ci && npm run build`. This keeps CLI deploy fast while allowing workspace-folder deploys from fresh clones.
+- **Two install paths** — local terminal installs use `scripts/install.sh`/`scripts/deploy.sh`, with the optimization job managed by DABs (`databricks bundle deploy -t app`). Notebook installs use `notebooks/install.py`, generate source under `/Workspace/Users/<user>/.genie-workbench-deploy/<app-name>/app`, and manage the GSO job through SDK/Jobs API reset/update semantics. Do NOT run `databricks bundle deploy -t dev` for production — it creates prefixed orphan jobs.
 - **Databricks CLI >= 0.297.2 required** — `preflight.sh` validates this automatically.
 - **`--destroy` does not remove all resources** — it deletes the app and jobs but leaves behind: Lakebase data (`genie` schema), UC schema/tables (`<catalog>.genie_space_optimizer`), Genie Space SP permissions, MLflow experiments, and synced tables. Clean these up manually if needed.
 - **`frontend/dist/` must be explicitly uploaded** with `databricks workspace import-dir` because `databricks sync --full` only uploads non-gitignored files.
 - **`requirements.txt` is databricksignored** — the platform uses `uv sync` instead of `pip install`. If you see pip dependency conflicts, verify `requirements.txt` is in `.databricksignore`.
 - **`MLFLOW_EXPERIMENT_ID` is workspace-specific** — the app validates it at startup and silently disables tracing if the experiment doesn't exist.
+- **Lakebase state is app-instance scoped** — keep the app name stable and update through the same install path (`./scripts/deploy.sh --update` locally, or rerun `notebooks/install.py`). If creating a new app instance, use a fresh Lakebase project; reusing an older app's Lakebase project can leave `genie` tables/sequences owned by the old app SP.
 
 ## Platform Build Strategy
 
 The Databricks Apps platform detects `package.json` at the root and runs `npm install` then `npm run build`. To avoid cross-platform failures (macOS lockfile vs Linux container) and redundant rebuilds, the root `package.json` is configured as follows:
 
-- **`postinstall`**: No-op. Frontend deps are installed by `deploy.sh` locally.
-- **`build`**: Checks for pre-built `frontend/dist/index.html`. If present (uploaded by `deploy.sh`), skips the rebuild. Falls back to a full build only if dist is missing.
+- **`postinstall`**: No-op. It does not invoke nested npm commands during `npm install`.
+- **`build`**: Checks for pre-built `frontend/dist/index.html`. If present (uploaded by `deploy.sh`), skips the rebuild. If dist is missing, runs `cd frontend && npm ci && npm run build`.
 - **`start`**: Runs uvicorn (though `app.yaml` `command` takes precedence).
 
 Python dependencies use `uv sync` on the platform (because `requirements.txt` is excluded from `.databricksignore`). This gives a clean venv with SHA256-verified hashes, avoiding conflicts with pre-installed platform packages (dash, gradio, streamlit, etc.).

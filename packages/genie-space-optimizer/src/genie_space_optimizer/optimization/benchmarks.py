@@ -226,6 +226,9 @@ def load_benchmarks_from_dataset(
                     benchmarks = [_normalize_benchmark_row(r.asDict(recursive=True)) for r in rows]
                     if rows and "inputs" in (rows[0].asDict()):
                         logger.debug("Normalized %d benchmark rows from nested MLflow format", len(rows))
+                    from genie_space_optimizer.common.config import MAX_BENCHMARK_COUNT
+                    if len(benchmarks) > MAX_BENCHMARK_COUNT:
+                        benchmarks = benchmarks[:MAX_BENCHMARK_COUNT]
                     return benchmarks
                 except Exception as read_err:
                     err_msg = str(read_err)
@@ -242,11 +245,36 @@ def load_benchmarks_from_dataset(
         else:
             df = spark_or_dataset
             rows = df.collect()
-            return [_normalize_benchmark_row(r.asDict(recursive=True)) for r in rows]
+            benchmarks = [_normalize_benchmark_row(r.asDict(recursive=True)) for r in rows]
+            from genie_space_optimizer.common.config import MAX_BENCHMARK_COUNT
+            if len(benchmarks) > MAX_BENCHMARK_COUNT:
+                benchmarks = benchmarks[:MAX_BENCHMARK_COUNT]
+            return benchmarks
     except Exception:
         logger.exception("Failed to load benchmarks from %s", table_name)
         return []
     return []
+
+
+def assert_benchmark_handoff_visible(
+    *,
+    expected_total: int,
+    actual_total: int,
+    domain: str,
+    table_name: str,
+) -> None:
+    """Fail before baseline eval when preflight-published benchmark count is not visible."""
+    if expected_total <= 0:
+        return
+    if actual_total >= expected_total:
+        return
+    raise RuntimeError(
+        "Benchmark handoff mismatch before evaluation: "
+        f"preflight published {expected_total} benchmark(s) for domain={domain}, "
+        f"but baseline loaded {actual_total} from {table_name}. "
+        "This usually means the UC evaluation dataset table is stale or merge_records "
+        "has not become visible. Retry the load or fail before mlflow.genai.evaluate."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -454,11 +482,60 @@ def validate_ground_truth_sql(
             suggest_match = _re.search(r"Did you mean one of the following\? \[([^\]]+)\]", err_msg)
             col_name = col_match.group(1) if col_match else "?"
             suggestion = suggest_match.group(1) if suggest_match else "?"
-            return False, (
-                f"UNRESOLVED_COLUMN: `{col_name}` — "
-                f"suggestion: {suggestion} "
-                f"(hint: use MEASURE({col_name}) for metric view measures in ORDER BY)"
+
+            # F10 — gate the MEASURE() hint on evidence the unresolved
+            # column is actually a metric-view measure. Previously
+            # every UNRESOLVED_COLUMN got the same MEASURE() hint
+            # unconditionally, including cases where the unresolved
+            # token was a missing TABLE reference (e.g. ``dim_date``
+            # without qualification). The misleading hint then
+            # propagated into the correction-LLM prompt as
+            # ``validation_error``, steering the model toward the
+            # wrong fix (wrap-in-MEASURE instead of qualify-table).
+            # The hint now fires only when either
+            #   (a) the Spark error explicitly reports
+            #       ``METRIC_VIEW_MISSING_MEASURE_FUNCTION`` — the
+            #       canonical signal that a measure needs wrapping, or
+            #   (b) the unresolved column matches a known measure
+            #       name across any metric view in ``config`` — which
+            #       handles the case where Spark collapses the
+            #       failure into a plain UNRESOLVED_COLUMN while
+            #       still being a measure issue.
+            from genie_space_optimizer.optimization.evaluation import (
+                metric_view_error_kind,
             )
+
+            include_measure_hint = metric_view_error_kind(err_msg) == "missing_measure"
+            if not include_measure_hint and col_name != "?" and config:
+                _lc_col = col_name.lower()
+                _parsed = config.get("_parsed_space", config)
+                _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+                _mvs = _ds.get("metric_views", []) if isinstance(_ds, dict) else []
+                for _mv in _mvs:
+                    if not isinstance(_mv, dict):
+                        continue
+                    for _measure in _mv.get("measures", []) or []:
+                        _mname = ""
+                        if isinstance(_measure, dict):
+                            _mname = str(_measure.get("name") or "").strip()
+                        elif isinstance(_measure, str):
+                            _mname = _measure.strip()
+                        if _mname and _mname.lower() == _lc_col:
+                            include_measure_hint = True
+                            break
+                    if include_measure_hint:
+                        break
+
+            base = (
+                f"UNRESOLVED_COLUMN: `{col_name}` — "
+                f"suggestion: {suggestion}"
+            )
+            if include_measure_hint:
+                return False, (
+                    f"{base} "
+                    f"(hint: use MEASURE({col_name}) for metric view measures in ORDER BY)"
+                )
+            return False, base
         return False, err_msg
 
     table_refs = _extract_table_references(resolved)
@@ -570,6 +647,29 @@ def validate_benchmarks(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def deterministic_question_sql_alignment_issues(benchmark: dict) -> list[str]:
+    """Return deterministic alignment issues for a benchmark.
+
+    The LLM alignment check is expensive and noisy for filter
+    misalignments that are cheap to detect via string match. This
+    helper consults the configurable
+    ``DETERMINISTIC_EXTRA_FILTER_RULES`` registry in
+    :mod:`alignment_rules` so deployments can opt into deterministic
+    shortcuts for their well-known business flags. The default
+    registry is empty, which means every benchmark falls through to
+    the LLM alignment validator (the previous behavior for any space
+    that did not match the legacy hardcoded rule).
+    """
+    from genie_space_optimizer.optimization.alignment_rules import (
+        evaluate_extra_filter_rules,
+    )
+
+    return evaluate_extra_filter_rules(
+        question=str(benchmark.get("question") or ""),
+        expected_sql=str(benchmark.get("expected_sql") or ""),
+    )
+
+
 def validate_question_sql_alignment(
     benchmarks: list[dict],
     *,
@@ -587,7 +687,6 @@ def validate_question_sql_alignment(
 
     from genie_space_optimizer.common.config import (
         BENCHMARK_ALIGNMENT_CHECK_PROMPT,
-        LLM_ENDPOINT,
         format_mlflow_template,
     )
 
@@ -930,27 +1029,37 @@ def assign_splits(
     train_ratio: float = 1.0 - HELD_OUT_RATIO,
     seed: int = 42,
 ) -> list[dict]:
-    """Assign ``split`` field (``train`` or ``held_out``) to each benchmark.
+    """Assign ``split`` field using deterministic random sampling.
 
-    Curated benchmarks (``provenance == "curated"``) are always assigned to
-    ``train`` so the optimizer always sees user-authored questions.  Only
-    non-curated benchmarks participate in the random held-out split.
-
-    Uses deterministic shuffle based on *seed* for reproducibility.
+    Split assignment is intentionally independent of benchmark provenance.
+    User-authored, sample-derived, synthetic, and gap-fill questions all
+    participate in the same random split so the held-out set is a real random
+    sample of the final validated corpus.
     """
-    curated_indices = {
-        i for i, b in enumerate(benchmarks) if b.get("provenance") == "curated"
-    }
-    splittable = [i for i in range(len(benchmarks)) if i not in curated_indices]
+    from genie_space_optimizer.common.config import (
+        MIN_HELD_OUT_BENCHMARK_COUNT,
+        MIN_TRAIN_BENCHMARK_COUNT,
+    )
 
+    n = len(benchmarks)
+    if n == 0:
+        return benchmarks
+    if n == 1:
+        benchmarks[0]["split"] = "train"
+        return benchmarks
+
+    if n >= MIN_TRAIN_BENCHMARK_COUNT + MIN_HELD_OUT_BENCHMARK_COUNT:
+        held_out_count = MIN_HELD_OUT_BENCHMARK_COUNT
+    else:
+        held_out_count = max(1, min(n - 1, int(round(n * (1.0 - train_ratio)))))
+
+    indices = list(range(n))
     rng = random.Random(seed)
-    rng.shuffle(splittable)
-    cutoff = int(len(splittable) * train_ratio)
+    rng.shuffle(indices)
+    held_out_indices = set(indices[:held_out_count])
 
-    for i in curated_indices:
-        benchmarks[i]["split"] = "train"
-    for rank, idx in enumerate(splittable):
-        benchmarks[idx]["split"] = "train" if rank < cutoff else "held_out"
+    for i, benchmark in enumerate(benchmarks):
+        benchmark["split"] = "held_out" if i in held_out_indices else "train"
 
     return benchmarks
 
@@ -1232,66 +1341,384 @@ def _extract_primary_table(sql: str, metadata_snapshot: dict) -> str | None:
     return None
 
 
-def _auto_prefix_bare_columns(
-    sql: str,
-    table_identifier: str,
-    metadata_snapshot: dict,
+def _resolve_primary_table_fqn(
+    table_identifier: str, *, catalog: str, gold_schema: str,
 ) -> str:
-    """Add table prefix to bare column references in a SQL snippet.
+    """Return the fully-qualified ``catalog.schema.table`` identifier.
 
-    The Genie API requires ``table.column`` syntax in SQL expressions.
-    This function detects bare column names (those not already prefixed
-    with ``table.``) and prepends the short table name.
+    Handles the two shapes we see in practice:
 
-    Returns the SQL with prefixed columns (original SQL unchanged if
-    all columns are already qualified or no columns are recognized).
+    - Already FQ (``foo.bar.baz``) — returned as-is after placeholder
+      substitution (so ``${catalog}.${gold_schema}.t`` resolves too).
+    - Short (``baz``) — wrapped in placeholders, then resolved.
     """
-    import re as _re
+    if not table_identifier:
+        return ""
+    if "." not in table_identifier:
+        templated = f"${{catalog}}.${{gold_schema}}.{table_identifier}"
+    else:
+        templated = table_identifier
+    return resolve_sql(templated, catalog=catalog, gold_schema=gold_schema)
 
+
+def _collect_columns_by_table(metadata_snapshot: dict) -> dict[str, set[str]]:
+    """Build ``{table_identifier_lower: {column_name_lower, ...}}``.
+
+    Includes metric view measures and dimensions alongside regular columns so
+    a SQL snippet like ``SUM(mv_sales.cy_sales)`` has its bare form
+    (``SUM(cy_sales)``) recognised and prefixed.
+    """
     ds = metadata_snapshot.get("data_sources", {})
     all_sources: list = []
     if isinstance(ds, dict):
         all_sources.extend(ds.get("tables", []) or [])
         all_sources.extend(ds.get("metric_views", []) or [])
 
-    short_name = table_identifier.split(".")[-1] if table_identifier else ""
-    if not short_name:
-        return sql
-
-    column_names: set[str] = set()
+    out: dict[str, set[str]] = {}
     for t in all_sources:
         if not isinstance(t, dict):
             continue
-        tid = (t.get("identifier") or t.get("name") or "").lower()
-        if short_name.lower() in tid:
-            for col in (t.get("columns", []) or []):
-                cname = (col.get("name") or "").strip()
-                if cname:
-                    column_names.add(cname.lower())
-            for cc in (t.get("column_configs", []) or []):
-                cname = (cc.get("column_name") or "").strip()
-                if cname:
-                    column_names.add(cname.lower())
-            break
+        tid = (t.get("identifier") or t.get("name") or "").strip().lower()
+        if not tid:
+            continue
+        cols: set[str] = set()
+        for col in (t.get("columns", []) or []):
+            name = (col.get("name") or "").strip().lower()
+            if name:
+                cols.add(name)
+        for cc in (t.get("column_configs", []) or []):
+            name = (cc.get("column_name") or "").strip().lower()
+            if name:
+                cols.add(name)
+        # Metric views expose measures + dimensions as first-class references
+        # that can appear in raw SQL expressions against the MV.
+        for m in (t.get("measures", []) or []):
+            name = (m.get("name") or "").strip().lower()
+            if name:
+                cols.add(name)
+        for d in (t.get("dimensions", []) or []):
+            name = (d.get("name") or "").strip().lower()
+            if name:
+                cols.add(name)
+        out[tid] = cols
+    return out
 
-    if not column_names:
-        return sql
+
+# ``AS alias`` and ``WITH alias AS (`` — their identifiers must never be
+# prefixed as columns. Kept intentionally permissive: a false-positive on an
+# alias just means we skip prefixing, which is always safe.
+_CTE_AS_ALIAS_RE = _re.compile(
+    r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)", _re.IGNORECASE,
+)
+_WITH_ALIAS_RE = _re.compile(
+    r"\bWITH\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", _re.IGNORECASE,
+)
+# Explicit table references in a SQL body (FROM / JOIN). We do not need a
+# full parser — the goal is to bound the ambiguity guard to tables that the
+# SQL actually touches, not every table in the snapshot.
+_FROM_JOIN_TABLE_RE = _re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_.`]*)",
+    _re.IGNORECASE,
+)
+
+
+def _extract_cte_aliases(sql: str) -> set[str]:
+    """Return a set of lowercase identifiers that look like CTE / AS aliases."""
+    aliases: set[str] = set()
+    for m in _CTE_AS_ALIAS_RE.finditer(sql):
+        aliases.add(m.group(1).lower())
+    for m in _WITH_ALIAS_RE.finditer(sql):
+        aliases.add(m.group(1).lower())
+    return aliases
+
+
+def _extract_referenced_tables(sql: str, known_tables: dict[str, set[str]]) -> set[str]:
+    """Return the subset of ``known_tables`` whose identifier appears in ``sql``.
+
+    We match by short name (last segment) OR full identifier — the SQL might
+    reference either. Only tables actually mentioned in ``FROM`` / ``JOIN``
+    are returned; this scopes the ambiguity guard to the query's real
+    universe rather than every source in the snapshot.
+    """
+    referenced: set[str] = set()
+    mentioned: set[str] = set()
+    for m in _FROM_JOIN_TABLE_RE.finditer(sql):
+        raw = m.group(1).strip("`").lower()
+        mentioned.add(raw)
+        if "." in raw:
+            mentioned.add(raw.split(".")[-1])
+    for tid in known_tables:
+        short = tid.split(".")[-1]
+        if tid in mentioned or short in mentioned:
+            referenced.add(tid)
+    return referenced
+
+
+def _auto_prefix_bare_columns(
+    sql: str,
+    table_identifier: str,
+    metadata_snapshot: dict,
+    *,
+    catalog: str = "",
+    gold_schema: str = "",
+) -> tuple[str, list[str]]:
+    """Prefix bare column references with the fully-qualified table name.
+
+    The Genie API rejects ``column`` references and short-form
+    ``table.column`` references at serving time — SQL snippets stored in
+    ``instructions.sql_snippets.*`` must use
+    ``catalog.schema.table.column``. This was the root cause of the bug
+    from the failing run.
+
+    Behaviour:
+
+    - Resolves ``${catalog}`` / ``${gold_schema}`` placeholders via
+      :func:`resolve_sql` before emitting the prefix.
+    - Emits the full identifier (``catalog.schema.table``) — not the short
+      table name — so every stored snippet is usable by the serving path.
+    - Ambiguity guard: if a bare column matches columns on 2+ tables that
+      the SQL references (FROM / JOIN), the column is skipped and a
+      warning is appended. Single-table snippets (the common case) are
+      unaffected.
+    - Metric views: ``measures[].name`` and ``dimensions[].name`` are
+      discovered alongside regular columns so ``SUM(cy_sales)`` against an
+      MV with a ``cy_sales`` measure prefixes correctly.
+    - CTE / subquery aliases (``WITH x AS (...)`` or ``FROM t AS x``) are
+      never rewritten as columns.
+
+    Returns ``(sql, warnings)``. Warnings is a (possibly empty) list of
+    human-readable strings; never raises.
+    """
+    warnings: list[str] = []
+    if not sql:
+        return sql, warnings
+
+    # Resolve the primary table to its FQ form up front. Without a primary
+    # table we cannot decide which prefix to emit — return the SQL as-is and
+    # leave the warning so the caller can drop the snippet if strict.
+    primary_fqn = _resolve_primary_table_fqn(
+        table_identifier, catalog=catalog, gold_schema=gold_schema,
+    )
+    if not primary_fqn:
+        warnings.append(
+            "no primary table identifier provided; columns left un-prefixed"
+        )
+        return sql, warnings
+
+    all_columns = _collect_columns_by_table(metadata_snapshot)
+    primary_lower = primary_fqn.lower()
+
+    # Try the exact FQ key first; fall back to any entry whose short name
+    # matches (handles metadata snapshots that store short-form identifiers).
+    primary_cols: set[str] = set()
+    if primary_lower in all_columns:
+        primary_cols = all_columns[primary_lower]
+    else:
+        primary_short = primary_lower.split(".")[-1]
+        for tid, cols in all_columns.items():
+            if tid.split(".")[-1] == primary_short:
+                primary_cols = cols
+                break
+
+    if not primary_cols:
+        warnings.append(
+            f"no columns known for primary table {primary_fqn!r}; "
+            "columns left un-prefixed"
+        )
+        return sql, warnings
+
+    referenced_tables = _extract_referenced_tables(sql, all_columns)
+    # Scope the ambiguity guard to tables actually mentioned in the SQL plus
+    # the primary. Bare expressions (no FROM/JOIN) shrink the universe to
+    # just the primary, which is the common case for sql_snippets.
+    in_scope = referenced_tables | {primary_lower}
+
+    cte_aliases = _extract_cte_aliases(sql)
 
     result = sql
-    for col in sorted(column_names, key=len, reverse=True):
+    # Longest-column-first so columns whose name is a prefix of another
+    # (``revenue`` vs ``revenue_amt``) don't partially-match.
+    for col in sorted(primary_cols, key=len, reverse=True):
+        col_lower = col.lower()
+        if col_lower in cte_aliases:
+            continue
+        # Ambiguity: column is present on >1 in-scope table.
+        other_tables_with_col = [
+            tid for tid in in_scope
+            if tid != primary_lower and col_lower in all_columns.get(tid, set())
+        ]
+        if other_tables_with_col:
+            warnings.append(
+                f"column {col!r} is ambiguous — present on primary {primary_fqn} "
+                f"and also on {sorted(other_tables_with_col)!r}; skipped"
+            )
+            continue
+
         pattern = _re.compile(
-            r'(?<![.\w])(' + _re.escape(col) + r')(?!\w)',
+            r'(?<![.\w`])(' + _re.escape(col) + r')(?!\w)',
             _re.IGNORECASE,
         )
-        def _replacer(m: _re.Match) -> str:
+
+        def _replacer(m: _re.Match, _cur: str = result) -> str:
             start = m.start()
-            prefix_check = result[:start]
-            if prefix_check.rstrip().endswith("."):
+            # Already qualified (``t.col``, ``schema.t.col``, or backtick-
+            # quoted) — leave alone.
+            prefix_check = _cur[:start]
+            if prefix_check.rstrip().endswith(".") or prefix_check.rstrip().endswith("`"):
                 return m.group(0)
-            return f"{short_name}.{m.group(1)}"
+            return f"{primary_fqn}.{m.group(1)}"
+
         result = pattern.sub(_replacer, result)
 
-    return result
+    return result, warnings
+
+
+def normalize_sql_snippet(
+    sql: str,
+    snippet_type: str,
+    metadata_snapshot: dict,
+    *,
+    catalog: str = "",
+    gold_schema: str = "",
+    spark: Any = None,
+    w: Any = None,
+    warehouse_id: str = "",
+) -> tuple[str, list[str]]:
+    """Return the stored form of a SQL snippet: strip wrappers, FQ-prefix, EXPLAIN.
+
+    This is the *storage* shape — no execution check, no data read. Used
+    for (a) repairing existing snippets in-place (the common case: a
+    space already has snippets with short-form prefixes) and (b) pre-
+    validating freshly-mined candidates before the heavier execution
+    check in :func:`validate_sql_snippet`.
+
+    Steps:
+
+    1. Trim the SQL and drop trailing semicolons.
+    2. Drop wrapper clauses — Genie stores the raw expression, never
+       ``SELECT …`` or ``WHERE …``.
+    3. Prefix bare columns with ``catalog.schema.table`` (see
+       :func:`_auto_prefix_bare_columns`).
+    4. If an execution backend is available, run ``EXPLAIN`` on the
+       wrapped form to catch syntax / resolution errors. This is
+       optional — callers can skip it by omitting both ``spark`` and
+       ``w``/``warehouse_id``.
+
+    Returns ``(normalized_sql, warnings)``. On EXPLAIN failure, the
+    error is added to ``warnings`` but the normalized SQL is still
+    returned so the caller can decide whether to store it anyway.
+    """
+    warnings: list[str] = []
+    if not sql or not isinstance(sql, str):
+        return sql, warnings
+
+    cleaned = sql.strip()
+    # Drop trailing semicolons & comments on a single line.
+    while cleaned.endswith(";"):
+        cleaned = cleaned[:-1].rstrip()
+
+    # Strip ``SELECT``/``WHERE`` wrappers a well-meaning LLM might emit —
+    # Genie rejects them at the snippet boundary. This is a best-effort
+    # unwrap; it won't defeat a legitimate subquery that starts with
+    # SELECT.
+    if snippet_type == "filter":
+        upper = cleaned.upper()
+        if upper.startswith("WHERE "):
+            cleaned = cleaned[6:].lstrip()
+
+    # Locate the primary table so we can FQ-prefix.
+    table = _extract_primary_table(cleaned, metadata_snapshot)
+    if not table:
+        warnings.append("cannot determine primary table; skipping FQ-prefix")
+        prefixed_sql = cleaned
+    else:
+        prefixed_sql, prefix_warnings = _auto_prefix_bare_columns(
+            cleaned, table, metadata_snapshot,
+            catalog=catalog, gold_schema=gold_schema,
+        )
+        warnings.extend(prefix_warnings)
+
+    # EXPLAIN guard — caller opts in by providing an execution backend.
+    have_backend = (spark is not None) or (w is not None and warehouse_id)
+    if have_backend and table:
+        resolved_table = _resolve_primary_table_fqn(
+            table, catalog=catalog, gold_schema=gold_schema,
+        )
+        if snippet_type == "filter":
+            wrapped = f"SELECT 1 FROM {resolved_table} WHERE {prefixed_sql} LIMIT 1"
+        else:
+            wrapped = f"SELECT {prefixed_sql} FROM {resolved_table} LIMIT 1"
+        try:
+            if w and warehouse_id:
+                from genie_space_optimizer.optimization.evaluation import (
+                    _execute_sql_via_warehouse,
+                )
+                _execute_sql_via_warehouse(
+                    w, warehouse_id, f"EXPLAIN {wrapped}",
+                    catalog=catalog, schema=gold_schema,
+                )
+            elif spark is not None:
+                _set_sql_context(spark, catalog, gold_schema)
+                spark.sql(f"EXPLAIN {wrapped}")
+        except Exception as exc:
+            warnings.append(f"EXPLAIN failed: {exc}")
+
+    return prefixed_sql, warnings
+
+
+# S8 — tautology detectors for ``snippet_type == "filter"``.
+# Cheap syntactic pre-check before we spend a warehouse round-trip. Each
+# pattern targets a canonical form the model regularly emits as a "safe
+# no-op": ``1=1``, ``TRUE``, ``col = col``, ``x IS NOT NULL OR x IS NULL``.
+_VACUOUS_FILTER_PATTERNS: tuple[_re.Pattern[str], ...] = (
+    _re.compile(r"^\s*1\s*=\s*1\s*$"),
+    _re.compile(r"^\s*(true|TRUE)\s*$"),
+    _re.compile(r"^\s*(\w+)\s*=\s*\1\s*$"),
+    _re.compile(
+        r"^\s*(\w+)\s+IS\s+NOT\s+NULL\s+OR\s+\1\s+IS\s+NULL\s*$",
+        _re.IGNORECASE,
+    ),
+    _re.compile(
+        r"^\s*(\w+)\s+IS\s+NULL\s+OR\s+\1\s+IS\s+NOT\s+NULL\s*$",
+        _re.IGNORECASE,
+    ),
+)
+
+
+def _is_vacuous_filter_syntactic(sql: str) -> bool:
+    """Return True when ``sql`` textually matches a tautology template."""
+    candidate = (sql or "").strip().strip(";").strip()
+    if candidate.startswith("(") and candidate.endswith(")"):
+        candidate = candidate[1:-1].strip()
+    return any(p.match(candidate) for p in _VACUOUS_FILTER_PATTERNS)
+
+
+# B5 — match ``<identifier> = '<literal>'`` or ``<identifier> = <numeric>``.
+# The zero-row-rejection guard below uses this to limit the false-positive
+# blast radius: range / inequality / IN-list filters that legitimately
+# match no current rows (e.g. ``created_at > 2030-01-01``) bypass the
+# guard and stay accepted.
+_SIMPLE_EQUALITY_PATTERN = _re.compile(
+    r"""^\s*
+        (?:[A-Za-z_][A-Za-z0-9_]*\.)*       # optional table / schema prefix
+        [A-Za-z_][A-Za-z0-9_]*              # identifier
+        \s*=\s*
+        (?:                                 # right-hand-side literal:
+            '(?:[^']|'')*'                   #   single-quoted string
+          | -?\d+(?:\.\d+)?                  #   numeric
+        )
+        \s*$
+    """,
+    _re.IGNORECASE | _re.VERBOSE,
+)
+
+
+def _is_simple_equality(sql: str) -> bool:
+    """Return True when *sql* is a single equality on a literal RHS."""
+    candidate = (sql or "").strip().strip(";").strip()
+    if candidate.startswith("(") and candidate.endswith(")"):
+        candidate = candidate[1:-1].strip()
+    return bool(_SIMPLE_EQUALITY_PATTERN.match(candidate))
 
 
 def validate_sql_snippet(
@@ -1305,38 +1732,68 @@ def validate_sql_snippet(
     w: Any = None,
     warehouse_id: str = "",
 ) -> tuple[bool, str, str]:
-    """Validate a SQL snippet by wrapping it in an executable context and running it.
+    """Validate a SQL snippet: normalize + EXPLAIN + execute.
 
-    Three-phase validation mirroring validate_ground_truth_sql:
-      1. Auto-prefix bare column names with table name (Genie API requirement).
-      2. EXPLAIN — catches syntax errors and unresolvable references.
-      3. Execution — runs the wrapped SQL with LIMIT 1.
+    Three-phase validation mirroring ``validate_ground_truth_sql``:
 
-    Wrapping rules:
-      - measure:    SELECT <sql> FROM <table> LIMIT 1
-      - filter:     SELECT 1 FROM <table> WHERE <sql> LIMIT 1
-      - expression: SELECT <sql> FROM <table> LIMIT 1
+    1. :func:`normalize_sql_snippet` — strip wrappers, FQ-prefix bare
+       columns, EXPLAIN. This is the shape we'll store.
+    2. Execution — runs the wrapped SQL with ``LIMIT 1``.
+
+    Wrapping rules for execution:
+
+    - measure:    ``SELECT <sql> FROM <table> LIMIT 1``
+    - filter:     ``SELECT 1 FROM <table> WHERE <sql> LIMIT 1``
+    - expression: ``SELECT <sql> FROM <table> LIMIT 1``
+
+    S8 — when ``snippet_type == "filter"`` and ``GSO_REJECT_VACUOUS_FILTERS``
+    is on (default), two additional guards run:
+
+    - A syntactic pre-check that rejects ``1=1``, ``TRUE``, ``col = col``,
+      and the ``x IS NULL OR x IS NOT NULL`` tautology without touching
+      the warehouse.
+    - A selectivity post-check (after the LIMIT-1 probe succeeds) that
+      runs ``SELECT COUNT(*) total, COUNT(*) FILTER (WHERE <filter>)``
+      on the resolved table and rejects the snippet when ``filtered >=
+      total`` (the filter restricts nothing). If the table is empty
+      (``total == 0``) we skip the check — emptiness cannot prove vacuity.
 
     Returns ``(is_valid, error_message, prefixed_sql)`` — callers should
-    use ``prefixed_sql`` (the 3rd element) when storing the snippet to
-    ensure ``table.column`` syntax required by the Genie API.
+    use ``prefixed_sql`` (the 3rd element) when storing the snippet so
+    the FQ form is persisted.
     """
+    from genie_space_optimizer.common.config import REJECT_VACUOUS_FILTERS
+
     table = _extract_primary_table(sql, metadata_snapshot)
     if not table:
         return False, "Cannot determine primary table for SQL snippet", sql
 
-    resolved_table = resolve_sql(
-        f"${{catalog}}.${{gold_schema}}.{table.split('.')[-1]}"
-        if "." not in table else table,
+    prefixed_sql, warnings = normalize_sql_snippet(
+        sql, snippet_type, metadata_snapshot,
         catalog=catalog, gold_schema=gold_schema,
+        spark=spark, w=w, warehouse_id=warehouse_id,
     )
+    # ``normalize_sql_snippet`` surfaces EXPLAIN failures via warnings.
+    for warning in warnings:
+        if warning.startswith("EXPLAIN failed:"):
+            return False, warning, prefixed_sql
 
-    sql = _auto_prefix_bare_columns(sql, table, metadata_snapshot)
+    # S8 — syntactic tautology pre-check. Rejects the most common
+    # no-op shapes before we spend a warehouse round-trip.
+    if (
+        REJECT_VACUOUS_FILTERS
+        and snippet_type == "filter"
+        and _is_vacuous_filter_syntactic(prefixed_sql)
+    ):
+        return False, f"filter is tautological: {prefixed_sql}", prefixed_sql
 
+    resolved_table = _resolve_primary_table_fqn(
+        table, catalog=catalog, gold_schema=gold_schema,
+    )
     if snippet_type == "filter":
-        wrapped = f"SELECT 1 FROM {resolved_table} WHERE {sql} LIMIT 1"
+        wrapped = f"SELECT 1 FROM {resolved_table} WHERE {prefixed_sql} LIMIT 1"
     else:
-        wrapped = f"SELECT {sql} FROM {resolved_table} LIMIT 1"
+        wrapped = f"SELECT {prefixed_sql} FROM {resolved_table} LIMIT 1"
 
     def _run_sql(statement: str) -> Any:
         if w and warehouse_id:
@@ -1352,14 +1809,118 @@ def validate_sql_snippet(
             return spark.sql(statement)
         raise RuntimeError("No SQL execution backend available")
 
-    try:
-        _run_sql(f"EXPLAIN {wrapped}")
-    except Exception as exc:
-        return False, f"EXPLAIN failed: {exc}", sql
+    def _first_row_values(result: Any) -> list[Any]:
+        """Return the first row as a list regardless of backend shape."""
+        if result is None:
+            return []
+        if hasattr(result, "collect"):
+            rows = result.collect()
+            if not rows:
+                return []
+            first = rows[0]
+            if hasattr(first, "asDict"):
+                return list(first.asDict().values())
+            try:
+                return list(first)
+            except TypeError:
+                return [first]
+        if hasattr(result, "result") and hasattr(result.result, "data_array"):
+            data = result.result.data_array or []
+            return list(data[0]) if data else []
+        if isinstance(result, list) and result:
+            row = result[0]
+            if isinstance(row, dict):
+                return list(row.values())
+            if isinstance(row, (list, tuple)):
+                return list(row)
+            return [row]
+        return []
 
     try:
         _run_sql(wrapped)
     except Exception as exc:
-        return False, f"Execution failed: {exc}", sql
+        # Tier 3.13: classify CAST_INVALID_INPUT separately. This fires
+        # when a filter-type snippet compares a STRING literal to a
+        # non-STRING column (typically BIGINT booleans encoded as 'Y'/'N',
+        # where the UC column is numeric). The error is NOT a parser
+        # bug — it's a type-mismatch in the proposed filter itself, so
+        # we return a cleaner reason code. Callers that see
+        # ``cast_invalid_input`` know to reject the proposal without
+        # a broad "Execution failed" blob in the log.
+        _msg = str(exc)
+        if "CAST_INVALID_INPUT" in _msg or "cannot be cast to" in _msg:
+            return (
+                False,
+                (
+                    f"cast_invalid_input: filter predicate compares values "
+                    f"that Databricks SQL can't coerce. Check the column's "
+                    f"UC-declared type vs the literal in the snippet. "
+                    f"Detail: {_msg[:200]}"
+                ),
+                prefixed_sql,
+            )
+        try:
+            from genie_space_optimizer.optimization.evaluation import (
+                is_metric_view_error,
+            )
+            if is_metric_view_error(_msg):
+                return False, _msg, prefixed_sql
+        except Exception:
+            pass
+        return False, f"Execution failed: {exc}", prefixed_sql
 
-    return True, "", sql
+    # S8 — post-execution selectivity probe. EXPLAIN + LIMIT 1 passed;
+    # now verify the filter actually restricts the result set. Silently
+    # skipped for empty tables (``total == 0``) because vacuity cannot
+    # be proven on zero rows.
+    if REJECT_VACUOUS_FILTERS and snippet_type == "filter":
+        selectivity_stmt = (
+            f"SELECT COUNT(*) AS total, "
+            f"COUNT(*) FILTER (WHERE {prefixed_sql}) AS filtered "
+            f"FROM {resolved_table}"
+        )
+        try:
+            result = _run_sql(selectivity_stmt)
+            values = _first_row_values(result)
+        except Exception as exc:
+            # Selectivity probe is a guard, not a requirement. If it
+            # fails we fall back to the lenient pre-S8 behaviour.
+            logger.debug(
+                "Selectivity probe failed for %s: %s; accepting filter.",
+                prefixed_sql, exc,
+            )
+            return True, "", prefixed_sql
+        if len(values) >= 2:
+            try:
+                total_count = int(values[0])
+                filtered_count = int(values[1])
+            except (TypeError, ValueError):
+                return True, "", prefixed_sql
+            if total_count > 0 and filtered_count >= total_count:
+                return (
+                    False,
+                    f"filter is vacuous: selects all rows "
+                    f"({filtered_count}/{total_count})",
+                    prefixed_sql,
+                )
+            # B5 — zero-rows guard. Strategists occasionally
+            # hallucinate equality literals (e.g. ``open_status_code
+            # = 'Y'`` when stored values are ``'O'`` / ``'C'``); the
+            # filter parses, EXPLAINs cleanly, and selects zero rows
+            # at runtime. Reject only when the filter is a simple
+            # equality on a literal — range / inequality / IN-list
+            # filters often legitimately match zero current rows
+            # (e.g. ``created_at > 2030-01-01``).
+            if (
+                total_count > 0
+                and filtered_count == 0
+                and _is_simple_equality(prefixed_sql)
+            ):
+                return (
+                    False,
+                    f"filter matches zero rows ({filtered_count}/{total_count}); "
+                    f"likely hallucinated literal — actual stored values may differ",
+                    prefixed_sql,
+                )
+
+    return True, "", prefixed_sql

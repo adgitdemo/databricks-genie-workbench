@@ -9,15 +9,14 @@ set -euo pipefail
 #   2. Asks for Databricks profile
 #   3. Asks for catalog (with auto-discovery)
 #   4. Asks for SQL Warehouse (with auto-discovery)
-#   5. Asks for LLM model
-#   6. MLflow tracing (optional — experiment ID for agent observability)
-#   7. Lakebase info (attach manually via Apps UI after deploy)
-#   8. Asks for app name
-#   9. Writes .env.deploy
-#  10. Runs deploy.sh
-#  11. Resolves app service principal
-#  12. Optionally grants SP access to Genie Spaces
-#  13. Prints summary with automated/manual sections
+#   5. MLflow tracing (optional — experiment ID for agent observability)
+#   6. Asks for app name
+#   7. Lakebase project (create new, skip, or advanced attach existing)
+#   8. Writes .env.deploy
+#   9. Runs deploy.sh
+#  10. Resolves app service principal
+#  11. Optionally grants SP access to Genie Spaces
+#  12. Prints summary with automated/manual sections
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,9 +152,17 @@ fi
 
 if command -v node &>/dev/null; then
     NODE_VERSION=$(node --version 2>/dev/null || echo "unknown")
-    _ok "Node.js ($NODE_VERSION)"
+    if node -e '
+const [major, minor] = process.versions.node.split(".").map(Number);
+const supported = (major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22;
+process.exit(supported ? 0 : 1);
+'; then
+        _ok "Node.js ($NODE_VERSION)"
+    else
+        MISSING+=("Node.js ^20.19.0 or >=22.12.0 — https://nodejs.org/ (found $NODE_VERSION)")
+    fi
 else
-    MISSING+=("Node.js — https://nodejs.org/")
+    MISSING+=("Node.js ^20.19.0 or >=22.12.0 — https://nodejs.org/")
 fi
 
 if command -v python3 &>/dev/null; then
@@ -287,20 +294,49 @@ _warn "You must have CREATE SCHEMA permission on the selected catalog."
 echo ""
 
 _info "Discovering available catalogs..."
+
+# Try to detect the workspace's default catalog and the user's home catalog
+# hint so we can surface likely choices at the top of the list.
+HOME_HINT=$(databricks current-user me --profile "$PROFILE" -o json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    u = json.load(sys.stdin).get('userName', '')
+    prefix = u.split('@', 1)[0] if u else ''
+    print(prefix.replace('.', '_'))
+except: pass
+" 2>/dev/null || true)
+
+DEFAULT_CATALOG=$(databricks settings default-namespace get --profile "$PROFILE" -o json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print((d.get('namespace') or {}).get('value', '') if isinstance(d, dict) else '')
+except: pass
+" 2>/dev/null || true)
+
 CATALOG_NAMES=()
 while IFS= read -r name; do
     [ -n "$name" ] && CATALOG_NAMES+=("$name")
 done < <(
-    databricks catalogs list --profile "$PROFILE" -o json 2>/dev/null \
-    | python3 -c "
-import sys, json
+    databricks catalogs list --profile "$PROFILE" --limit 0 -o json 2>/dev/null \
+    | HOME_HINT="$HOME_HINT" DEFAULT_CATALOG="$DEFAULT_CATALOG" python3 -c "
+import sys, json, os
 try:
     data = json.load(sys.stdin)
     cats = data if isinstance(data, list) else data.get('catalogs', [])
-    for c in cats[:30]:
-        name = c.get('name','') if isinstance(c, dict) else str(c)
-        if name:
-            print(name)
+    names = sorted({(c.get('name','') if isinstance(c, dict) else str(c)) for c in cats}, key=str.lower)
+    names = [n for n in names if n]
+    head = []
+    home = os.environ.get('HOME_HINT', '')
+    default = os.environ.get('DEFAULT_CATALOG', '')
+    if default and default in names and default not in head:
+        names.remove(default); head.append(default)
+    if home and home in names and home not in head:
+        names.remove(home); head.append(home)
+    for n in head + names:
+        print(n)
 except: pass
 " 2>/dev/null
 )
@@ -309,8 +345,61 @@ if [ ${#CATALOG_NAMES[@]} -eq 0 ]; then
     _warn "Could not list catalogs. Enter a catalog name manually."
     _prompt CATALOG "Catalog name" ""
 else
-    _info "Available catalogs:"
-    _select_from CATALOG "Select the catalog to use" "${CATALOG_NAMES[@]}"
+    TOTAL=${#CATALOG_NAMES[@]}
+    _info "Available catalogs (${TOTAL}):"
+
+    # Build display labels with markers for home / workspace default
+    CATALOG_LABELS=()
+    for name in "${CATALOG_NAMES[@]}"; do
+        label="$name"
+        if [ -n "$DEFAULT_CATALOG" ] && [ "$name" = "$DEFAULT_CATALOG" ]; then
+            label="$name  (workspace default)"
+        elif [ -n "$HOME_HINT" ] && [ "$name" = "$HOME_HINT" ]; then
+            label="$name  (home)"
+        fi
+        CATALOG_LABELS+=("$label")
+    done
+
+    PAGE_SIZE=20
+    PAGE=0
+    MAX_PAGE=$(( (TOTAL - 1) / PAGE_SIZE ))
+    CATALOG=""
+    while [ -z "$CATALOG" ]; do
+        START=$(( PAGE * PAGE_SIZE ))
+        END=$(( START + PAGE_SIZE ))
+        [ $END -gt $TOTAL ] && END=$TOTAL
+        echo ""
+        echo "  Page $((PAGE + 1)) of $((MAX_PAGE + 1))"
+        for ((i = START; i < END; i++)); do
+            printf "    %3d) %s\n" "$((i + 1))" "${CATALOG_LABELS[$i]}"
+        done
+        echo ""
+        nav_hint="number"
+        [ $PAGE -lt $MAX_PAGE ] && nav_hint="$nav_hint, n=next"
+        [ $PAGE -gt 0 ] && nav_hint="$nav_hint, p=prev"
+        nav_hint="$nav_hint, m=manual"
+        echo -en "  Select catalog [$nav_hint]: "
+        read -r choice
+        case "$choice" in
+            n|N)
+                if [ $PAGE -lt $MAX_PAGE ]; then PAGE=$((PAGE + 1)); else echo "  Already on the last page."; fi
+                ;;
+            p|P)
+                if [ $PAGE -gt 0 ]; then PAGE=$((PAGE - 1)); else echo "  Already on the first page."; fi
+                ;;
+            m|M)
+                _prompt CATALOG "Catalog name" ""
+                break
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$TOTAL" ]; then
+                    CATALOG="${CATALOG_NAMES[$((choice - 1))]}"
+                else
+                    echo "  Enter a number between 1 and ${TOTAL}, or n/p/m."
+                fi
+                ;;
+        esac
+    done
 fi
 
 if [ -z "$CATALOG" ]; then
@@ -377,87 +466,24 @@ fi
 _ok "Selected warehouse: $WAREHOUSE_ID"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 5: LLM Model
-# ══════════════════════════════════════════════════════════════════════════
-_header "Step 5: LLM Model"
+LLM_MODEL="${GENIE_LLM_MODEL:-databricks-claude-sonnet-4-6}"
+_ok "Default LLM model: $LLM_MODEL"
+_info "Users can choose other READY chat serving endpoints inside the app."
 
-_info "Choose the foundation model Genie Workbench will use to create and"
-_info "optimize Genie Spaces, generate SQL instructions, and explain findings."
+# ══════════════════════════════════════════════════════════════════════════
+# Step 5: MLflow Tracing (optional)
+# ══════════════════════════════════════════════════════════════════════════
+_header "Step 5: MLflow Tracing (optional)"
+
+_info "MLflow tracing is observability for the app's AI agents."
+_info "When enabled, the Create Agent and Fix Agent log their LLM requests,"
+_info "responses, token counts, and latency to an MLflow experiment so you can"
+_info "debug agent behavior and review what happened after a run."
 echo ""
-
-CURATED_MODELS=(
-    "Claude Sonnet 4.6  (Recommended — databricks-claude-sonnet-4-6)"
-    "GPT-5.4            (Databricks — databricks-gpt-5-4)"
-    "Other              (browse all serving endpoints or enter a name manually)"
-)
-
-LLM_MODEL=""
-_select_from MODEL_CHOICE "Select a model" 1 "${CURATED_MODELS[@]}"
-
-case "$MODEL_CHOICE" in
-    Claude*)
-        LLM_MODEL="databricks-claude-sonnet-4-6" ;;
-    GPT*)
-        LLM_MODEL="databricks-gpt-5-4" ;;
-    Other*)
-        echo ""
-        echo "    1) Browse all serving endpoints in my workspace"
-        echo "    2) Enter endpoint name manually"
-        echo ""
-        OTHER_CHOICE=""
-        while true; do
-            echo -en "  [1-2]: "
-            read -r OTHER_CHOICE
-            case "$OTHER_CHOICE" in
-                1|2) break ;;
-                *) echo "  Please enter 1 or 2." ;;
-            esac
-        done
-        if [ "$OTHER_CHOICE" = "1" ]; then
-            _info "Fetching all serving endpoints..."
-            ALL_ENDPOINTS=()
-            while IFS= read -r ep; do
-                [ -n "$ep" ] && ALL_ENDPOINTS+=("$ep")
-            done < <(
-                databricks serving-endpoints list --profile "$PROFILE" -o json 2>/dev/null \
-                | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    eps = data if isinstance(data, list) else data.get('endpoints', [])
-    for e in eps:
-        print(e.get('name',''))
-except: pass
-" 2>/dev/null
-            )
-            if [ ${#ALL_ENDPOINTS[@]} -eq 0 ]; then
-                _warn "No serving endpoints found. Enter endpoint name manually."
-                _prompt LLM_MODEL "Endpoint name" ""
-            else
-                _select_from LLM_MODEL "Select endpoint" "${ALL_ENDPOINTS[@]}"
-            fi
-        else
-            _prompt LLM_MODEL "Endpoint name" ""
-        fi
-        ;;
-esac
-
-if [ -z "$LLM_MODEL" ]; then
-    _error "No LLM model selected."
-    exit 1
-fi
-
-_ok "LLM model: $LLM_MODEL"
-
-# ══════════════════════════════════════════════════════════════════════════
-# Step 6: MLflow Tracing (optional)
-# ══════════════════════════════════════════════════════════════════════════
-_header "Step 6: MLflow Tracing (optional)"
-
-_info "MLflow tracing records every LLM call the Create Agent and Fix Agent make:"
-_info "inputs, outputs, token counts, and latency — viewable in the MLflow"
-_info "Experiments UI. Useful for debugging agent behavior; adds minor overhead."
-_info "You can enable or disable this later by editing .env.deploy."
+_info "This is optional because it does not affect core app functionality."
+_info "If you skip it, Genie Workbench still creates, scans, and optimizes spaces;"
+_info "you just won't get detailed MLflow traces for agent debugging. You can"
+_info "enable or disable it later by editing .env.deploy."
 echo ""
 
 MLFLOW_EXPERIMENT_ID=""
@@ -551,73 +577,9 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 7: Lakebase (PostgreSQL)
+# Step 6: App name
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 7: Lakebase (PostgreSQL)"
-
-_info "Lakebase provides persistent PostgreSQL storage for scan history, starred"
-_info "spaces, and Create Agent sessions. Without it, the app uses in-memory"
-_info "storage and all history is lost every time the app restarts."
-echo ""
-_warn "Genie Workbench requires Lakebase Autoscaling (Serverless). Provisioned"
-_warn "Lakebase instances are not supported."
-echo ""
-_info "If you don't have a Lakebase Autoscaling project yet, you can skip this"
-_info "step and create one later via the Databricks UI (SQL → Lakebase)."
-echo ""
-
-_info "Discovering available Lakebase Autoscaling projects..."
-LB_NAMES=()
-while IFS= read -r name; do
-    [ -n "$name" ] && LB_NAMES+=("$name")
-done < <(
-    databricks api get /api/2.0/postgres/projects --profile "$PROFILE" -o json 2>/dev/null \
-    | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    projects = data if isinstance(data, list) else data.get('projects', [])
-    for proj in projects:
-        if isinstance(proj, dict):
-            # resource name is 'projects/<project_id>' — extract the ID
-            resource_name = proj.get('name', '')
-            project_id = resource_name.removeprefix('projects/') if resource_name else proj.get('project_id', '')
-            if project_id:
-                print(project_id)
-        else:
-            val = str(proj)
-            if val:
-                print(val)
-except: pass
-" 2>/dev/null
-)
-
-LB_OPTIONS=()
-if [ ${#LB_NAMES[@]} -gt 0 ]; then
-    LB_OPTIONS+=("${LB_NAMES[@]}")
-fi
-LB_OPTIONS+=("Skip — use in-memory fallback (history lost on restart)")
-
-if [ ${#LB_NAMES[@]} -gt 0 ]; then
-    _info "Available Lakebase Autoscaling projects:"
-else
-    _info "No Lakebase Autoscaling projects found. You can skip for now and create"
-    _info "one in the Databricks UI (SQL → Lakebase), then re-run ./scripts/deploy.sh."
-fi
-_select_from LB_CHOICE "Select a Lakebase Autoscaling project" "${LB_OPTIONS[@]}"
-
-if [[ "$LB_CHOICE" == "Skip — use in-memory fallback (history lost on restart)" ]]; then
-    LAKEBASE_INSTANCE=""
-    _warn "Skipping Lakebase. Scan history and stars will not persist across restarts."
-else
-    LAKEBASE_INSTANCE="$LB_CHOICE"
-    _ok "Lakebase Autoscaling project: $LAKEBASE_INSTANCE"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════
-# Step 8: App name
-# ══════════════════════════════════════════════════════════════════════════
-_header "Step 8: App name"
+_header "Step 6: App name"
 
 _info "This is the name of the Databricks App that will be created in your workspace."
 _info "Only lowercase letters, numbers, and hyphens are allowed."
@@ -654,9 +616,160 @@ done
 _ok "App name: $APP_NAME"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 9: Write .env.deploy
+# Step 7: Lakebase (PostgreSQL)
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 9: Writing configuration"
+_header "Step 7: Lakebase (PostgreSQL)"
+
+_info "Lakebase provides persistent PostgreSQL storage for scan history, starred"
+_info "spaces, and Create Agent sessions. Without it, the app uses in-memory"
+_info "storage and all history is lost every time the app restarts."
+echo ""
+_warn "Genie Workbench requires Lakebase Autoscaling (Serverless). Provisioned"
+_warn "Lakebase instances are not supported."
+echo ""
+_info "Recommended: create a fresh Lakebase project for this app instance."
+_info "Reusing a Lakebase project from another app can cause ownership errors."
+echo ""
+
+_info "Discovering available Lakebase Autoscaling projects..."
+LB_NAMES=()
+while IFS= read -r name; do
+    [ -n "$name" ] && LB_NAMES+=("$name")
+done < <(
+    databricks api get /api/2.0/postgres/projects --profile "$PROFILE" -o json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    projects = data if isinstance(data, list) else data.get('projects', [])
+    for proj in projects:
+        if isinstance(proj, dict):
+            # resource name is 'projects/<project_id>' — extract the ID
+            resource_name = proj.get('name', '')
+            project_id = resource_name.removeprefix('projects/') if resource_name else proj.get('project_id', '')
+            if project_id:
+                print(project_id)
+        else:
+            val = str(proj)
+            if val:
+                print(val)
+except: pass
+" 2>/dev/null
+)
+
+_lakebase_name_exists() {
+    local needle="$1"
+    local name
+
+    if [ "${#LB_NAMES[@]}" -eq 0 ]; then
+        return 1
+    fi
+
+    for name in "${LB_NAMES[@]}"; do
+        if [ "$name" = "$needle" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+LAKEBASE_BASE="${APP_NAME}-lakebase"
+if [[ ! "$LAKEBASE_BASE" =~ ^[a-z] ]]; then
+    LAKEBASE_BASE="genie-$LAKEBASE_BASE"
+fi
+if [ "${#LAKEBASE_BASE}" -gt 63 ]; then
+    LAKEBASE_BASE="${LAKEBASE_BASE:0:63}"
+    LAKEBASE_BASE="${LAKEBASE_BASE%-}"
+fi
+DEFAULT_LAKEBASE_INSTANCE="$LAKEBASE_BASE"
+LAKEBASE_SUFFIX=2
+while _lakebase_name_exists "$DEFAULT_LAKEBASE_INSTANCE"; do
+    SUFFIX="-$LAKEBASE_SUFFIX"
+    MAX_BASE_LEN=$((63 - ${#SUFFIX}))
+    DEFAULT_LAKEBASE_INSTANCE="${LAKEBASE_BASE:0:$MAX_BASE_LEN}${SUFFIX}"
+    DEFAULT_LAKEBASE_INSTANCE="${DEFAULT_LAKEBASE_INSTANCE%-}"
+    LAKEBASE_SUFFIX=$((LAKEBASE_SUFFIX + 1))
+done
+
+CREATE_DEFAULT_OPTION="Create new Lakebase project: $DEFAULT_LAKEBASE_INSTANCE"
+CREATE_CUSTOM_OPTION="Enter a different new Lakebase project name"
+SKIP_LAKEBASE_OPTION="Skip — use in-memory fallback (history lost on restart)"
+ATTACH_EXISTING_OPTION="Advanced: attach an existing Lakebase project"
+
+LB_OPTIONS=("$CREATE_DEFAULT_OPTION" "$CREATE_CUSTOM_OPTION" "$SKIP_LAKEBASE_OPTION")
+if [ ${#LB_NAMES[@]} -gt 0 ]; then
+    LB_OPTIONS+=("$ATTACH_EXISTING_OPTION")
+fi
+
+if [ ${#LB_NAMES[@]} -gt 0 ]; then
+    _info "Existing Lakebase projects were found. Attach one only for an"
+    _info "intentional same-app reuse or after an admin ownership migration."
+else
+    _info "No existing Lakebase Autoscaling projects found."
+fi
+
+LAKEBASE_INSTANCE=""
+while true; do
+    _select_from LB_CHOICE "Choose Lakebase persistence" 1 "${LB_OPTIONS[@]}"
+
+    if [[ "$LB_CHOICE" == "$CREATE_DEFAULT_OPTION" ]]; then
+        LAKEBASE_INSTANCE="$DEFAULT_LAKEBASE_INSTANCE"
+        _ok "Lakebase Autoscaling project will be created: $LAKEBASE_INSTANCE"
+        break
+    elif [[ "$LB_CHOICE" == "$CREATE_CUSTOM_OPTION" ]]; then
+        echo ""
+        _info "The new Lakebase project will be created during deploy."
+        _info "Use lowercase letters, numbers, and hyphens."
+        while true; do
+            _prompt LAKEBASE_INSTANCE "New Lakebase project name"
+            if [[ ! "$LAKEBASE_INSTANCE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]]; then
+                _error "Lakebase project name must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens."
+                continue
+            fi
+            if [ "${#LAKEBASE_INSTANCE}" -gt 63 ]; then
+                _error "Lakebase project name must be 63 characters or fewer."
+                continue
+            fi
+            if _lakebase_name_exists "$LAKEBASE_INSTANCE"; then
+                _error "Lakebase project '$LAKEBASE_INSTANCE' already exists. Choose the advanced attach option to reuse it, or enter a new project name."
+                continue
+            fi
+            _ok "Lakebase Autoscaling project will be created: $LAKEBASE_INSTANCE"
+            break
+        done
+        break
+    elif [[ "$LB_CHOICE" == "$SKIP_LAKEBASE_OPTION" ]]; then
+        LAKEBASE_INSTANCE=""
+        _warn "Skipping Lakebase. Scan history and stars will not persist across restarts."
+        break
+    elif [[ "$LB_CHOICE" == "$ATTACH_EXISTING_OPTION" ]]; then
+        echo ""
+        _warn "Attach an existing Lakebase project only if this is the same app"
+        _warn "instance or an admin has migrated ownership of the existing"
+        _warn "genie schema, tables, and sequences to this app's service principal."
+        _prompt_yn CONFIRM_ATTACH "Continue with existing Lakebase attachment?" "N"
+        if [ "$CONFIRM_ATTACH" != "Y" ]; then
+            echo ""
+            continue
+        fi
+        echo ""
+        _info "Available Lakebase Autoscaling projects:"
+        EXISTING_LB_OPTIONS=("${LB_NAMES[@]}" "Back to Lakebase options")
+        _select_from LAKEBASE_INSTANCE "Select existing Lakebase project" "${EXISTING_LB_OPTIONS[@]}"
+        if [[ "$LAKEBASE_INSTANCE" == "Back to Lakebase options" ]]; then
+            LAKEBASE_INSTANCE=""
+            echo ""
+            continue
+        fi
+        _ok "Lakebase Autoscaling project: $LAKEBASE_INSTANCE"
+        break
+    fi
+done
+
+# ══════════════════════════════════════════════════════════════════════════
+# Step 8: Write .env.deploy
+# ══════════════════════════════════════════════════════════════════════════
+_header "Step 8: Writing configuration"
 
 ENV_FILE="$PROJECT_DIR/.env.deploy"
 cat > "$ENV_FILE" <<EOF
@@ -680,15 +793,15 @@ echo "  │  App name:     $APP_NAME"
 echo "  │  Catalog:      $CATALOG"
 echo "  │  GSO Schema:   ${CATALOG}.${GSO_SCHEMA} (default)"
 echo "  │  Warehouse ID: $WAREHOUSE_ID"
-echo "  │  LLM Model:    $LLM_MODEL"
+echo "  │  Default LLM:  $LLM_MODEL"
 echo "  │  Lakebase:     ${LAKEBASE_INSTANCE:-<none>}"
 echo "  │  MLflow:       ${MLFLOW_EXPERIMENT_ID:-<disabled>}"
 echo "  └───────────────────────────────────────────────────────────┘"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 10: Deploy
+# Step 9: Deploy
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 10: Deploying"
+_header "Step 9: Deploying"
 
 _info "This will build the frontend, sync code to your workspace, deploy the"
 _info "optimization job, and start the app (typically 3-5 minutes)."
@@ -707,9 +820,9 @@ AUTOMATED=()
 AUTOMATED_FAIL=()
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 11: Resolve app service principal
+# Step 10: Resolve app service principal
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 11: Resolving app service principal"
+_header "Step 10: Resolving app service principal"
 
 SP_CLIENT_ID=$(
     databricks apps get "$APP_NAME" --profile "$PROFILE" -o json 2>/dev/null \
@@ -742,9 +855,9 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 12: Genie Space permissions (optional)
+# Step 11: Genie Space permissions (optional)
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 12: Genie Space access"
+_header "Step 11: Genie Space access"
 
 _info "The app uses On-Behalf-Of (OBO) auth, so users see their own spaces."
 _info "However, the service principal needs explicit grants for fallback access."
@@ -808,8 +921,11 @@ for space in spaces:
 
 print(granted)
 " 2>/dev/null || echo "0")
+    if [[ ! "$GENIE_SPACES_GRANTED" =~ ^[0-9]+$ ]]; then
+        GENIE_SPACES_GRANTED=0
+    fi
 
-    if [ "$GENIE_SPACES_GRANTED" -gt 0 ] 2>/dev/null; then
+    if [ "$GENIE_SPACES_GRANTED" -gt 0 ]; then
         _ok "Granted access to $GENIE_SPACES_GRANTED Genie Space(s)."
         AUTOMATED+=("Genie Space SP access ($GENIE_SPACES_GRANTED spaces)")
     else
@@ -844,17 +960,38 @@ else
     echo "  URL: https://${APP_NAME}-*.databricksapps.com (available shortly)"
 fi
 
-# ── Automated (done) ─────────────────────────────────────────────────────
+# ── Ready / follow-up summary ────────────────────────────────────────────
 echo ""
-echo -e "  ${GREEN}${BOLD}Automated (done):${NC}"
-echo -e "    ${GREEN}✓${NC} OAuth scopes (configured in app.yaml)"
-echo -e "    ${GREEN}✓${NC} GSO optimization job (bundle-managed)"
+echo -e "  ${GREEN}${BOLD}Ready:${NC}"
+echo -e "    ${GREEN}✓${NC} Databricks App deployed"
+echo -e "    ${GREEN}✓${NC} App OAuth scopes and resources configured"
+echo -e "    ${GREEN}✓${NC} GSO optimization job deployed"
 echo -e "    ${GREEN}✓${NC} UC grants on ${CATALOG}.${GSO_SCHEMA}"
+
+if [ -n "$LAKEBASE_INSTANCE" ]; then
+    echo -e "    ${GREEN}✓${NC} Lakebase configured: $LAKEBASE_INSTANCE"
+else
+    echo -e "    ${YELLOW}⚠${NC} Lakebase skipped; history and sessions use in-memory storage"
+fi
+
+if [ -n "$MLFLOW_EXPERIMENT_ID" ]; then
+    echo -e "    ${GREEN}✓${NC} MLflow tracing enabled: $MLFLOW_EXPERIMENT_ID"
+else
+    echo -e "    ${YELLOW}○${NC} MLflow tracing disabled"
+fi
 
 if [ ${#AUTOMATED[@]} -gt 0 ]; then
     for item in "${AUTOMATED[@]}"; do
         echo -e "    ${GREEN}✓${NC} $item"
     done
+fi
+
+if [ "$GENIE_SPACES_GRANTED" -eq 0 ]; then
+    if [ "$GRANT_SPACES" = "Y" ] && [ -n "$SP_CLIENT_ID" ]; then
+        echo -e "    ${YELLOW}⚠${NC} No existing Genie Spaces were granted to the app SP"
+    elif [ "$GRANT_SPACES" != "Y" ]; then
+        echo -e "    ${YELLOW}○${NC} Existing Genie Space SP grants skipped"
+    fi
 fi
 
 if [ ${#AUTOMATED_FAIL[@]} -gt 0 ]; then
@@ -865,39 +1002,26 @@ if [ ${#AUTOMATED_FAIL[@]} -gt 0 ]; then
     done
 fi
 
-# ── Remaining manual steps ───────────────────────────────────────────────
 SP_NAME_FOR_DISPLAY="${SP_DISPLAY_NAME:-${SP_CLIENT_ID:-<app-service-principal>}}"
 
 echo ""
-echo -e "  ${YELLOW}${BOLD}Remaining manual steps:${NC}"
+echo -e "  ${BOLD}Next:${NC}"
+echo "    1. Open the app URL above."
+echo "    2. Wait a minute if the app is still starting, then run a scan."
 echo ""
-echo -e "    ${BOLD}1. Create GSO synced tables (for Auto-Optimize history)${NC}"
-echo "       Synced tables replicate GSO Delta tables to Lakebase for"
-echo "       fast reads in the app. They must be created via Catalog Explorer UI."
-echo ""
-echo "       For each of these 8 tables in ${CATALOG}.${GSO_SCHEMA}:"
-echo "         genie_opt_runs, genie_opt_stages, genie_opt_iterations,"
-echo "         genie_opt_patches, genie_eval_asi_results, genie_opt_provenance,"
-echo "         genie_opt_suggestions, genie_opt_data_access_grants"
-echo ""
-echo "       a) Navigate to the source table in Catalog Explorer"
-echo "       b) Click 'Create' → 'Synced table'"
-echo "       c) Name: <table_name>_synced (same schema)"
-echo "       d) Database type: Lakebase Serverless (Autoscaling)"
-echo "       e) Project: ${APP_NAME}-db, Branch: production"
-echo "       f) Sync mode: Triggered"
-echo ""
-echo "       Then verify:"
-echo -e "       ${CYAN}python3 scripts/setup_synced_tables.py --source-catalog ${CATALOG} --warehouse-id \$WAREHOUSE_ID --profile \$PROFILE --verify-only${NC}"
-echo ""
-echo -e "    ${BOLD}2. Genie Space data access${NC}"
-echo "       The SP needs SELECT on schemas your Genie Spaces reference."
-echo "       Open the app → Auto-Optimize → Settings to see which schemas"
-echo "       need grants, then run:"
-echo -e "       ${CYAN}GRANT SELECT ON SCHEMA <catalog>.<schema> TO \`${SP_NAME_FOR_DISPLAY}\`${NC}"
-echo ""
-echo -e "    ${BOLD}4. Future Genie Spaces${NC}"
-echo "       Spaces created after install need SP grants. Open the space"
-echo "       sharing dialog and add '${SP_NAME_FOR_DISPLAY}' with CAN_MANAGE."
+echo -e "  ${BOLD}Optional follow-up:${NC}"
+echo "    • Auto-Optimize data access: if a run reports missing table access,"
+echo "      open Auto-Optimize → Settings to identify schemas, then grant:"
+echo -e "      ${CYAN}GRANT SELECT ON SCHEMA <catalog>.<schema> TO \`${SP_NAME_FOR_DISPLAY}\`${NC}"
+echo "    • Future Genie Spaces: share new spaces with '${SP_NAME_FOR_DISPLAY}'"
+echo "      when you want SP fallback or Auto-Optimize support."
+if [ -z "$LAKEBASE_INSTANCE" ]; then
+    echo "    • Persistent history: set GENIE_LAKEBASE_INSTANCE in .env.deploy,"
+    echo "      then run ./scripts/deploy.sh --update."
+fi
+if [ -z "$MLFLOW_EXPERIMENT_ID" ]; then
+    echo "    • Agent tracing: set GENIE_MLFLOW_EXPERIMENT_ID in .env.deploy,"
+    echo "      then run ./scripts/deploy.sh --update."
+fi
 echo ""
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"

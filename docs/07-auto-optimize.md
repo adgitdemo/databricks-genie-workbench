@@ -129,10 +129,16 @@ The optimization job runs entirely as the app's **Service Principal** (SP). See 
 Users trigger optimization from the **Optimize** tab in the Space Detail view:
 
 1. The UI calls `GET /api/auto-optimize/permissions/{space_id}` to pre-check SP access
-2. User configures options (apply mode, levers) and clicks "Optimize"
+2. User configures options (apply mode, levers, and optional LLM model) and clicks "Optimize"
 3. `POST /api/auto-optimize/trigger` starts the job (see [trigger flow](03-authentication-and-permissions.md#optimization-trigger-flow))
 4. The UI polls `GET /api/auto-optimize/runs/{run_id}/status` for progress
 5. On completion, the user can review patches and choose to apply or discard
+
+## Model Selection
+
+Auto-Optimize can run with a per-run `llm_model` selected from the curated compatibility list returned by `GET /api/models`. If the trigger request omits `llm_model`, the backend uses the workspace-wide `LLM_MODEL` default.
+
+Selected models are validated against the curated compatibility list before job submission. The shared list also serves Create Agent, so GPT 5.5 endpoints are intentionally excluded until Create Agent supports the Responses API tool-calling shape. The chosen model is stored on `genie_opt_runs.llm_model`, passed through the GSO job widgets, and shown in optimization history.
 
 ## Source Files
 

@@ -34,6 +34,7 @@ STEP_LABELS: dict[str, str] = {
     "discovery": "Discovering data sources",
     "feasibility": "Assessing feasibility",
     "inspection": "Inspecting tables",
+    "profiling": "Profiling the data",
     "plan": "Building plan",
     "config_create": "Generating configuration",
     "post_creation": "Finalizing space",
@@ -44,28 +45,31 @@ STEP_THINKING: dict[str, str] = {
     "discovery": "Exploring your data catalog…",
     "feasibility": "Assessing data feasibility…",
     "inspection": "Analyzing table structure and data quality…",
+    "profiling": "Profiling the data…",
     "plan": "Designing your Genie Space plan…",
     "config_create": "Generating the configuration…",
     "post_creation": "Finalizing your Genie Space…",
 }
 
-# Tools allowed per step — structural guardrail to prevent the LLM from
-# calling tools outside the current step's scope.
-# Empty set = no tools (pure conversation). Missing key = all tools (fallback).
+# Tools allowed per step — each step is a cumulative superset of all preceding
+# steps so the agent never loses capabilities as the workflow advances.
+# The prompt guides the agent on what to focus on; STEP_TOOLS is a safety net.
+_DISCOVERY = {"search_tables", "discover_catalogs", "discover_schemas", "discover_tables"}
+_INSPECTION = _DISCOVERY | {"describe_table", "profile_columns", "assess_data_quality", "profile_table_usage", "test_sql"}
+_PROFILING = _INSPECTION | {"assess_readiness"}
+_PLAN = _PROFILING | {"generate_plan", "present_plan"}
+_CONFIG = _PLAN | {"discover_warehouses", "generate_config", "validate_config", "create_space"}
+_POST = _CONFIG | {"update_config", "update_space"}
+
 STEP_TOOLS: dict[str, set[str]] = {
-    # Requirements has discovery tools so the agent can transition naturally
-    # when the user says "go find my data." The prompt guides the agent to
-    # gather requirements first — tools are available but not encouraged.
-    "requirements": {"search_tables", "discover_catalogs", "discover_schemas", "discover_tables"},
-    "discovery": {"search_tables", "discover_catalogs", "discover_schemas", "discover_tables"},
-    # Feasibility has inspection tools available so the LLM can call
-    # describe_table after the user confirms. The prompt instructs it to
-    # present an assessment and WAIT before calling tools.
-    "feasibility": {"describe_table", "profile_columns", "assess_data_quality", "profile_table_usage", "test_sql"},
-    "inspection": {"describe_table", "profile_columns", "assess_data_quality", "profile_table_usage", "test_sql"},
-    "plan": {"generate_plan", "present_plan", "test_sql"},
-    "config_create": {"discover_warehouses", "generate_config", "validate_config", "create_space"},
-    "post_creation": {"update_config", "validate_config", "update_space"},
+    "requirements": _DISCOVERY,
+    "discovery": _DISCOVERY,
+    "feasibility": _INSPECTION,
+    "inspection": _INSPECTION,
+    "profiling": _PLAN,  # needs generate_plan/present_plan so agent can advance from profiling
+    "plan": _PLAN,
+    "config_create": _CONFIG,
+    "post_creation": _POST,
 }
 
 STEP_ORDER = [
@@ -73,6 +77,7 @@ STEP_ORDER = [
     "discovery",
     "feasibility",
     "inspection",
+    "profiling",
     "plan",
     "config_create",
     "post_creation",
@@ -83,8 +88,11 @@ class CreateGenieAgent:
     """Conversational agent that guides users through Genie space creation."""
 
     def __init__(self):
-        self.model = get_llm_model()
         self._schema_content: str | None = None
+
+    @staticmethod
+    def _effective_model(session: AgentSession) -> str:
+        return session.llm_model or get_llm_model()
 
     def _get_schema_content(self) -> str:
         if self._schema_content is None:
@@ -191,7 +199,8 @@ class CreateGenieAgent:
             content_parts: list[str] = []
             tool_calls_acc: dict[int, dict] = {}
             tool_call_signaled = False
-            async for chunk in self._async_stream_llm(messages, tools=step_tool_defs):
+            effective_model = self._effective_model(session)
+            async for chunk in self._async_stream_llm(messages, tools=step_tool_defs, model=effective_model):
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
@@ -651,13 +660,13 @@ class CreateGenieAgent:
         for idx, msg in reversed(inserts):
             session.history.insert(idx, msg)
 
-    def _repair_config(self, config: dict, error_msg: str) -> dict | None:
+    def _repair_config(self, config: dict, error_msg: str, model: str | None = None) -> dict | None:
         """Use the LLM to repair a config that failed space creation.
 
         Sends the error message and the failing config section to the LLM,
         which returns a corrected config.  Returns None if repair fails.
         """
-        from backend.services.llm_utils import call_serving_endpoint, parse_json_from_llm_response, get_llm_model
+        from backend.services.llm_utils import call_serving_endpoint, parse_json_from_llm_response
         try:
             # Send both sections — use a generous limit so the LLM sees the full config
             repair_context = {
@@ -678,7 +687,7 @@ class CreateGenieAgent:
             )
             response = call_serving_endpoint(
                 [{"role": "user", "content": prompt}],
-                model=get_llm_model(),
+                model=model or get_llm_model(),
                 max_tokens=16000,
             )
             repaired = parse_json_from_llm_response(response)
@@ -820,13 +829,16 @@ class CreateGenieAgent:
         if not result.get("success") and result.get("error"):
             err = result["error"]
             if "Invalid" in err or "configuration" in err.lower() or "proto" in err.lower():
-                yield {"event": "tool_result", "data": {"tool": "create_space", "result": {"repairing": True, "original_error": err}}}
                 yield {"event": "thinking", "data": {"message": "Config rejected by API — repairing automatically...", "step": "create", "round": 0}}
 
-                fixed = await loop.run_in_executor(None, run_in_context(self._repair_config, config, err))
+                fixed = await loop.run_in_executor(
+                    None,
+                    run_in_context(self._repair_config, config, err, self._effective_model(session)),
+                )
                 if fixed:
                     config = fixed
                     session.space_config = config
+                    yield {"event": "thinking", "data": {"message": "Retrying space creation with repaired config...", "step": "create", "round": 0}}
                     result = await loop.run_in_executor(
                         None, run_in_context(handle_tool_call, "create_space", {"display_name": display_name}, config)
                     )
@@ -841,6 +853,8 @@ class CreateGenieAgent:
                 "url": result["space_url"],
                 "display_name": result.get("display_name", display_name),
             }}
+        elif result.get("error"):
+            yield {"event": "error", "data": {"message": result["error"]}}
 
     async def _fast_create(
         self,
@@ -944,7 +958,12 @@ class CreateGenieAgent:
     _MAX_LLM_RETRIES = 4
     _RETRY_BACKOFF_BASE = 2  # seconds
 
-    def _stream_llm(self, messages: list[dict], tools: list[dict] | None = None) -> Generator[dict, None, None]:
+    def _stream_llm(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+    ) -> Generator[dict, None, None]:
         """Stream LLM response chunks from the serving endpoint (sync).
 
         Uses the SDK's pre-authenticated requests.Session so auth works
@@ -965,8 +984,9 @@ class CreateGenieAgent:
         if effective_tools:
             body["tools"] = effective_tools
 
-        url = f"{host}/serving-endpoints/{self.model}/invocations"
-        logger.info("Streaming LLM call to %s with %d messages", self.model, len(messages))
+        effective_model = model or get_llm_model()
+        url = f"{host}/serving-endpoints/{effective_model}/invocations"
+        logger.info("Streaming LLM call to %s with %d messages", effective_model, len(messages))
         if logger.isEnabledFor(logging.DEBUG):
             for i, m in enumerate(messages):
                 role = m.get("role", "?")
@@ -1016,7 +1036,12 @@ class CreateGenieAgent:
         finally:
             resp.close()
 
-    async def _async_stream_llm(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncGenerator[dict, None]:
+    async def _async_stream_llm(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+    ) -> AsyncGenerator[dict, None]:
         """Async wrapper that bridges the sync streaming generator to async.
 
         Captures context once and reuses across all iterations (can't use
@@ -1025,7 +1050,7 @@ class CreateGenieAgent:
         import contextvars as _cv
         loop = asyncio.get_event_loop()
         ctx = _cv.copy_context()
-        gen = self._stream_llm(messages, tools=tools)
+        gen = self._stream_llm(messages, tools=tools, model=model)
         _sentinel = object()
 
         while True:
@@ -1173,7 +1198,12 @@ class CreateGenieAgent:
             len(tables_context), len(inspection_summaries), len(user_requirements),
         )
 
-        raw_plan = plan_builder.generate_plan(tables_context, inspection_summaries, user_requirements)
+        raw_plan = plan_builder.generate_plan(
+            tables_context,
+            inspection_summaries,
+            user_requirements,
+            model=session.llm_model,
+        )
 
         if "error" in raw_plan and "tables" not in raw_plan:
             return raw_plan
@@ -1234,8 +1264,8 @@ class CreateGenieAgent:
                         if col.get("description"):
                             entry["description"] = col["description"]
                         cols.append(entry)
-                    ttype = result.get("table_type", "")
-                    if ttype and "METRIC_VIEW" in ttype:
+                    ttype = str(result.get("table_type", "")).upper()
+                    if "METRIC_VIEW" in ttype:
                         # Metric views go into mvs_by_id with column_configs
                         # (only enable_format_assistance, NOT enable_entity_matching)
                         mv_cols = [{"column_name": c["column_name"], "enable_format_assistance": True} for c in cols]
@@ -1262,12 +1292,10 @@ class CreateGenieAgent:
                             }
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
-        if "tables" not in tool_args and tables_by_id:
-            tool_args["tables"] = list(tables_by_id.values())
-            injected.append(f"tables({len(tables_by_id)})")
-        if "metric_views" not in tool_args and mvs_by_id:
-            tool_args["metric_views"] = list(mvs_by_id.values())
-            injected.append(f"metric_views({len(mvs_by_id)})")
+        # Strip string-only tables so plan sections (with LLM-generated descriptions) can fill them in
+        tables_val = tool_args.get("tables")
+        if tables_val and all(isinstance(t, str) for t in tables_val):
+            del tool_args["tables"]
 
         # --- Extract user's edited plan from selections (preferred source) ---
         edited_plan: dict | None = None
@@ -1325,6 +1353,14 @@ class CreateGenieAgent:
                         tool_args[arg_key] = val
                         count = len(val) if isinstance(val, list) else 1
                         injected.append(f"{arg_key}({count}|{source})")
+
+        # Fall back to raw describe_table data for anything plan sections didn't provide
+        if "tables" not in tool_args and tables_by_id:
+            tool_args["tables"] = list(tables_by_id.values())
+            injected.append(f"tables({len(tables_by_id)}|describe_table)")
+        if "metric_views" not in tool_args and mvs_by_id:
+            tool_args["metric_views"] = list(mvs_by_id.values())
+            injected.append(f"metric_views({len(mvs_by_id)}|describe_table)")
 
         return injected
 

@@ -25,6 +25,12 @@ export interface AppSettings {
   workspace_directory: string | null
 }
 
+export interface LLMModelInfo {
+  name: string
+  displayName: string
+  isDefault: boolean
+}
+
 // Space fetch/detail response types
 export interface FetchSpaceResponse {
   genie_space_id: string
@@ -167,6 +173,7 @@ export interface BenchmarkQuestion {
 export interface UcCatalog {
   name: string
   comment?: string
+  is_home?: boolean
 }
 
 export interface UcSchema {
@@ -264,6 +271,7 @@ export interface GSOTriggerRequest {
   apply_mode?: "genie_config" | "uc_artifact" | "both"
   levers?: number[]
   deploy_target?: string
+  llm_model?: string | null
 }
 
 export interface GSOTriggerResponse {
@@ -286,7 +294,16 @@ export interface GSORunStatus {
   startedAt: string | null
   completedAt: string | null
   baselineScore: number | null
+  // Canonical "arbiter adjusted accuracy" headline. The backend guarantees
+  // ``optimizedScore >= baselineScore`` (regressions are clamped to baseline,
+  // since regressions don't get posted) and ``optimizedScore`` is null while
+  // no full-scope iteration > 0 has been evaluated yet.
   optimizedScore: number | null
+  // ``0`` means baseline was retained (no iter > 0 strictly improved on it,
+  // or optimization is still running). ``N > 0`` is the iteration that
+  // actually achieved ``optimizedScore``. ``null`` if there's no baseline at
+  // all yet.
+  bestIteration: number | null
   convergenceReason: string | null
   stepsCompleted?: number | null
   totalSteps?: number | null
@@ -303,6 +320,7 @@ export interface GSORunSummary {
   best_iteration: number | null
   convergence_reason: string | null
   triggered_by: string | null
+  llm_model?: string | null
 }
 
 export interface GSOPipelineStep {
@@ -416,6 +434,7 @@ export interface GSOIterationResult {
   correct_count: number
   excluded_count?: number | null
   quarantined_benchmarks_json?: string | null
+  rolled_back?: boolean | null
   scores_json: string | Record<string, number>
   thresholds_met: boolean
   reflection_json?: string | Record<string, any> | null

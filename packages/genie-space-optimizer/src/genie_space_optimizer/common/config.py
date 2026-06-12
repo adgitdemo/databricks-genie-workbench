@@ -28,6 +28,79 @@ def format_mlflow_template(template: str, **kwargs: Any) -> str:
 
     return re.sub(r"\{\{\s*(\w+)\s*\}\}", _replacer, template)
 
+# ── 0. Canonical Instruction Schema (PR #178 — docs/gsl-instruction-schema.md) ──
+#
+# Keep in sync with docs/gsl-instruction-schema.md introduced by PR #178.
+# Consolidation into a shared Python module tracked under epic #173 / issue #174;
+# until that lands, this is the authoritative source for GSO. Once the shared
+# module exists, delete these constants in a follow-up PR and import instead.
+#
+# Header rules (from the schema doc):
+#   1-4: matched case-insensitively on the header line (normalized form
+#        compared against these tuples).
+#   5  : VERBATIM required — Databricks' blessed string for the summary-
+#        rendering section. Any variant (case, wording, punctuation) is
+#        rejected in strict mode.
+#   All sections may be absent, never reordered.
+#   Only `##` (h2) headers — `###` subheaders belong in structured targets
+#   (sql_snippets, join_specs, etc.), not prose.
+CANONICAL_SECTION_HEADERS: tuple[str, ...] = (
+    "## PURPOSE",
+    "## DISAMBIGUATION",
+    "## DATA QUALITY NOTES",
+    "## CONSTRAINTS",
+    "## Instructions you must follow when providing summaries",  # verbatim
+)
+CANONICAL_SECTION_ORDER: dict[str, int] = {
+    h: i for i, h in enumerate(CANONICAL_SECTION_HEADERS)
+}
+VERBATIM_REQUIRED_HEADERS: frozenset[str] = frozenset({
+    "## Instructions you must follow when providing summaries",
+})
+
+# Scanner check #4 soft cap. Matches the threshold enforced by
+# backend/services/scanner.py; prose longer than this is flagged as a finding.
+MAX_TEXT_INSTRUCTIONS_CHARS = 2000
+
+# Minimum remaining char budget below which expand-instructions skips the
+# LLM call entirely. With less than this much room, the LLM can't produce
+# useful content for even one section, let alone multiple. Prevents bogus
+# "expand failed" log spam when the existing prose is already near the cap.
+MIN_EXPAND_BUDGET = 100
+
+# Minimum LLM-reported confidence for a prose-to-structured promotion to be
+# applied. Lower-confidence candidates are dropped; they stay in prose until a
+# later pass (or a human edit) raises the confidence.
+PROMOTE_MIN_CONFIDENCE = 0.7
+
+# Legacy ALL-CAPS section → promotion target, authoritative per
+# docs/gsl-instruction-schema.md (the "What does NOT go in text_instructions"
+# table). Used by the multi-target miner for routing hints; not a strict filter
+# (the miner reads full prose and classifies every span regardless of header).
+SECTION_TO_TARGET: dict[str, str] = {
+    "BUSINESS DEFINITIONS": "sql_snippet",
+    "AGGREGATION RULES":    "sql_snippet",
+    "FUNCTION ROUTING":     "sql_snippet",
+    "TEMPORAL FILTERS":     "sql_snippet",
+    "JOIN GUIDANCE":        "join_spec",
+    "QUERY RULES":          "example_qsql",
+    "QUERY PATTERNS":       "example_qsql",
+    "ASSET ROUTING":        "metadata",  # table_desc + column_synonym
+}
+
+# Single source of truth: ``genie_space_optimizer.iq_scan.scoring``. The
+# legacy ``_SQL_IN_TEXT_RE`` (naïve keyword match) is re-exported as
+# ``SQL_IN_TEXT_RE`` for back-compat with existing imports, but callers
+# should prefer ``looks_like_sql_in_prose`` (single line) or
+# ``sql_in_text_findings`` (multi-line text) which apply the scanner-v2
+# structure-aware detector. Previous duplicate regex removed; consolidation
+# tracked alongside the schema module in issue #174.
+from genie_space_optimizer.iq_scan.scoring import (  # noqa: E402
+    _SQL_IN_TEXT_RE as SQL_IN_TEXT_RE,
+    looks_like_sql_in_prose,
+    sql_in_text_findings,
+)
+
 # ── 1. Quality Thresholds ───────────────────────────────────────────────
 
 DEFAULT_THRESHOLDS = {
@@ -40,6 +113,21 @@ DEFAULT_THRESHOLDS = {
     "result_correctness": 85.0,
     "asset_routing": 85.0,
 }
+
+INFO_ONLY_JUDGES = frozenset({
+    # Tier 3.6: judges that are diagnostic-only and must NOT drive
+    # clustering / soft-signal detection. Their failures are tracked
+    # for observability but don't justify a lever-loop iteration.
+    #
+    # ``repeatability`` compares this run's SQL against prior runs —
+    # failing on iteration 2 just means the SQL differs from iter 1's
+    # SQL, not that something is wrong.
+    # ``previous_sql`` is a sibling diagnostic that fires on every row
+    # where the SQL differs from the last accepted iteration's SQL; same
+    # reasoning — diagnostic, not actionable.
+    "repeatability",
+    "previous_sql",
+})
 
 REPEATABILITY_TARGET = 90.0
 
@@ -77,17 +165,390 @@ CONNECTION_POOL_SIZE = 20
 # ── 3. Iteration and Convergence ───────────────────────────────────────
 
 MAX_ITERATIONS = 5
+MAX_ITERATIONS_PER_CLUSTER = 1
+MAX_ITERATIONS_HARD_CEILING = 15
 SLICE_GATE_TOLERANCE = 15.0
-ENABLE_SLICE_GATE: bool = False
+ENABLE_SLICE_GATE: bool = True
+"""T2.15: re-enabled after iteration-1 log showed a 3-patch / 3-lever AG
+applied with zero intermediate regression checks. Combined with
+``SLICE_GATE_TOLERANCE_SMALL_CORPUS`` below, small-corpus noise is
+absorbed without suppressing the gate."""
 SLICE_GATE_MIN_REDUCTION = 0.5
 REGRESSION_THRESHOLD = 5.0
 MAX_NOISE_FLOOR = 5.0
+SLICE_GATE_TOLERANCE_SMALL_CORPUS = max(REGRESSION_THRESHOLD * 2, MAX_NOISE_FLOOR)
+"""T2.15: effective slice-gate tolerance when the full-scope corpus is
+smaller than ``SLICE_GATE_SMALL_CORPUS_ROWS``. Wider than the normal
+tolerance so a single-row swing doesn't spuriously fail the gate on
+22-row corpora."""
+SLICE_GATE_SMALL_CORPUS_ROWS = 30
+
+ENABLE_REWRITE_SECTION_SPLIT: bool = True
+"""T1.11: when True, a ``rewrite_instruction`` patch without explicit
+``escalation=full_rewrite`` is parsed into its canonical section headers
+(using ``INSTRUCTION_SECTION_ORDER``) and emitted as per-section
+``update_instruction_section`` patches, routed to the owning lever via
+``LEVER_TO_SECTIONS``. Only content with no canonical header or sections
+explicitly named CONSTRAINTS in the rewrite are merged into CONSTRAINTS.
+Set False to revert to the legacy ``collapse into CONSTRAINTS`` behaviour
+without a code revert."""
+
+SOFT_CLUSTER_REELEVATION_THRESHOLD = 0.6
+"""T1.12: when a soft cluster's mean ``judge_failure_ratio`` (failing
+non-info judges / total non-info judges) is at or above this threshold,
+the 0.5 soft-dampening multiplier is bypassed during ``rank_clusters``
+and the cluster is marked ``reelevated=True``. Prevents multi-judge
+soft clusters (e.g. 6-of-7 judges failing with arbiter verdict
+`genie_correct`) from being ranked below a small hard cluster."""
+
+OPTIMIZATION_OBJECTIVE: str = "pre_arbiter"
+"""DEPRECATED — read but no longer honoured by the gate code.
+
+Historical: selected which accuracy metric the lever-loop gate
+optimised (``pre_arbiter`` / ``post_arbiter`` / ``blended``). The
+``pre_arbiter`` default is what allowed the retail run to accept AG2
+with a -4.6pp post-arbiter regression: pre-arbiter improvement masked
+the arbiter-adjusted loss.
+
+Replaced by the single-criterion model in
+``acceptance_policy.decide_acceptance``. Post-arbiter accuracy is now
+the only signal that drives acceptance. Pre-arbiter accuracy is still
+emitted as a diagnostic in the eval payload and decision-audit rows
+but does not gate.
+
+The constant is kept for one release so importers don't break. Will
+be removed in a follow-up cleanup PR."""
+
+OPTIMIZATION_OBJECTIVE_POST_ARBITER_GUARDRAIL_PP: float = 5.0
+"""DEPRECATED — no longer read by the gate code.
+
+Historical: capped how far post-arbiter could regress when
+``OPTIMIZATION_OBJECTIVE='pre_arbiter'``. The 5.0pp default was looser
+than typical run-to-run variance, which is how the retail AG2
+acceptance slipped through.
+
+Replaced by ``MIN_POST_ARBITER_GAIN_PP`` (the gain floor itself acts
+as the guardrail — any drop or sub-threshold gain rejects). Kept for
+one release for back-compat."""
+
+# ── Task 2: strict acceptance ────────────────────────────────────────
+
+ENABLE_LEGACY_SLICE_P0_GATES: bool = (
+    os.getenv("GSO_ENABLE_LEGACY_SLICE_P0_GATES", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When True, ``harness._run_gate_checks`` runs the slice and P0
+evaluation gates before the full eval. When False (the default after
+Task 2 of the lever-loop improvement plan), only the single full eval
+runs and acceptance is decided by
+``acceptance_policy.decide_acceptance``.
+
+The decoded retail run showed both gates passing on AG2 while the
+full-eval rejection was the only honest signal; both gates also each
+add a Genie round-trip per AG. Keep the flag for one release so any
+operator who wants the old behaviour can opt in via
+``GSO_ENABLE_LEGACY_SLICE_P0_GATES=true``."""
+
+OPTIMIZATION_TARGET_POST_ARBITER_ACCURACY: float = float(
+    os.getenv("GSO_OPTIMIZATION_TARGET_POST_ARBITER_ACCURACY", "100.0")
+)
+"""Target post-arbiter / arbiter-adjusted accuracy for lever-loop convergence."""
+
+IGNORED_OPTIMIZATION_JUDGES: tuple[str, ...] = tuple(
+    j.strip()
+    for j in os.getenv("GSO_IGNORED_OPTIMIZATION_JUDGES", "response_quality").split(",")
+    if j.strip()
+)
+"""Judges visible in diagnostics but excluded from optimization targeting."""
+
+ENABLE_CONTROL_PLANE_ACCEPTANCE: bool = (
+    os.getenv("GSO_ENABLE_CONTROL_PLANE_ACCEPTANCE", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""Default-on kill switch for control-plane (causal) acceptance gating.
+
+The harness always computes ``decide_control_plane_acceptance`` for
+diagnostics, but only appends the rollback-driving
+``control_plane_acceptance`` regression when this flag is enabled. If
+the new gate over-rejects in a real workspace, set
+``GSO_ENABLE_CONTROL_PLANE_ACCEPTANCE=false`` to fall back to the legacy
+post-arbiter/regression-only acceptance path while keeping diagnostics
+intact.
+"""
+
+MIN_POST_ARBITER_GAIN_PP: float = float(
+    os.getenv("GSO_MIN_POST_ARBITER_GAIN_PP", "0.0")
+)
+"""Post-arbiter gain floor for accepting candidate states.
+
+The optimizer objective is 100% arbiter-adjusted accuracy within the configured
+lever-loop attempt budget. The default is 0.0 so any positive post-arbiter gain
+can be accepted when target-qid and out-of-target regression checks pass.
+Negative or zero deltas still reject in ``acceptance_policy.decide_acceptance``.
+"""
+
+BASELINE_DRIFT_DIAGNOSTIC_PP: float = float(
+    os.getenv("GSO_BASELINE_DRIFT_DIAGNOSTIC_PP", "4.0")
+)
+"""Threshold for the post-hoc baseline-drift diagnostic.
+
+At iteration N+1 entry, the harness compares the candidate's
+post-arbiter accuracy against iteration N's *pre-acceptance* baseline
+(the carried baseline before iter N's gate ran). If the candidate has
+fallen below that snapshot by ``BASELINE_DRIFT_DIAGNOSTIC_PP`` or
+more, a ``suspected_stale_baseline`` decision-audit row is written to
+flag a possibly-lucky iter-N acceptance.
+
+Diagnostic only — no auto-rollback. The acceptance gate at iter N+1
+runs as usual and may reject on its own merit."""
+
+MIN_PRIMARY_GAIN_PP: float = float(os.getenv("GSO_MIN_PRIMARY_GAIN_PP", "0.0"))
+"""DEPRECATED — no longer read by the gate code.
+
+Historical: per-confirmation-run primary-gain floor under the K-of-N
+strict acceptance policy. Replaced by ``MIN_POST_ARBITER_GAIN_PP``
+which applies once per iteration to a single eval. Kept for one
+release for back-compat."""
+
+MAX_POST_ARBITER_DROP_PP_SMALL_CORPUS: float = float(
+    os.getenv("GSO_MAX_POST_ARBITER_DROP_PP_SMALL_CORPUS", "2.0")
+)
+"""DEPRECATED — no longer read by the gate code.
+
+Historical: hard guardrail on raw post-arbiter accuracy drop, applied
+per confirmation run. Replaced by ``MIN_POST_ARBITER_GAIN_PP`` (a
+positive gain floor; any drop or sub-floor gain rejects). Kept for
+one release for back-compat."""
+
+SHADOW_APPLY: bool = False
+"""T3.3: when True, clone the Genie space to a shadow, apply patches
+there, evaluate the shadow, and promote on pass. When False (default),
+patches apply in-place with rollback on regression.
+
+Off by default because it doubles Genie API calls per iteration and
+the existing rollback path is cheap. Recommended ON for high-stakes
+spaces (live production) where even a brief "bad state" between apply
+and rollback is unacceptable.
+
+The promotion mechanism is not yet wired to the Genie SDK's space-clone
+API. When enabled but unwired, the harness logs a warning and falls
+back to in-place apply."""
 PLATEAU_ITERATIONS = 2
 CONSECUTIVE_ROLLBACK_LIMIT = 3
 """Stop the lever loop after this many consecutive rollbacks, indicating
 the optimizer is stuck and further iterations are unlikely to help.
 Root causes are only marked as tried when the limit is about to be hit,
 giving the strategist a chance to retry with a different lever."""
+MAX_ACTION_GROUPS_PER_STRATEGY = int(os.getenv("GSO_MAX_ACTION_GROUPS_PER_STRATEGY", "5"))
+"""Maximum number of action groups the strategist may emit per iteration.
+
+Task 15 of the lever-loop convergence plan v2 replaced the hard-coded
+``action_groups[:1]`` slice (which forced the strategist to ship a
+single AG per iteration) with this config knob. Multi-AG output lets a
+single iteration attack independent failure clusters in parallel,
+while the per-AG patch survival ledger (Task 4) and the per-question
+journey ledger (Task 13) keep blast-radius accounting clean."""
+
+MAX_AG_PATCHES = int(os.getenv("GSO_MAX_AG_PATCHES", "3"))
+"""Hard cap on the number of patches applied in a single action group.
+
+Task 5 of the lever-loop improvement plan lowered the default from 8
+to 3. Rationale: AG2 in the retail run shipped 8-patch bundles whose
+patches did not all target the failing questions, and a single bad
+patch took down 7 others when the AG rolled back. Smaller bundles
+keep rollback blast radius small and let per-question regression
+attribution (Task 4) actually point at the patch responsible.
+
+Override via ``GSO_MAX_AG_PATCHES`` for spaces that legitimately need
+broader bundles (e.g. very large corpora where 3 patches cannot move
+the metric). The original Tier 2.6 design — lever-boundary batch
+apply with intra-AG slice gates — is no longer in the gate sequence
+after Task 2 disabled slice/P0 gates by default."""
+
+MIN_PROPOSAL_RELEVANCE = float(os.getenv("GSO_MIN_PROPOSAL_RELEVANCE", "0.1"))
+
+ENABLE_PROACTIVE_FEATURE_MINING: bool = (
+    os.getenv("GSO_ENABLE_PROACTIVE_FEATURE_MINING", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""Task 9: when True, after the post-enrichment baseline eval the
+harness aggregates a typed corpus profile from the passing rows and
+emits enrichment patches (column descriptions, join specs, sql
+snippets) gated by the same dedup contract as Task 6 reactive
+mining.
+
+Default is ``False`` because proactive mining changes pre-loop
+enrichment behavior and the plan rollout (§7) ships it with its own
+release flag. Set ``GSO_ENABLE_PROACTIVE_FEATURE_MINING=true`` to
+opt in once Task 6 reactive mining is stable on a space."""
+
+ENABLE_REGRESSION_MINING_STRATEGIST: bool = (
+    os.getenv("GSO_ENABLE_REGRESSION_MINING_STRATEGIST", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""Regression-mining lane: when True, high-confidence
+``column_confusion`` insights mined from rolled-back iterations are
+appended to the next strategist call as compact, non-benchmark-verbatim
+hints (e.g. "Prefer contrastive metadata for is_month_to_date vs
+use_mtdate_flag").
+
+Default is ``False`` so the lane ships audit-only first. Mining itself
+runs unconditionally — the flag only gates the strategist input path.
+Insights below
+:data:`REGRESSION_MINING_STRATEGIST_MIN_CONFIDENCE` are never fed to
+the strategist regardless of this flag."""
+
+REGRESSION_MINING_STRATEGIST_MIN_CONFIDENCE: float = float(
+    os.getenv("GSO_REGRESSION_MINING_STRATEGIST_MIN_CONFIDENCE", "0.7")
+)
+"""Minimum confidence required for a mined insight to influence the
+strategist when
+:data:`ENABLE_REGRESSION_MINING_STRATEGIST` is on. Tightens the
+default analyzer floor (~0.6) for the strategist input path so only
+high-evidence insights leak into proposal generation; the audit lane
+keeps everything for offline review."""
+
+ENABLE_REGRESSION_MINING_RCA_LEDGER: bool = (
+    os.getenv("GSO_ENABLE_REGRESSION_MINING_RCA_LEDGER", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, visible regression-mining lessons feed the audit-only RCA ledger.
+
+This is intentionally independent of
+:data:`ENABLE_REGRESSION_MINING_STRATEGIST`, which only controls prompt
+exposure."""
+
+ENABLE_RCA_LEDGER: bool = (
+    os.getenv("GSO_ENABLE_RCA_LEDGER", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, build typed RCA findings from failed eval rows for audit.
+
+Default true because audit-only ledger construction does not change
+optimizer behavior."""
+
+ENABLE_RCA_THEMES_STRATEGIST: bool = (
+    os.getenv("GSO_ENABLE_RCA_THEMES_STRATEGIST", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, include selected RCA themes and conflict matrix in the
+strategist prompt. Defaults true because hard-failure RCA is part of the
+unified optimizer control plane, not optional diagnostics."""
+
+ENABLE_RCA_THEME_SELECTION: bool = (
+    os.getenv(
+        "GSO_ENABLE_RCA_THEME_SELECTION",
+        os.getenv("GSO_ENABLE_RCA_THEME_BUNDLES", "false"),
+    ).lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, prune RCA themes to a compatible subset for strategist context.
+
+This does not mechanically constrain proposal generation, grounding, or
+apply. ``GSO_ENABLE_RCA_THEME_BUNDLES`` is accepted as a deprecated
+compatibility alias."""
+
+ENABLE_RCA_THEME_BUNDLES: bool = ENABLE_RCA_THEME_SELECTION
+"""Deprecated compatibility alias for :data:`ENABLE_RCA_THEME_SELECTION`."""
+
+RCA_MAX_THEMES_PER_ITERATION: int = int(
+    os.getenv("GSO_RCA_MAX_THEMES_PER_ITERATION", "3")
+)
+RCA_MAX_THEME_PATCHES_PER_ITERATION: int = int(
+    os.getenv("GSO_RCA_MAX_THEME_PATCHES_PER_ITERATION", "8")
+)
+
+ENABLE_RCA_EXAMPLE_SQL_SYNTHESIS: bool = (
+    os.getenv("GSO_ENABLE_RCA_EXAMPLE_SQL_SYNTHESIS", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, selected RCA themes may request leakage-safe example SQL synthesis.
+
+This only creates candidate proposals through ``synthesize_example_sqls_for_rca``.
+It does not bypass synthesis validation, benchmark-leakage checks, proposal
+grounding, or post-iteration rollback.
+"""
+
+ENABLE_RCA_SQL_SNIPPET_BRIDGE: bool = (
+    os.getenv("GSO_ENABLE_RCA_SQL_SNIPPET_BRIDGE", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, RCA themes whose patches request SQL snippets
+(``add_sql_snippet_measure`` / ``add_sql_snippet_filter`` /
+``add_sql_snippet_expression``) deterministically trigger
+``_generate_lever6_proposal`` even when the strategist did not route the
+action group to Lever 6.
+
+This does not bypass identifier validation, SQL execution checks, or
+benchmark-leakage firewall in ``_generate_lever6_proposal``.
+"""
+
+ENABLE_RCA_JOIN_SPEC_BRIDGE: bool = (
+    os.getenv("GSO_ENABLE_RCA_JOIN_SPEC_BRIDGE", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, RCA themes whose patches request ``add_join_spec``
+deterministically build a join proposal from the theme's
+``expected_objects`` (qualified ``table.column`` pairs) and run it
+through the existing Lever-4 validation + dedup machinery, even when
+the strategist did not surface the join in its directives.
+
+This does not bypass ``ensure_join_spec_fields`` normalization,
+``validate_join_spec_types`` checks, or duplicate-pair filtering against
+existing or already-proposed joins.
+"""
+
+ENABLE_RCA_LEVER1_BRIDGE: bool = (
+    os.getenv("GSO_ENABLE_RCA_LEVER1_BRIDGE", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When true, RCA themes whose patches request L1 metadata changes
+(``update_column_description`` / ``add_column_synonym`` /
+``update_description``) trigger ``_generate_lever1_rca_proposal``,
+which calls the LLM to produce description text and high-quality
+synonyms from the failing questions' NL phrasing + RCA evidence.
+
+Existing column proposals from the strategist path are augmented with
+RCA-derived synonyms (additive merge) rather than overwritten. The
+benchmark-leakage firewall still applies via the AFS projection.
+"""
+
+ENFORCE_REFLECTION_REVALIDATION: bool = (
+    os.getenv("GSO_ENFORCE_REFLECTION_REVALIDATION", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""Task 10: when True (default), the T2.2 reflection-as-validator
+bypass requires a substantive ``escalation_justification`` (≥ 16
+chars) to override a previously-rolled-back ``(patch_type, target)``
+pair. Surviving rewrites are stamped with a fresh ``proposal_id`` +
+``parent_proposal_id`` for attribution and emit a
+``reflection_rewrite`` decision audit row before flowing through
+grounding (Task 5), counterfactual scan, AFS / leakage firewall, and
+apply.
+
+Set ``GSO_ENFORCE_REFLECTION_REVALIDATION=false`` to fall back to the
+legacy "any non-empty justification bypasses" behavior. The legacy
+mode still tags rewrites and emits the audit row, but no longer
+requires the justification to be non-trivial."""
+
+"""Minimum fraction of a proposal's identifier targets that must
+appear in some failing question's surface for the proposal to be kept
+by ``proposal_grounding.select_patch_bundle``. Default ``0.1`` keeps
+the bar low (one matching identifier among ten suffices) but still
+catches the AG2 failure mode where ``zone_combination`` patches
+shipped against Q011/Q009 failures that never reference the column.
+
+Set to ``0.0`` to disable grounding entirely (legacy behavior)."""
+INFRA_RETRY_BUDGET = 3
+"""Stop the lever loop after this many consecutive INFRA_FAILURE
+rollbacks. Infra rollbacks do not count toward
+``CONSECUTIVE_ROLLBACK_LIMIT`` or ``_diminishing_returns`` because
+they carry no content signal, but an unbounded infra-fail loop should
+still terminate with a clear ``LEVER_LOOP_INFRA_EXHAUSTED`` reason
+rather than spinning until the job timeout kills the run. See
+:mod:`genie_space_optimizer.optimization.rollback_class` and
+``classify_rollback_reason`` for which producer prefixes map to
+``INFRA_FAILURE``."""
 CONSECUTIVE_ESCALATION_LIMIT = 2
 """Stop the lever loop after this many consecutive iterations where the
 strategist escalated (gt_repair, flag_for_review) instead of producing
@@ -124,9 +585,127 @@ TVF_REMOVAL_BLAME_THRESHOLD = 2
 """Minimum distinct iterations where the TVF was blamed in ASI provenance
 for high-confidence auto-removal."""
 
+# ── 3a. Scoring-V2 feature flags ────────────────────────────────────────
+#
+# ``GSO_SCORING_V2`` gates every Group-B scoring-policy change from the
+# ``baseline-eval-fix`` plan. Accepted values (case-insensitive):
+#
+#   ``on``      — new corrected scoring (default).
+#   ``shadow``  — run both old and new paths; headline is the new value
+#                 but the legacy value is logged as ``shadow.<judge>.<metric>``
+#                 for side-by-side comparison in MLflow.
+#   ``off``     — legacy kill-switch. Byte-identical to pre-PR behavior.
+#
+# ``GSO_APPLY_QUALITY_INSTRUCTIONS`` gates the Group-D applier changes
+# (MV-preference, column-ordering, calendar-grounding instruction
+# bullets). Each policy is rendered as a plain bullet under its target
+# canonical ``##`` section — no markers or wrappers are written into
+# customer-visible prose. Accepted values: ``on`` (default, inserts the
+# current policy bullets), ``off`` (skips insertion). In either mode,
+# bullets whose text exactly matches a known policy body (current or
+# deprecated, tracked in ``applier._GSO_QUALITY_V1_POLICIES`` and
+# ``_GSO_QUALITY_V1_DEPRECATED_BULLETS``) are stripped so a flip to
+# ``off`` fully reverts our content. Customer-authored bullets with any
+# different wording are preserved verbatim. Pre-Option-C sentinel blocks
+# (``-- BEGIN/END GSO_QUALITY_V1:<key>``) are swept out on any apply.
+#
+# ``GSO_ASSERT_ROW_CANONICAL`` is a dev-only assertion; defaults to off.
+#
+# ``GSO_INVARIANT_STRICT`` (Plan N4 / Cycle 8) controls the lever
+# loop's invariant warn-and-degrade policy. Defaults to **off** on
+# the production deploy: the five sites that historically raised
+# ``AssertionError`` (quarantine attribution drift, regression-debt
+# partition completeness, cap conservation, soft-cluster currency,
+# non-canonical judge row) now emit ``GSO_INVARIANT_VIOLATION_V1``
+# stdout markers + typed decision records and degrade gracefully.
+# CI and replay tooling that sets ``GSO_DECISION_EMITTER_STRICT=1``
+# automatically inherits strict invariant behaviour via fallback.
+# Operators who want strict-debug locally set
+# ``GSO_INVARIANT_STRICT=1``.
+
+_SCORING_V2_ALLOWED = ("on", "shadow", "off")
+
+
+def _normalize_scoring_v2(raw: str | None) -> str:
+    value = (raw or "on").strip().lower()
+    if value in _SCORING_V2_ALLOWED:
+        return value
+    # Back-compat: accept the common booleans people wire into env files.
+    if value in ("1", "true", "yes"):
+        return "on"
+    if value in ("0", "false", "no"):
+        return "off"
+    return "on"
+
+
+def get_scoring_v2_mode() -> str:
+    """Return the active scoring-v2 mode (``on``/``shadow``/``off``).
+
+    Evaluated on every call so tests can ``monkeypatch.setenv`` without
+    reloading the module.
+    """
+    return _normalize_scoring_v2(os.environ.get("GSO_SCORING_V2"))
+
+
+def scoring_v2_is_legacy() -> bool:
+    """True when ``GSO_SCORING_V2=off`` — restores legacy scoring exactly."""
+    return get_scoring_v2_mode() == "off"
+
+
+def scoring_v2_is_shadow() -> bool:
+    """True when ``GSO_SCORING_V2=shadow`` — new headline + legacy shadow metrics."""
+    return get_scoring_v2_mode() == "shadow"
+
+
+def scoring_v2_is_on() -> bool:
+    """True when the new scoring path is the active headline (default)."""
+    return get_scoring_v2_mode() in ("on", "shadow")
+
+
+_APPLY_QUALITY_INSTRUCTIONS_ALLOWED = ("on", "off")
+
+
+def _normalize_quality_instructions(raw: str | None) -> str:
+    value = (raw or "on").strip().lower()
+    if value in _APPLY_QUALITY_INSTRUCTIONS_ALLOWED:
+        return value
+    if value in ("1", "true", "yes"):
+        return "on"
+    if value in ("0", "false", "no"):
+        return "off"
+    return "on"
+
+
+def get_apply_quality_instructions_mode() -> str:
+    """Return the active applier-quality mode (``on`` or ``off``)."""
+    return _normalize_quality_instructions(
+        os.environ.get("GSO_APPLY_QUALITY_INSTRUCTIONS")
+    )
+
+
+def apply_quality_instructions_is_on() -> bool:
+    return get_apply_quality_instructions_mode() == "on"
+
+
 # ── 4. LLM Configuration ──────────────────────────────────────────────
 
-LLM_ENDPOINT = "databricks-claude-opus-4-6"
+DEFAULT_LLM_ENDPOINT = "databricks-claude-sonnet-4-6"
+
+
+def get_llm_endpoint() -> str:
+    """Return the Databricks model serving endpoint used by GSO LLM calls.
+
+    ``LLM_MODEL`` is the app-wide source of truth. ``GSO_LLM_ENDPOINT`` is an
+    explicit GSO-only override for emergency/debug use.
+    """
+    return (
+        os.environ.get("GSO_LLM_ENDPOINT")
+        or os.environ.get("LLM_MODEL")
+        or DEFAULT_LLM_ENDPOINT
+    ).strip() or DEFAULT_LLM_ENDPOINT
+
+
+LLM_ENDPOINT = DEFAULT_LLM_ENDPOINT
 LLM_TEMPERATURE = 0
 LLM_MAX_RETRIES = 3
 
@@ -147,12 +726,71 @@ HELD_OUT_RATIO = 0.15
 """Fraction of non-curated benchmarks reserved for held-out generalization
 check in Finalize.  The optimizer never sees these during the lever loop."""
 
-TARGET_BENCHMARK_COUNT = 24
-MAX_BENCHMARK_COUNT = 29
-"""Hard ceiling on benchmark count.  No evaluation should ever run on more
+PUBLISH_BENCHMARKS_TO_SPACE: bool = (
+    os.environ.get("GSO_PUBLISH_BENCHMARKS_TO_SPACE", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When True (default), benchmark questions used by the optimizer are
+published to the Genie Space's native ``benchmarks.questions`` at finalize
+via ``publish_benchmarks_to_genie_space``. Writes are merged (not replacing)
+with any user-authored benchmarks and tagged with a ``[auto-optimize]``
+prefix + structured source metadata so end users can distinguish them from
+their own curated benchmarks. Set GSO_PUBLISH_BENCHMARKS_TO_SPACE=0 to opt
+out and keep the space's benchmark section untouched."""
+
+# Phase 4 (Bug #4) — corpus sizing for same-corpus before/after evaluation.
+# All Bug-#4-era changes to these values are hidden behind GSO_NEW_SIZING so
+# rollback to previous behaviour is a one-env-var flip. The legacy values
+# were TARGET=24, MAX=29, HELD_OUT=0.15 (~20 train + ~4 held-out); the Phase
+# 4 plan specifies 30 total (~25 train + ~5 held-out), MAX=35 cap.
+_GSO_NEW_SIZING = os.environ.get("GSO_NEW_SIZING", "true").lower() in {
+    "1", "true", "yes", "on",
+}
+
+if _GSO_NEW_SIZING:
+    TARGET_BENCHMARK_COUNT = 30
+    MAX_BENCHMARK_COUNT = 30
+else:
+    TARGET_BENCHMARK_COUNT = 24
+    MAX_BENCHMARK_COUNT = 29
+"""Hard ceiling on benchmark count. No evaluation should ever run on more
 than this many questions, regardless of how many are generated or loaded.
-With HELD_OUT_RATIO=0.15 the train split contains ~20 questions (same as
-the previous TARGET_BENCHMARK_COUNT) and ~4 are held out."""
+With the Phase 4 default the corpus is exactly 30 questions (~25 train + ~5
+held out via HELD_OUT_RATIO=0.15). Flip GSO_NEW_SIZING=0 to restore the
+legacy 24/29 values."""
+
+MIN_TRAIN_BENCHMARK_COUNT = 20
+"""Minimum desired train benchmark count after split assignment."""
+
+MIN_HELD_OUT_BENCHMARK_COUNT = 5
+"""Minimum desired held-out benchmark count when the corpus has enough rows."""
+
+# Phase 4 (Bug #4) — per-iteration / acceptance-gate defaults.
+# The optimizer re-evaluates the full training corpus each iteration and
+# derives cluster attestation as a slice of that eval (see harness.py and
+# AGENTS.md Bug #4 section).
+MIN_NET_DELTA = int(os.environ.get("GSO_MIN_NET_DELTA", "1") or "1")
+"""Minimum net_delta within the targeted cluster for an iteration to be
+accepted. net_delta = newly_passing_within_cluster - newly_failing_within_cluster.
+A value of 1 (default) matches "at least one more question passes, within
+the cluster". Lower to 0 to allow zero-improvement iterations (not
+recommended — admits pure-noise iterations)."""
+
+OUT_OF_CLUSTER_REGRESSION_TOLERANCE = int(
+    os.environ.get("GSO_OOC_REGRESSION_TOLERANCE", "0") or "0"
+)
+"""Maximum number of questions outside the targeted cluster that may go
+from passing to failing in a single iteration before the iteration is
+rolled back. Default 0 — any out-of-cluster regression triggers rollback."""
+
+ITERATION_ACCEPTANCE_ENABLED: bool = (
+    os.environ.get("GSO_ITERATION_ACCEPTANCE", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+"""When True, ``apply_iteration_acceptance`` in ``harness.py`` enforces the
+cluster-net-delta + out-of-cluster regression check and rolls back
+iterations that fail. Set to False during debugging to disable rollback
+while keeping the metrics visible on the iteration row."""
 
 FINALIZE_REPEATABILITY_PASSES = 1
 """Number of repeatability passes in Finalize.  Reduced from 2 to make room
@@ -267,10 +905,18 @@ BENCHMARK_GENERATION_PROMPT = (
     'FROM mv_sales s JOIN dim_location l ON s.location_number = l.location_number GROUP BY ALL\n'
     'GOOD (CTE-first pattern — materialize metric view, then JOIN):\n'
     '  WITH sales AS (\n'
-    '    SELECT location_number, MEASURE(cy_sales) AS cy_sales FROM mv_sales GROUP BY ALL\n'
+    '    SELECT location_number, MEASURE(cy_sales) AS cy_sales_value FROM mv_sales GROUP BY ALL\n'
     '  )\n'
-    '  SELECT s.location_number, l.zone_name, s.cy_sales '
+    '  SELECT s.location_number, l.zone_name, s.cy_sales_value '
     'FROM sales s JOIN dim_location l ON s.location_number = l.location_number\n'
+    '\n'
+    '## CRITICAL: MEASURE() Alias Collision Rule\n'
+    '- NEVER alias MEASURE(col) back to the same column name. '
+    'Spark shadows the underlying measure column with the alias and '
+    'fails ORDER BY / HAVING with '
+    'MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION.\n'
+    'BAD:  SELECT zone, MEASURE(cy_sales) AS cy_sales FROM mv GROUP BY zone ORDER BY MEASURE(cy_sales) DESC\n'
+    'GOOD: SELECT zone, MEASURE(cy_sales) AS cy_sales_value FROM mv GROUP BY zone ORDER BY cy_sales_value DESC\n'
     '\n'
     '## Question-SQL Alignment\n'
     '- expected_sql MUST answer EXACTLY what the question asks — no more, no less.\n'
@@ -281,12 +927,15 @@ BENCHMARK_GENERATION_PROMPT = (
     '\n'
     '## CRITICAL: Instruction-Mandated Default Filters\n'
     'The Genie Space Instructions section above may define default filters (e.g. '
-    '"Default filter: same_store_7now = Y for all PSD queries"). These are MANDATORY:\n'
+    '"Default filter: <flag_column> = <value> for all <metric>-related queries", '
+    'such as a default region filter, a default active-only filter, or a default '
+    'time-window filter). These are MANDATORY:\n'
     '- EVERY benchmark SQL that falls under the scope of a default filter MUST include '
     'that filter in its WHERE clause. Omitting it produces incorrect ground truth.\n'
     '- The question text MUST reflect the default filter so question and SQL stay aligned. '
-    'Example: instead of "What are the PSD KPIs by zone?" with WHERE same_store_7now = \'Y\', '
-    'write "What are the same-store PSD KPIs by zone?"\n'
+    'Example: instead of "What are the metric KPIs by region?" with '
+    'WHERE <flag_column> = \'<value>\', '
+    'write "What are the <flag-qualified> metric KPIs by region?" so the question and SQL agree.\n'
     '- Do NOT add filters that are neither mentioned in the question NOR mandated by instructions.\n'
     '\n'
     '## Minimal SQL Principle\n'
@@ -353,11 +1002,21 @@ BENCHMARK_CORRECTION_PROMPT = (
     '{{ data_profile_context }}\n'
     '\n'
     '## Benchmarks to Fix\n'
+    'Each entry below has these keys:\n'
+    '- ``question`` / ``original_expected_sql`` — the input.\n'
+    '- ``error`` — the raw Spark error string.\n'
+    '- ``validation_reason_code`` — a stable taxonomy code (e.g. '
+    '``mv_alias_collision``, ``mv_missing_measure_function``, '
+    '``unknown_column``).\n'
+    '- ``repair_hint`` — a class-specific instruction describing the '
+    'minimal change. **Apply the repair_hint before any other rewrite.**\n'
     '{{ benchmarks_to_fix }}\n'
     '</context>\n'
     '\n'
     '<instructions>\n'
-    'Fix each benchmark so expected_sql is valid using ONLY the assets and columns above.\n'
+    'Fix each benchmark so expected_sql is valid using ONLY the assets and columns above. '
+    'When ``repair_hint`` is present, follow it exactly — it is the deterministic fix for '
+    'the error class.\n'
     '\n'
     '- Wrong table/view name: find closest matching valid asset, rewrite SQL.\n'
     '- Field drift (e.g., property_name vs property): map to closest valid column.\n'
@@ -373,8 +1032,8 @@ BENCHMARK_CORRECTION_PROMPT = (
     'the CTE-first pattern — materialize the metric view in a WITH clause, then JOIN the '
     'CTE to the dimension table:\n'
     '  BAD:  SELECT s.id, l.name, MEASURE(s.sales) FROM mv_sales s JOIN dim l ON s.id = l.id\n'
-    '  GOOD: WITH sales AS (SELECT id, MEASURE(sales) AS sales FROM mv_sales GROUP BY ALL) '
-    'SELECT s.id, l.name, s.sales FROM sales s JOIN dim l ON s.id = l.id\n'
+    '  GOOD: WITH sales AS (SELECT id, MEASURE(sales) AS sales_value FROM mv_sales GROUP BY ALL) '
+    'SELECT s.id, l.name, s.sales_value FROM sales s JOIN dim l ON s.id = l.id\n'
     '- TVFs: use correct function call signature.\n'
     '- Multi-table JOINs: use Join Specifications above for valid join paths.\n'
     '- If error says "Query returns 0 rows", the SQL is syntactically valid but\n'
@@ -395,6 +1054,251 @@ BENCHMARK_CORRECTION_PROMPT = (
     '"unfixable_reason" (null if fixed).\n'
     '</output_schema>'
 )
+
+
+# ── 6b. Example-SQL prompts (Phase 2.R2 of unify-example-sql plan) ──────
+#
+# Copy-and-diverge from BENCHMARK_GENERATION_PROMPT / BENCHMARK_CORRECTION_PROMPT
+# with three specific changes:
+#   - <role> reframed from "evaluation expert" to "example author"
+#     ("TEACH Genie", not "TEST Genie")
+#   - Instructions de-emphasize evaluation-style edge cases and asset
+#     coverage; emphasize common, naturally-phrased business questions
+#   - Output schema drops category / expected_facts / required_tables /
+#     required_columns; example_question_sqls just need question + SQL
+#     (+ optional usage_guidance that helps Genie use the example)
+#
+# Every Metric-View rule, Column Allowlist rule, Data Profile grounding
+# block, and Instruction-Mandated Default Filter block is kept verbatim —
+# those are the features we adopted the benchmark engine for.
+#
+# Isolation: these prompts must NOT reference any benchmark-derived
+# template variable. See the module-load-time assertion at the bottom of
+# this file + docs/example-sql-isolation.md.
+
+EXAMPLE_SQL_GENERATION_PROMPT = (
+    '<role>\n'
+    'You are a Databricks Genie Space example-SQL author. Your output '
+    'will be stored in instructions.example_question_sqls as reference '
+    'material that TEACHES Genie the shape of common questions on this '
+    'space — it is NOT used to evaluate Genie. Write examples a real '
+    'business user would naturally ask; clarity beats cleverness.\n'
+    '</role>\n'
+    '\n'
+    '<context>\n'
+    '## Domain: {{ domain }}\n'
+    '\n'
+    '## VALID Data Assets (ONLY use these in SQL)\n'
+    '{{ valid_assets_context }}\n'
+    '\n'
+    '## Tables and Columns\n'
+    '{{ tables_context }}\n'
+    '\n'
+    '## Column Allowlist (Extract-Over-Generate — use ONLY these column names)\n'
+    '{{ column_allowlist }}\n'
+    '\n'
+    '## Metric Views\n'
+    '{{ metric_views_context }}\n'
+    '\n'
+    '## Table-Valued Functions\n'
+    '{{ tvfs_context }}\n'
+    '\n'
+    '## Join Specifications (how tables relate)\n'
+    '{{ join_specs_context }}\n'
+    '\n'
+    '## Generation Profile\n'
+    'Profile name: {{ generation_profile_name }}\n'
+    '{{ generation_profile_focus }}\n'
+    '\n'
+    '## Asset Coverage Guidance\n'
+    '{{ asset_coverage_guidance }}\n'
+    '\n'
+    '## Genie Space Instructions\n'
+    '{{ instructions_context }}\n'
+    '\n'
+    '## Sample Questions (from Genie Space config)\n'
+    '{{ sample_questions_context }}\n'
+    '\n'
+    '## Data Profile (actual values from database)\n'
+    '{{ data_profile_context }}\n'
+    '</context>\n'
+    '\n'
+    '<instructions>\n'
+    'Generate exactly {{ target_count }} example question + SQL pairs that '
+    'a typical business user would ask on this space. Prioritize common, '
+    'directly-useful business questions over edge cases.\n'
+    '\n'
+    '## Data-Grounded Values\n'
+    'Use the Data Profile to pick realistic filter values — reference '
+    'actual column values rather than inventing them. For numeric columns, '
+    'use values within the profiled min/max range. If a filter cannot be '
+    'grounded, omit it rather than guess.\n'
+    '\n'
+    '## Asset Constraint (Extract-Over-Generate)\n'
+    'expected_sql MUST ONLY reference tables, metric views, and functions '
+    'from VALID Data Assets. Every column MUST come from the Column '
+    'Allowlist. Invented table, view, or column names are a hallucination '
+    'and will be rejected.\n'
+    '\n'
+    '## Metric View Query Rules\n'
+    'When writing SQL for metric views:\n'
+    '- NEVER use SELECT * — metric views require explicit column references.\n'
+    '- ALL measure columns MUST be wrapped in MEASURE() in both SELECT and ORDER BY.\n'
+    '  Example: SELECT region, MEASURE(total_revenue) FROM mv_sales GROUP BY region\n'
+    '- NEVER use MEASURE() in WHERE, HAVING, ON, or CASE WHEN clauses — MEASURE() is '
+    'only valid in SELECT and ORDER BY. To filter on a measure, materialize it in a '
+    'CTE first, then filter on the alias.\n'
+    '- NEVER use direct JOINs on metric views — they cause METRIC_VIEW_JOIN_NOT_SUPPORTED errors.\n'
+    '- If an example requires metric view data PLUS dimension columns from another table, '
+    'use the CTE-first pattern: materialize the metric view query in a WITH clause, then JOIN '
+    'the CTE result to the dimension table.\n'
+    '- Dimensions (non-measure columns) are used for GROUP BY and filtering only.\n'
+    '- The Metric Views section above lists which columns are measures vs dimensions.\n'
+    '\n'
+    '## Common Metric View SQL Mistakes (AVOID THESE)\n'
+    'BAD:  SELECT zone, MEASURE(sales) FROM mv WHERE MEASURE(pct_chg) < -2\n'
+    'GOOD: WITH t AS (SELECT zone, MEASURE(sales) AS s, MEASURE(pct_chg) AS p '
+    'FROM mv GROUP BY zone) SELECT * FROM t WHERE p < -2\n'
+    '\n'
+    'BAD:  SELECT * FROM mv_store_sales\n'
+    'GOOD: SELECT zone, MEASURE(total_sales) FROM mv_store_sales GROUP BY zone\n'
+    '\n'
+    'BAD (METRIC_VIEW_JOIN_NOT_SUPPORTED):\n'
+    '  SELECT s.location_number, l.zone_name, MEASURE(s.cy_sales) '
+    'FROM mv_sales s JOIN dim_location l ON s.location_number = l.location_number GROUP BY ALL\n'
+    'GOOD (CTE-first pattern — materialize metric view, then JOIN):\n'
+    '  WITH sales AS (\n'
+    '    SELECT location_number, MEASURE(cy_sales) AS cy_sales_value FROM mv_sales GROUP BY ALL\n'
+    '  )\n'
+    '  SELECT s.location_number, l.zone_name, s.cy_sales_value '
+    'FROM sales s JOIN dim_location l ON s.location_number = l.location_number\n'
+    '\n'
+    '## CRITICAL: MEASURE() Alias Collision Rule\n'
+    '- NEVER alias MEASURE(col) back to the same column name. '
+    'Spark shadows the underlying measure column with the alias and '
+    'fails ORDER BY / HAVING with '
+    'MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION.\n'
+    'BAD:  SELECT zone, MEASURE(cy_sales) AS cy_sales FROM mv GROUP BY zone ORDER BY MEASURE(cy_sales) DESC\n'
+    'GOOD: SELECT zone, MEASURE(cy_sales) AS cy_sales_value FROM mv GROUP BY zone ORDER BY cy_sales_value DESC\n'
+    '\n'
+    '## Question-SQL Alignment\n'
+    '- expected_sql MUST answer EXACTLY what the question asks — no more, no less.\n'
+    '- Do NOT add extra columns beyond what the question asks for.\n'
+    '- If the question is ambiguous about a filter, do NOT assume one UNLESS the Genie '
+    'Space Instructions mandate it as a default.\n'
+    '\n'
+    '## CRITICAL: Instruction-Mandated Default Filters\n'
+    'The Genie Space Instructions section above may define default filters. These are MANDATORY:\n'
+    '- EVERY example SQL in the scope of a default filter MUST include that filter. '
+    'Omitting it teaches Genie the wrong query shape.\n'
+    '- The question text MUST reflect the default filter so question and SQL stay aligned.\n'
+    '\n'
+    '## Minimal SQL Principle\n'
+    'Write the simplest correct SQL. Prefer fewer columns and filters. '
+    'For multi-table questions JOINs are expected and encouraged, but only when '
+    'the question really spans two assets.\n'
+    '\n'
+    '## Diversity Quotas For This Call\n'
+    '{{ generation_profile_quotas }}\n'
+    '\n'
+    'Avoid repeating the same question wording, exact intent, WHERE filters, '
+    'ORDER BY shape, or selected dimensions across examples in this call. '
+    'Do NOT copy benchmark-style wording verbatim. The examples should teach '
+    'useful business query patterns without echoing evaluation rows.\n'
+    '\n'
+    '## Diversity\n'
+    'Cover different query shapes (aggregations, filters, temporal comparisons, '
+    'ranking). Do NOT duplicate the intent of any "Already Covered Questions" '
+    'block appended below this prompt.\n'
+    '</instructions>\n'
+    '\n'
+    '<output_schema>\n'
+    'Return a JSON array of example objects. No markdown, just JSON.\n'
+    '\n'
+    'Each object:\n'
+    '- "question": clean business question, customer-style phrasing\n'
+    '- "expected_sql": valid Databricks SQL using fully-qualified names from VALID Data Assets '
+    '(metric views: MEASURE() syntax; TVFs: function call; tables: standard SQL)\n'
+    '- "usage_guidance": one short sentence telling Genie when to surface this example '
+    '(e.g. "Use when the user asks about monthly revenue by region.")\n'
+    '</output_schema>'
+)
+
+EXAMPLE_SQL_CORRECTION_PROMPT = (
+    '<role>\n'
+    'You are a Databricks SQL expert fixing invalid Genie Space example '
+    'SQLs. These examples TEACH Genie common query shapes, so the '
+    'corrected SQL must be realistic and clear for a business user.\n'
+    '</role>\n'
+    '\n'
+    '<context>\n'
+    '## VALID Data Assets (ONLY these exist)\n'
+    '{{ valid_assets_context }}\n'
+    '\n'
+    '## Tables and Columns\n'
+    '{{ tables_context }}\n'
+    '\n'
+    '## Column Allowlist (Extract-Over-Generate — use ONLY these column names)\n'
+    '{{ column_allowlist }}\n'
+    '\n'
+    '## Metric Views\n'
+    '{{ metric_views_context }}\n'
+    '\n'
+    '## Table-Valued Functions\n'
+    '{{ tvfs_context }}\n'
+    '\n'
+    '## Data Profile (actual values from database)\n'
+    '{{ data_profile_context }}\n'
+    '\n'
+    '## Examples to Fix\n'
+    'Each entry below has these keys:\n'
+    '- ``question`` / ``original_expected_sql`` — the input.\n'
+    '- ``error`` — the raw Spark error string.\n'
+    '- ``validation_reason_code`` — a stable taxonomy code (e.g. '
+    '``mv_alias_collision``, ``mv_missing_measure_function``, '
+    '``unknown_column``).\n'
+    '- ``repair_hint`` — a class-specific instruction describing the '
+    'minimal change. **Apply the repair_hint before any other rewrite.**\n'
+    '{{ benchmarks_to_fix }}\n'
+    '</context>\n'
+    '\n'
+    '<instructions>\n'
+    'Fix each example so expected_sql is valid using ONLY the assets and columns above. '
+    'When ``repair_hint`` is present, follow it exactly — it is the deterministic fix for '
+    'the error class.\n'
+    '\n'
+    '- Wrong table/view name: find closest matching valid asset, rewrite SQL.\n'
+    '- Field drift (e.g., property_name vs property): map to closest valid column.\n'
+    '- Metric views: use MEASURE() syntax for aggregates in SELECT/ORDER BY.\n'
+    '- Metric view alias collision: NEVER use ORDER BY alias when alias == source column\n'
+    '  for MEASURE() expressions. Use ORDER BY MEASURE(column) directly.\n'
+    '- Metric views: NEVER use SELECT * or direct JOINs on metric views. '
+    'All measures MUST use MEASURE().\n'
+    '- Metric views: NEVER use MEASURE() in WHERE, HAVING, ON, or CASE WHEN clauses — '
+    'MEASURE() is only valid in SELECT and ORDER BY. To filter on a measure, materialize '
+    'it in a CTE first, then filter on the alias.\n'
+    '- Metric view + JOIN: If the error is METRIC_VIEW_JOIN_NOT_SUPPORTED, rewrite using '
+    'the CTE-first pattern — materialize the metric view in a WITH clause, then JOIN the '
+    'CTE to the dimension table:\n'
+    '  BAD:  SELECT s.id, l.name, MEASURE(s.sales) FROM mv_sales s JOIN dim l ON s.id = l.id\n'
+    '  GOOD: WITH sales AS (SELECT id, MEASURE(sales) AS sales_value FROM mv_sales GROUP BY ALL) '
+    'SELECT s.id, l.name, s.sales_value FROM sales s JOIN dim l ON s.id = l.id\n'
+    '- TVFs: use correct function call signature.\n'
+    '- If error says "Query returns 0 rows", the SQL is syntactically valid but\n'
+    '  references impossible filter values. Use the Data Profile to pick realistic values.\n'
+    '- If no valid asset can answer the question, set expected_sql to null with unfixable_reason.\n'
+    '- Preserve original question text when possible.\n'
+    '- Apply MINIMAL SQL PRINCIPLE: corrected SQL answers exactly what the question asks.\n'
+    '</instructions>\n'
+    '\n'
+    '<output_schema>\n'
+    'Return a JSON array of objects. No markdown, just JSON.\n'
+    '\n'
+    'Each object: "question", "expected_sql" (corrected or null), '
+    '"usage_guidance", "unfixable_reason" (null if fixed).\n'
+    '</output_schema>'
+)
+
 
 CURATED_SQL_GENERATION_PROMPT = (
     '<role>\n'
@@ -569,6 +1473,14 @@ BENCHMARK_COVERAGE_GAP_PROMPT = (
     'BAD:  SELECT * FROM mv_store_sales\n'
     'GOOD: SELECT zone, MEASURE(total_sales) FROM mv_store_sales GROUP BY zone\n'
     '\n'
+    '## CRITICAL: MEASURE() Alias Collision Rule\n'
+    '- NEVER alias MEASURE(col) back to the same column name. '
+    'Spark shadows the underlying measure column with the alias and '
+    'fails ORDER BY / HAVING with '
+    'MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION.\n'
+    'BAD:  SELECT zone, MEASURE(cy_sales) AS cy_sales FROM mv GROUP BY zone ORDER BY MEASURE(cy_sales) DESC\n'
+    'GOOD: SELECT zone, MEASURE(cy_sales) AS cy_sales_value FROM mv GROUP BY zone ORDER BY cy_sales_value DESC\n'
+    '\n'
     '## Question-SQL Alignment\n'
     '- expected_sql MUST answer EXACTLY what the question asks — no more, no less.\n'
     '- Do NOT add WHERE filters the question does not mention.\n'
@@ -598,6 +1510,106 @@ BENCHMARK_COVERAGE_GAP_PROMPT = (
     '</output_schema>'
 )
 
+# ── 5a. Unified RCA Engine Contract (defined before any consumer prompt) ─
+#
+# Shared header injected into every RCA-driven optimizer prompt so the
+# strategist, lever, proposal, mining, and reactive paths all reason about
+# the same control-plane invariants. Preflight example synthesis uses a
+# narrower contract; see ``LEAK_SAFE_EXAMPLE_SYNTHESIS_CONTRACT_PROMPT``.
+
+UNIFIED_RCA_ENGINE_CONTRACT_PROMPT = """\
+<unified_rca_engine_contract>
+## Unified RCA engine contract
+
+The optimizer is a closed-loop control system. Every proposed action must
+preserve this chain:
+
+judge feedback -> RCA -> lever -> patch -> gateable outcome
+
+Primary objective:
+- Reach 100% post-arbiter accuracy, or exhaust the configured lever-loop budget.
+- Hard failures are the first priority. Hard failures include arbiter verdicts
+  `ground_truth_correct` and `neither_correct`.
+- Soft signals may guide preventive improvements only when hard failures and
+  mandatory regression debt are not being starved.
+
+Mandatory causal fields:
+- Every action group must declare `primary_cluster_id`, `source_cluster_ids`,
+  and `affected_questions` using those exact JSON field names.
+- Every proposal must be explainable as: this judge signal produced this RCA,
+  this RCA maps to this lever, and this patch is expected to fix these target
+  questions.
+- If `regression_debt_qids` are present in context, they are mandatory priority
+  and must be targeted before optional soft improvements.
+
+Patch safety rules:
+- A patch type must match RCA defect. A filter defect needs a filter patch,
+  scoped instruction, or example SQL. Do not substitute a measure patch for a
+  missing or wrong filter.
+- A broad global instruction change is unsafe unless it is scoped to target
+  questions or backed by explicit counterfactual dependents.
+- Prefer narrow structured metadata, SQL expressions, join specs, or example SQL
+  over broad prose when the root cause is structural SQL behavior.
+- Preserve at least one causal patch per target question when proposing a bundle.
+
+Regression policy awareness:
+- Net post-arbiter gains can be accepted with bounded regression debt.
+- Do not hide or ignore newly regressed hard questions; surface them as
+  `regression_debt_qids`.
+- Protected or required benchmark regressions must be treated as unbounded
+  collateral risk.
+
+Leakage boundary:
+- Do not copy held-out benchmark expected SQL into Genie-visible examples.
+- Use failure evidence and generated SQL to understand behavior, but output
+  reusable guidance, scoped metadata, SQL expressions, or safe example patterns.
+
+Precedence:
+- If a downstream prompt provides a more specific lever map (for example a
+  strategist `## Contract: All Instruments of Power` section), that map is
+  authoritative for lever routing. This contract specifies the global control
+  invariants only.
+</unified_rca_engine_contract>
+"""
+
+
+LEAK_SAFE_EXAMPLE_SYNTHESIS_CONTRACT_PROMPT = """\
+<leak_safe_example_synthesis_contract>
+## Leak-safe example synthesis contract
+
+This prompt creates one reusable Genie-visible example question/SQL pair.
+
+Rules:
+- Return exactly one single JSON object matching the requested schema.
+- Do not copy held-out benchmark expected SQL into Genie-visible examples.
+- Use schema metadata and the supplied failure pattern to create a reusable
+  example; remove benchmark-specific literals, aliases, row limits, and wording.
+- Keep the generated SQL narrow to the requested tables, joins, filters, and
+  measures. Do not introduce broad global behavior.
+- Prefer one precise example over a generalized rule.
+</leak_safe_example_synthesis_contract>
+"""
+
+# ── Feature flag: allow operators to disable contract injection in
+# emergencies without a code change. Default is ON.
+_INCLUDE_UNIFIED_RCA_CONTRACT = (
+    os.getenv("GSO_INCLUDE_UNIFIED_RCA_CONTRACT", "true").strip().lower()
+    not in ("false", "0", "no", "off")
+)
+
+_RCA_CONTRACT_HEADER: str = (
+    UNIFIED_RCA_ENGINE_CONTRACT_PROMPT + "\n\n"
+    if _INCLUDE_UNIFIED_RCA_CONTRACT
+    else ""
+)
+
+_EXAMPLE_SYNTHESIS_CONTRACT_HEADER: str = (
+    LEAK_SAFE_EXAMPLE_SYNTHESIS_CONTRACT_PROMPT + "\n\n"
+    if _INCLUDE_UNIFIED_RCA_CONTRACT
+    else ""
+)
+
+
 # ── 5b. Proposal Generation Prompts ───────────────────────────────────
 
 PROPOSAL_GENERATION_PROMPT = (
@@ -606,6 +1618,7 @@ PROPOSAL_GENERATION_PROMPT = (
     'so that it generates correct SQL for user questions.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
     '## Failure Analysis\n'
     '- Root cause: {{ failure_type }}\n'
@@ -642,6 +1655,7 @@ LEVER_1_2_COLUMN_PROMPT = (
     'and column descriptions and synonyms so that Genie generates correct SQL.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
     '## Failure Analysis\n'
     '- Root cause: {{ failure_type }}\n'
@@ -939,9 +1953,11 @@ SPACE_DESCRIPTION_PROMPT = (
 PROACTIVE_INSTRUCTION_PROMPT = (
     '<role>\n'
     'You are a Databricks Genie Space configuration expert. Your job is to '
-    'write a concise set of routing instructions for a Genie Space that has '
-    'NO instructions yet. These instructions help Genie correctly route '
-    'user questions to the right tables and generate accurate SQL.\n'
+    'write the initial routing instructions for a Genie Space that has NO '
+    'instructions yet (or only empty / whitespace prose). These instructions '
+    'follow the canonical 5-section schema — they help Genie disambiguate '
+    'the user, understand data-quality caveats, respect hard constraints, '
+    'and render result summaries consistently.\n'
     '</role>\n'
     '\n'
     '<context>\n'
@@ -956,80 +1972,160 @@ PROACTIVE_INSTRUCTION_PROMPT = (
     '</context>\n'
     '\n'
     '<instructions>\n'
-    'Write plain-text instructions (500-3750 characters) using ALL-CAPS SECTION HEADERS with a colon.\n'
-    'Use these canonical sections (omit empty ones):\n'
+    'Write Markdown prose using exactly the five canonical `##` headers '
+    'below, in this order, omitting any section with nothing to say. '
+    'Keep total length under 2000 characters.\n'
     '\n'
-    'PURPOSE:\n'
-    '- What this space does and who it serves (1 paragraph)\n'
+    'Exact headers (case-insensitive for #1-#4; header #5 is VERBATIM, '
+    'including capitalization and wording):\n'
     '\n'
-    'ASSET ROUTING:\n'
-    '- Which table(s) to use for which topic/entity\n'
+    '## PURPOSE\n'
+    '- 1-2 bullets stating the space scope and audience.\n'
+    '- Infer from table / metric view descriptions and join specs.\n'
     '\n'
-    'TEMPORAL FILTERS:\n'
-    '- Default date filters, fiscal year logic, time-range rules\n'
+    '## DISAMBIGUATION\n'
+    '- Clarification-question triggers: "When the user asks about X '
+    'without specifying Y, ask them to clarify Y."\n'
+    '- Term-resolution rules: "\'Q1\' means calendar Q1 unless the user '
+    'says \'fiscal Q1\'."\n'
+    '- Source: columns with overlapping synonyms across tables; temporal '
+    'columns admitting multiple calendars.\n'
     '\n'
-    'DATA QUALITY NOTES:\n'
-    '- NULL handling, is_current flags, data caveats\n'
+    '## DATA QUALITY NOTES\n'
+    '- NULL handling, known bad rows, column semantics that are NOT in '
+    'the column description.\n'
+    '- Source: column descriptions mentioning NULL / unknown / effective '
+    '/ is_current; fields flagged as low-completeness.\n'
     '\n'
-    'JOIN GUIDANCE:\n'
-    '- Key join patterns if join specs exist\n'
+    '## CONSTRAINTS\n'
+    '- Hard guardrails: what NEVER to show (PII columns, secrets) and '
+    'what NOT to do (cross-join, ignore a required filter).\n'
+    '- Behavioural rules only — SQL-expressible filters MUST be stored '
+    'as sql_snippets, NOT in this section.\n'
     '\n'
-    'Rules:\n'
+    '## Instructions you must follow when providing summaries\n'
+    '- Summary customisation: rounding rules, mandatory caveats, date-'
+    'range statements.\n'
+    '- This header is Databricks\'s verbatim blessed string — do NOT '
+    'paraphrase, re-case, or shorten it.\n'
+    '\n'
+    'Non-regressive rules:\n'
     '- Be factual — infer ONLY from the schema provided.\n'
-    '- Do NOT invent business rules not evident in column names or descriptions.\n'
-    '- Use short, imperative sentences.\n'
-    '- Do NOT use Markdown formatting (no #, **, ```, etc.).\n'
-    '- Keep total output between 500 and 3750 characters.\n'
+    '- Do NOT invent business rules that are not evident in column names '
+    'or descriptions.\n'
+    '- Do NOT emit any SQL keyword or clause anywhere in the prose; '
+    'SQL belongs in sql_snippets / join_specs / example_question_sqls. '
+    'When describing rules in English, use verbs like "combine", "link", '
+    '"pair", "associate" instead of "join"; "given that" instead of '
+    '"where"; "after" instead of "order by".\n'
+    '- Do NOT emit any `##` header not in the five above.\n'
+    '- Do NOT use `###` subheaders — they belong to structured targets, '
+    'not prose.\n'
+    '- If a section has nothing to say, OMIT it rather than emitting a '
+    'placeholder.\n'
+    '- Use short, imperative bullets (`- …`) under each header.\n'
     '</instructions>\n'
     '\n'
     '<output_schema>\n'
-    'Respond with ONLY the instruction text — no JSON wrapper, no code fences.\n'
+    'Respond with ONLY the instruction text — no JSON wrapper, no code '
+    'fences, no preamble.\n'
     '</output_schema>'
 )
 
-INSTRUCTION_RESTRUCTURE_PROMPT = (
+# Used by the two-phase proactive seeding path: when a space already has
+# instructions but is missing one or more canonical sections, the expand
+# prompt fills in only the gaps without touching sections that already
+# exist. Output is strict JSON keyed by exact canonical headers so the
+# caller can merge without a re-parse of free-form prose.
+EXPAND_INSTRUCTION_PROMPT = (
     '<role>\n'
-    'You are a Databricks Genie Space instruction classifier. '
-    'Your job is to reorganize existing unstructured instructions into '
-    'canonical ALL-CAPS sections WITHOUT changing the content.\n'
+    'You are a Databricks Genie Space configuration expert. The space '
+    'already has instructions but is missing one or more of the five '
+    'canonical sections. Your job is to write ONLY the missing sections '
+    '— never rewrite or rephrase content that already exists.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
-    '## Existing Instructions (unstructured)\n'
+    '## Existing Instructions\n'
     '{{ existing_instructions }}\n'
     '\n'
-    '## Available Tables\n'
+    '## Tables\n'
     '{{ tables_context }}\n'
+    '\n'
+    '## Metric Views\n'
+    '{{ metric_views_context }}\n'
+    '\n'
+    '## Join Specifications\n'
+    '{{ join_specs_context }}\n'
+    '\n'
+    '## Missing Sections (generate each one if there is meaningful '
+    'content to add — otherwise omit)\n'
+    '{{ missing_sections }}\n'
     '</context>\n'
     '\n'
     '<instructions>\n'
-    'Classify each rule or sentence from the existing instructions into '
-    'exactly one of these canonical sections:\n'
+    'Generate content ONLY for the headers listed in "Missing Sections". '
+    'Never emit a header that is not in that list. Emit each header '
+    'VERBATIM as given (case-sensitive for header #5, case-insensitive '
+    'parser for the others — still, copy them as-shown).\n'
     '\n'
-    'PURPOSE:             What this Genie Space does and who it serves\n'
-    'ASSET ROUTING:       Which table/TVF/MV to use for which topic\n'
-    'BUSINESS DEFINITIONS: Term definitions — [term] = [column] from [table]\n'
-    'DISAMBIGUATION:      How to resolve ambiguous terms, hierarchies, synonyms\n'
-    'AGGREGATION RULES:   How to aggregate measures, grain rules, default filters\n'
-    'FUNCTION ROUTING:    When to use TVFs/UDFs vs raw tables\n'
-    'JOIN GUIDANCE:       Explicit join paths and conditions\n'
-    'QUERY RULES:         SQL-level rules — filters, ordering, limits, output formatting\n'
-    'QUERY PATTERNS:      Common multi-step query patterns\n'
-    'TEMPORAL FILTERS:    Date partitioning, time-range rules\n'
-    'DATA QUALITY NOTES:  Known nulls, data caveats\n'
-    'CONSTRAINTS:         Cross-cutting behavioral constraints\n'
+    'Per-section guidance:\n'
     '\n'
-    'Rules:\n'
-    '- PRESERVE every rule from the original — do NOT drop, summarize, or rephrase.\n'
-    '- Each rule goes into exactly one section. If unclear, use CONSTRAINTS.\n'
-    '- Output plain text with ALL-CAPS section headers followed by a colon.\n'
-    '- Use - for bullet points. Use blank lines between sections.\n'
-    '- Do NOT use Markdown syntax (no ##, no **, no backticks).\n'
-    '- Omit sections with no matching rules.\n'
+    '- `## PURPOSE` — 1-2 bullets on space scope and audience. If such '
+    'content is evident in the schema or existing prose, capture it; '
+    'otherwise OMIT.\n'
+    '- `## DISAMBIGUATION` — clarification-question triggers and '
+    'term-resolution rules. If such content is evident in the schema or '
+    'existing prose, capture it; otherwise OMIT.\n'
+    '- `## DATA QUALITY NOTES` — NULL handling, known bad rows, column '
+    'semantics not captured in descriptions. If such content is evident '
+    'in the schema or existing prose, capture it; otherwise OMIT.\n'
+    '- `## CONSTRAINTS` — hard guardrails (PII columns, forbidden '
+    'operations). If such content is evident in the schema or existing '
+    'prose, capture it; otherwise OMIT.\n'
+    '- `## Instructions you must follow when providing summaries` — '
+    'summary-rendering rules (rounding, mandatory caveats, date-range '
+    'statements). Copy the header letter-for-letter. If such content is '
+    'evident in the schema or existing prose, capture it; otherwise OMIT.\n'
+    '\n'
+    'Non-regressive rules (parity with proactive seeding — expand must '
+    'not invent what seed would have omitted):\n'
+    '- Be factual — infer ONLY from the schema + existing instructions.\n'
+    '- Do NOT invent business rules that are not evident in column names, '
+    'descriptions, or existing prose.\n'
+    '- If a requested section has nothing meaningful to add, OMIT its '
+    'key from the output JSON rather than emitting a placeholder.\n'
+    '\n'
+    '## Budget\n'
+    'The existing prose is {{ existing_length }} chars. You have '
+    '{{ remaining_budget }} chars remaining in the 2000-char cap for '
+    '{{ missing_count }} section(s) — aim for {{ per_section_budget }} '
+    'chars each. Going over will cause your output to be discarded.\n'
+    '\n'
+    'Strict output rules:\n'
+    '- Do NOT include any `##` header not listed in "Missing Sections".\n'
+    '- Do NOT emit any SQL keyword or clause anywhere in the prose; '
+    'SQL belongs in sql_snippets / join_specs / example_question_sqls. '
+    'When describing rules in English, use verbs like "combine", "link", '
+    '"pair", "associate" instead of "join"; "given that" instead of '
+    '"where"; "after" instead of "order by".\n'
+    '- Do NOT include code fences or `###` subheaders.\n'
+    '- Do NOT rewrite or duplicate existing content.\n'
     '</instructions>\n'
     '\n'
     '<output_schema>\n'
-    'Respond with ONLY the restructured instruction text — no JSON wrapper, no code fences.\n'
+    'Return strict JSON. Example:\n'
+    '{\n'
+    '  "sections": {\n'
+    '    "## PURPOSE": "- Analytics for the sales team covering H1 revenue.\\n",\n'
+    '    "## DATA QUALITY NOTES": "- The `status` column has mixed casing; '
+    'normalize before filtering.\\n"\n'
+    '  }\n'
+    '}\n'
+    '\n'
+    'Keys MUST be exact canonical headers. Values are plain text with '
+    'one bullet per line (each starting with `- `).\n'
     '</output_schema>'
 )
 
@@ -1082,6 +2178,7 @@ LEVER_4_JOIN_SPEC_PROMPT = (
     'You are a Databricks Genie Space join optimization expert.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
     '## SQL Diffs showing join issues\n'
     '{{ sql_diffs }}\n'
@@ -1161,6 +2258,7 @@ LEVER_4_JOIN_DISCOVERY_PROMPT = (
     'Your task is to identify MISSING join relationships between tables.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
     '## Full Schema Context (tables, columns, data types, descriptions)\n'
     '{{ full_schema_context }}\n'
@@ -1272,18 +2370,19 @@ INSTRUCTION_FORMAT_RULES = (
     'ASSET ROUTING:       When user asks about [topic], use [table/TVF/MV] (Lever 5)\n'
     'BUSINESS DEFINITIONS: [term] = [column] from [table] (Lever 1)\n'
     'DISAMBIGUATION:      When [ambiguous scenario], prefer [approach] (Lever 1)\n'
-    'AGGREGATION RULES:   How to aggregate measures, grain rules, avoid double-counting (Lever 2)\n'
+    'AGGREGATION RULES:   How to aggregate measures, grain rules, avoid double-counting (Lever 6 primary; Lever 2 may refine MV column descriptions)\n'
     'FUNCTION ROUTING:    When to use TVFs/UDFs vs raw tables, parameter guidance (Lever 3)\n'
     'JOIN GUIDANCE:       Explicit join paths and conditions (Lever 4)\n'
     'QUERY RULES:         SQL-level rules — filters, ordering, limits\n'
     'QUERY PATTERNS:      Common multi-step query patterns with actual column names\n'
-    'TEMPORAL FILTERS:    Date partitioning, SCD filters, time-range rules (Lever 2/4)\n'
+    'TEMPORAL FILTERS:    Date partitioning, SCD filters, time-range rules (Lever 6 primary; Lever 4 for join-side temporal rules)\n'
     'DATA QUALITY NOTES:  Known nulls, is_current flags, data caveats\n'
     'CONSTRAINTS:         Cross-cutting behavioral constraints, output formatting\n'
     '\n'
     'Lever-to-section alignment (target your contribution to these sections):\n'
     '  Lever 1 -> BUSINESS DEFINITIONS, DISAMBIGUATION\n'
-    '  Lever 2 -> AGGREGATION RULES, TEMPORAL FILTERS\n'
+    '  Lever 2 -> MV column descriptions and synonyms only (CANNOT add measures, filters, or change MV SQL)\n'
+    '  Lever 6 -> AGGREGATION RULES, TEMPORAL FILTERS\n'
     '  Lever 3 -> FUNCTION ROUTING\n'
     '  Lever 4 -> JOIN GUIDANCE, TEMPORAL FILTERS\n'
     '  Lever 5 -> ASSET ROUTING, QUERY RULES, QUERY PATTERNS, DATA QUALITY NOTES, CONSTRAINTS\n'
@@ -1301,6 +2400,7 @@ LEVER_5_INSTRUCTION_PROMPT = (
     'You are a Databricks Genie Space instruction expert.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
     '## SQL Diffs showing routing/disambiguation issues\n'
     '{{ sql_diffs }}\n'
@@ -1398,6 +2498,7 @@ LEVER_5_HOLISTIC_PROMPT = (
     'plus targeted example SQL queries.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<context>\n'
     '## Genie Space Purpose\n'
     '{{ space_description }}\n'
@@ -1524,6 +2625,7 @@ STRATEGIST_PROMPT = (
     'You are the Holistic Strategist for a Databricks Genie Space optimization framework.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<instructions>\n'
     '## Purpose\n'
     'Analyze ALL benchmark evaluation failures and produce a coordinated multi-lever '
@@ -1541,7 +2643,7 @@ STRATEGIST_PROMPT = (
     '## Contract: All Instruments of Power\n'
     'For each root cause, specify EVERY lever that should act:\n'
     '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5 + Lever 6\n'
-    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 2, also Lever 5 + Lever 6\n'
+    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 6 (sql_snippet), also Lever 5 (example_sql); Lever 2 only for MV-column synonym/description refinement\n'
     '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
     '- wrong_join / missing_join_spec: Primary Lever 4, also Lever 1 + 5\n'
     '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1 + Lever 6\n'
@@ -1625,7 +2727,7 @@ STRATEGIST_PROMPT = (
     '    {\n'
     '      "id": "AG<N>",\n'
     '      "root_cause_summary": "<one sentence>",\n'
-    '      "source_cluster_ids": ["C001"],\n'
+    '      "source_cluster_ids": ["H001"],\n'
     '      "affected_questions": ["<question_id>"],\n'
     '      "priority": 1,\n'
     '      "lever_directives": {\n'
@@ -1669,6 +2771,9 @@ STRATEGIST_PROMPT = (
     '  Only include sections you want to ADD or REPLACE. Omitted sections are PRESERVED unchanged.\n'
     '  Values are plain-text bullet lists (no Markdown). Empty string means delete the section.\n'
     '- priority 1 = most impactful. Order by affected question count.\n'
+    '- Cluster IDs use H### for hard-failure clusters and S### for soft-signal clusters. '
+    'Populate "source_cluster_ids" using the exact IDs from the provided cluster list. '
+    'Legacy C### ids (from old runs) will also be accepted.\n'
     '- If no actionable improvements:\n'
     '  {"action_groups": [], "global_instruction_rewrite": {}, "rationale": "No actionable failures"}\n'
     '</output_schema>'
@@ -1681,6 +2786,7 @@ STRATEGIST_TRIAGE_PROMPT = (
     'You are the Triage Strategist for a Databricks Genie Space optimization framework.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<instructions>\n'
     '## Purpose\n'
     'Analyze ALL failure clusters and produce action group SKELETONS. Each skeleton '
@@ -1700,6 +2806,9 @@ STRATEGIST_TRIAGE_PROMPT = (
     '## Lever Capabilities\n'
     '- Lever 1: Table/column descriptions, synonyms\n'
     '- Lever 2: Metric view column descriptions, synonyms\n'
+    '  NOTE: Lever 2 CANNOT add measures, filters, or change MV SQL. It can only update '
+    'table/column descriptions and synonyms on existing metric views. '
+    'For missing_filter / wrong_aggregation / wrong_measure, use Lever 6 (sql_snippet) instead.\n'
     '- Lever 3: Function descriptions and parameter documentation\n'
     '- Lever 4: Join specifications between tables\n'
     '- Lever 5: Instructions + example SQL queries\n'
@@ -1707,7 +2816,7 @@ STRATEGIST_TRIAGE_PROMPT = (
     '\n'
     '## Lever Mapping (All Instruments of Power)\n'
     '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5 + Lever 6\n'
-    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 2, also Lever 5 + Lever 6\n'
+    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 6 (sql_snippet), also Lever 5 (example_sql); Lever 2 only for MV-column synonym/description refinement\n'
     '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
     '- wrong_join / missing_join_spec: Primary Lever 4, also Lever 1 + 5\n'
     '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1 + Lever 6\n'
@@ -1754,8 +2863,8 @@ STRATEGIST_TRIAGE_PROMPT = (
     '<examples>\n'
     '<example>\n'
     'Input: Two failure clusters:\n'
-    '  C001: wrong_column on dim_product.product_name vs product_title (3 questions)\n'
-    '  C002: missing_join between fact_sales and dim_product (2 questions, overlapping with C001)\n'
+    '  H001: wrong_column on dim_product.product_name vs product_title (3 questions)\n'
+    '  H002: missing_join between fact_sales and dim_product (2 questions, overlapping with H001)\n'
     '\n'
     'Output:\n'
     '{\n'
@@ -1764,7 +2873,7 @@ STRATEGIST_TRIAGE_PROMPT = (
     '      "id": "AG1",\n'
     '      "root_cause_summary": "Genie selects product_title instead of product_name and '
     'misses the fact_sales→dim_product join because column synonyms and join spec are absent",\n'
-    '      "source_cluster_ids": ["C001", "C002"],\n'
+    '      "source_cluster_ids": ["H001", "H002"],\n'
     '      "affected_questions": ["Q3", "Q7", "Q12"],\n'
     '      "priority": 1,\n'
     '      "levers_needed": [1, 4, 5],\n'
@@ -1773,7 +2882,7 @@ STRATEGIST_TRIAGE_PROMPT = (
     '    }\n'
     '  ],\n'
     '  "global_instruction_guidance": "BUSINESS DEFINITIONS: product name disambiguation; JOIN GUIDANCE: fact_sales to dim_product join path",\n'
-    '  "rationale": "C001 and C002 both blame dim_product — merged into one AG. '
+    '  "rationale": "H001 and H002 both blame dim_product — merged into one AG. '
     'Lever 1 fixes the synonym, Lever 4 adds the join spec, Lever 5 adds an example SQL."\n'
     '}\n'
     '</example>\n'
@@ -1786,7 +2895,7 @@ STRATEGIST_TRIAGE_PROMPT = (
     '    {\n'
     '      "id": "AG<N>",\n'
     '      "root_cause_summary": "<one sentence>",\n'
-    '      "source_cluster_ids": ["C001", "C003"],\n'
+    '      "source_cluster_ids": ["H001", "H003"],\n'
     '      "affected_questions": ["<question_id>"],\n'
     '      "priority": 1,\n'
     '      "levers_needed": [1, 4, 5],\n'
@@ -1815,6 +2924,7 @@ STRATEGIST_DETAIL_PROMPT = (
     'You are the Detail Planner for a Databricks Genie Space optimization action group.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<instructions>\n'
     '## Purpose\n'
     'Given an action group skeleton and detailed evidence (SQL diffs, current metadata), '
@@ -1859,7 +2969,8 @@ STRATEGIST_DETAIL_PROMPT = (
     'No Markdown (no ##, no **, no backticks). Plain text only.\n'
     'Target sections aligned with your active levers:\n'
     '  Lever 1 -> BUSINESS DEFINITIONS, DISAMBIGUATION\n'
-    '  Lever 2 -> AGGREGATION RULES, TEMPORAL FILTERS\n'
+    '  Lever 2 -> MV column descriptions and synonyms only (CANNOT add measures, filters, or change MV SQL)\n'
+    '  Lever 6 -> AGGREGATION RULES, TEMPORAL FILTERS\n'
     '  Lever 3 -> FUNCTION ROUTING\n'
     '  Lever 4 -> JOIN GUIDANCE, TEMPORAL FILTERS\n'
     '  Lever 5 -> ASSET ROUTING, QUERY RULES, QUERY PATTERNS, DATA QUALITY NOTES, CONSTRAINTS\n'
@@ -2059,6 +3170,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     'fresh evaluation results and must decide the SINGLE best next action.\n'
     '</role>\n'
     '\n'
+    + _RCA_CONTRACT_HEADER +
     '<instructions>\n'
     '## Purpose\n'
     'Analyze the CURRENT failure clusters (from the most recent evaluation) and '
@@ -2091,7 +3203,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '## Contract: All Instruments of Power\n'
     'For the root cause you target, specify EVERY lever that should act:\n'
     '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5 + Lever 6\n'
-    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 2, also Lever 5 + Lever 6\n'
+    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 6 (sql_snippet), also Lever 5 (example_sql); Lever 2 only for MV-column synonym/description refinement\n'
     '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
     '- wrong_join / missing_join_spec / wrong_join_spec: Primary Lever 4, also Lever 1 + 5\n'
     '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1 + Lever 6\n'
@@ -2104,12 +3216,14 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Contract: Compound-Concept Queries\n'
     'When a question requires resolving MULTIPLE business concepts simultaneously '
-    '(e.g. "Canada 7Now delivery PSD sales by zone" = country filter + channel filter '
-    '+ metric + grouping dimension), apply a multi-lever approach:\n'
+    '(for example: "North-America wholesale revenue by region" = country filter + '
+    'channel filter + metric + grouping dimension; OR: "EMEA premium-tier claim '
+    'count by line-of-business" = region filter + tier filter + metric + grouping '
+    'dimension), apply a multi-lever approach:\n'
     '1. Lever 6: Add SQL expressions for each atomic concept — a filter for the '
-    'country, a filter for the channel, a measure for the metric.\n'
+    'country/region, a filter for the channel/tier, a measure for the metric.\n'
     '2. Lever 2: Ensure column descriptions include concept-to-column mappings '
-    '(e.g. "Canada = country_code=CA", "PSD sales = psd_sales column").\n'
+    '(e.g. "North America = region_code=NA", "wholesale = channel column = WH").\n'
     '3. Lever 5: Add an example SQL that demonstrates the FULL filter chain for '
     'this type of compound query.\n'
     'NEVER leave a compound-concept failure with just an instruction rewrite — '
@@ -2118,7 +3232,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Contract: Instruction-Defined Default Filters\n'
     'If the Genie Space instructions define a default filter (e.g. "always filter by '
-    'same_store_7now = Y unless explicitly requested otherwise"), that filter is '
+    '<flag_column> = <value> unless explicitly requested otherwise"), that filter is '
     'CORRECT BEHAVIOR. Do NOT blame it as "over-filtering" in root cause analysis. '
     'Only flag the filter as a problem if the user explicitly asked to exclude it.\n'
     '\n'
@@ -2205,7 +3319,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '    {\n'
     '      "id": "AG<iteration_number>",\n'
     '      "root_cause_summary": "<one sentence>",\n'
-    '      "source_cluster_ids": ["C001"],\n'
+    '      "source_cluster_ids": ["H001"],\n'
     '      "affected_questions": ["<question_id>"],\n'
     '      "priority": 1,\n'
     '      "lever_directives": {\n'
@@ -2246,6 +3360,9 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     'Rules:\n'
     '- EXACTLY one action group. Pick the single highest-impact fix.\n'
+    '- Cluster IDs use H### for hard-failure clusters and S### for soft-signal clusters. '
+    'Populate "source_cluster_ids" using the exact IDs from the provided cluster list. '
+    'Legacy C### ids are accepted during replay of old iterations.\n'
     '- "lever_directives" keys "1"-"6". Only include levers with work to do.\n'
     '- "sections" keys from structured metadata schema.\n'
     '- Lever 2 uses same column format as Lever 1. Lever 3: {"functions": [...]}.\n'
@@ -2305,6 +3422,45 @@ NON_EXPORTABLE_FIELDS = {
     "space_status",
 }
 
+# ── 6a. Internal runtime annotations on the config/metadata_snapshot dict ──
+#
+# The pipeline stores runtime-only state (data profiles, failure clusters,
+# cluster synthesis budgets, RLS audit, etc.) on the config dict with a
+# leading underscore. These must be stripped before PATCH and must NOT be
+# rejected by strict validation — they never leave the process.
+#
+# Known annotation keys are documented here for discoverability; the
+# underscore-prefix convention is the hard contract and `is_runtime_key`
+# is the single authority both the validator (`genie_schema.py`) and the
+# stripper (`genie_client.py`) must defer to.
+
+INTERNAL_RUNTIME_KEYS_PREFIX = "_"
+
+KNOWN_INTERNAL_RUNTIME_KEYS = frozenset({
+    "_data_profile",
+    "_failure_clusters",
+    "_cluster_synthesis_count",
+    "_rls_audit",
+    "_space_id",
+    "_join_overlaps",
+    "_join_attempts",
+    "_original_instruction_sections",
+})
+
+
+def is_runtime_key(k: object) -> bool:
+    """Return True when ``k`` is a runtime-only top-level annotation.
+
+    Runtime-only keys live on the in-memory config/metadata_snapshot but
+    must never reach the Genie API. The single contract: a leading
+    ``INTERNAL_RUNTIME_KEYS_PREFIX``. Used by both
+    ``common.genie_client.strip_non_exportable_fields`` and
+    ``common.genie_schema._strict_validate`` so the two paths cannot
+    drift (which is exactly what caused ``_data_profile`` to land
+    correctly through the stripper but error out at the validator).
+    """
+    return isinstance(k, str) and k.startswith(INTERNAL_RUNTIME_KEYS_PREFIX)
+
 # ── 7. Feature Flags ──────────────────────────────────────────────────
 
 USE_PATCH_DSL = True
@@ -2329,6 +3485,9 @@ LOW_RISK_PATCHES = {
     "hide_column",
     "unhide_column",
     "add_instruction",
+    # v2 Task 12: conditional disambiguation rule renders as an
+    # add_instruction-style append; classify with the same risk level.
+    "add_conditional_disambiguation_instruction",
     "enable_example_values",
     "disable_example_values",
     "enable_value_dictionary",
@@ -2339,6 +3498,7 @@ LOW_RISK_PATCHES = {
 
 MEDIUM_RISK_PATCHES = {
     "update_instruction",
+    "update_instruction_section",
     "rewrite_instruction",
     "remove_instruction",
     "rename_column_alias",
@@ -2414,6 +3574,36 @@ shown in the UI as a toggleable option.
 DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5, 6]
 """Default set of user-selectable levers, in execution order."""
 
+
+SCAN_CHECK_TO_LEVERS: dict[int, list[int]] = {
+    # Check 2 (Table descriptions) / Check 3 (Column descriptions) → lever 1
+    #   (Tables & Columns) — adds/fills descriptions and synonyms.
+    2: [1],
+    3: [1],
+    # Check 4 (Text instructions) → lever 5 (Genie Space Instructions).
+    4: [5],
+    # Check 5 (Join specifications) → lever 4 (Join Specifications).
+    5: [4],
+    # Check 7 (8+ example SQLs) / Check 8 (SQL snippets) → lever 6 (SQL Expressions)
+    #   which covers example SQLs, filters, measures, and expressions.
+    7: [6],
+    8: [6],
+    # Check 9 (Entity / format matching) → lever 1 (Tables & Columns) which
+    #   owns column_configs including enable_entity_matching / format_assistance.
+    9: [1],
+}
+"""IQ Scan check ID → recommended optimizer levers.
+
+1-indexed check IDs match the 12-check order in
+:func:`genie_space_optimizer.iq_scan.scoring.calculate_score`. Checks that
+can't be fixed by the optimizer (1 - data sources exist; 6 - data source
+count; 10 - benchmarks; 11 / 12 - optimization outcomes) are intentionally
+absent.
+
+Consumed by :func:`preflight_run_iq_scan` to translate failing checks into a
+``recommended_levers`` hint for the strategist and cluster-ranking tiebreaker.
+"""
+
 MAX_VALUE_DICTIONARY_COLUMNS = 120
 """Maximum number of string columns per Genie Space that can have
 enable_entity_matching=true. Enforced by auto_apply_prompt_matching()."""
@@ -2435,6 +3625,105 @@ FREE_TEXT_COLUMN_PATTERNS = [
     "narrative", "reason", "explanation",
 ]
 
+# ── 11b. Entity-matching slot allocation (intelligent scoring) ──────────
+# Consumed by ``_entity_matching_score`` + ``auto_apply_prompt_matching``
+# in ``optimization/applier.py``. The scorer returns 0 for any hard
+# disqualifier below; the caller FILTERS score<=0 candidates out of the
+# selection pool rather than sorting-and-taking-top-N. This prevents the
+# silent PII leak that happens today on spaces with <120 STRING columns
+# where every STRING column gets auto-enabled regardless of fit.
+
+MAX_ENTITY_MATCHING_CARDINALITY = 1024
+"""Genie silently drops value dictionaries for columns whose distinct value
+count exceeds this threshold (see docs.databricks.com knowledge-store
+docs). Slot activation on such columns is a no-op that wastes one of the
+120 slots."""
+
+MIN_ENTITY_MATCHING_CARDINALITY = 2
+"""Reject constant columns (cardinality <= 1). Zero benefit from entity
+matching on a column whose only value is 'ACTIVE' or NULL."""
+
+FREE_TEXT_DISTINCT_RATIO = 0.8
+"""Reject columns whose distinct_count / row_count exceeds this threshold —
+near-unique-per-row columns are IDs or free-form text, neither of which
+benefits from value dictionary lookup."""
+
+PII_COLUMN_PATTERNS = [
+    "email", "ssn", "social_security", "phone", "address_line",
+    "dob", "date_of_birth", "tax_id", "credit_card", "passport",
+    "driver_license", "account_number", "bank_account",
+]
+"""Column name substrings that indicate PII. Hard-rejected from entity
+matching because the value dictionary is stored in the workspace storage
+bucket and would leak sensitive values to the space's shared context."""
+
+BOOLEAN_FLAG_PATTERNS = [
+    "_flag", "_yn", "_bool", "is_", "has_", "can_", "should_",
+]
+"""Column name substrings that indicate boolean / 2-value flags. Zero
+benefit from entity matching."""
+
+DESCRIPTION_HINTS_POSITIVE = frozenset({
+    "enum", "category", "lookup", "one of", "valid values",
+})
+"""Description keywords that boost the entity-matching score — explicit
+markers of bounded-value columns."""
+
+DESCRIPTION_HINTS_NEGATIVE = frozenset({
+    "internal", "etl", "audit", "deprecated", "do not use",
+})
+"""Description keywords that penalize the entity-matching score — low
+user-intent signal."""
+
+DYNAMIC_VIEW_FN_RE = re.compile(
+    r"\b(current_user|session_user|is_account_group_member|is_member)\s*\(",
+    re.IGNORECASE,
+)
+"""Identity functions used by dynamic views. Per Databricks docs,
+entity matching on dynamic views is silently no-op'd — treat any view
+whose DDL matches this regex as RLS-tainted."""
+
+ENABLE_SMARTER_SCORING = (
+    os.getenv("GSO_SMARTER_SCORING", "true").lower() in ("1", "true", "yes")
+)
+"""Gate for the intelligent scorer + idempotent diff allocator. When
+False, falls back to the legacy 0/1/2 scorer + enable-only sort-and-take
+shim (today's pre-idempotent behaviour, including the silent PII leak on
+spaces with <120 STRING columns). Default: True. Override via env var
+``GSO_SMARTER_SCORING=false``. The legacy shim will be deleted in a
+follow-up release; use the flag to pin today's behaviour if the new
+allocator surfaces any regressions on your corpus."""
+
+DRY_RUN_ENTITY_MATCHING = (
+    os.getenv("GSO_DRY_RUN_ENTITY_MATCHING", "false").lower() in ("1", "true", "yes")
+)
+
+# S8 — Vacuous-filter rejection in ``validate_sql_snippet``.
+# Lever 6 occasionally proposes filter snippets whose semantics are
+# ``1 = 1`` / ``TRUE`` / ``col = col`` (tautological — select all rows).
+# The validator used to accept them (EXPLAIN passes, LIMIT 1 returns a
+# row), so they deployed and silently did nothing, wasting a lever
+# iteration. The gate runs a cheap syntactic pre-check plus a
+# selectivity post-check (``COUNT(*) total`` vs
+# ``COUNT(*) WHERE <filter>``). Default: on. Flip the env var off if a
+# true-positive filter is ever miscategorised.
+REJECT_VACUOUS_FILTERS = (
+    os.getenv("GSO_REJECT_VACUOUS_FILTERS", "true").lower() in ("1", "true", "yes", "on")
+)
+"""When True, log the proposed enable/disable diff without PATCHing the
+space. Used for initial rollout / audit. Covers the full enable+disable
+diff produced by the idempotent allocator (not just reclaim).
+Override via env var ``GSO_DRY_RUN_ENTITY_MATCHING=true``."""
+
+STRICT_RLS_MODE = (
+    os.getenv("GSO_STRICT_RLS", "false").lower() in ("1", "true", "yes")
+)
+"""When True, RLS verdict 'unknown' is treated as 'tainted' (refuse to
+enable entity matching). Default: False — unknown verdicts are treated
+as clean + warned, aligning with preflight's warn-and-proceed philosophy
+since ``information_schema.row_filters`` availability is inconsistent
+across DBR versions and workspace configurations."""
+
 NUMERIC_DATA_TYPES = {
     "DOUBLE", "FLOAT", "DECIMAL", "INT", "INTEGER", "BIGINT",
     "SMALLINT", "TINYINT", "LONG", "SHORT", "BYTE", "NUMBER",
@@ -2454,6 +3743,13 @@ TABLE_PATCHES = "genie_opt_patches"
 TABLE_ASI = "genie_eval_asi_results"
 TABLE_PROVENANCE = "genie_opt_provenance"
 TABLE_SUGGESTIONS = "genie_opt_suggestions"
+TABLE_FINALIZE_ATTESTATION = "genie_opt_finalize_attestation_matrix"
+"""Bug #4 Phase 4 — per-qid pass/fail matrix for baseline and finalize
+sweeps. One row per (run_id, qid, iteration_idx)."""
+TABLE_SCAN_SNAPSHOTS = "genie_opt_scan_snapshots"
+"""IQ Scan snapshots captured at preflight and postflight phases of an
+optimization run. One row per (run_id, phase). See
+``genie_space_optimizer.optimization.scan_snapshots``."""
 
 # ── 13. MLflow Conventions ─────────────────────────────────────────────
 
@@ -2484,9 +3780,11 @@ MAX_INSTRUCTION_TEXT_CHARS = 2000
 MAX_HOLISTIC_INSTRUCTION_CHARS = 8000
 
 PROMPT_TOKEN_BUDGET = 70_000
-"""Token budget for LLM prompts.  Claude Opus 4.6 supports 200k tokens;
-we target ~70k to stay in the quality sweet-spot while leaving headroom
-for the response."""
+"""Token budget for LLM prompts.
+
+The default endpoint supports large contexts; keep prompts around 70k tokens to
+leave response headroom and remain inside the quality sweet spot.
+"""
 
 RISK_LEVEL_SCORE = {
     "low": 1,
@@ -2718,6 +4016,12 @@ PATCH_TYPES = {
     },
     "rewrite_instruction": {
         "type": "rewrite_instruction",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["instructions"],
+    },
+    "update_instruction_section": {
+        "type": "update_instruction_section",
         "scope": "genie_config",
         "risk_level": "medium",
         "affects": ["instructions"],
@@ -3197,7 +4501,14 @@ LEVER_PROMPTS: dict[str, str] = {
     "description_enrichment": DESCRIPTION_ENRICHMENT_PROMPT,
     "table_description_enrichment": TABLE_DESCRIPTION_ENRICHMENT_PROMPT,
     "proactive_instruction": PROACTIVE_INSTRUCTION_PROMPT,
-    "instruction_restructure": INSTRUCTION_RESTRUCTURE_PROMPT,
+    "expand_instruction": EXPAND_INSTRUCTION_PROMPT,
+    # "instruction_restructure" was removed in the 5-section schema
+    # migration (see common/config.py CANONICAL_SECTION_HEADERS and the
+    # prose rule miner). Its reorganize-without-promote semantics are
+    # subsumed by the miner's canonical-grouping rewrite step.
+    # ``prose_rule_mining`` (and its deprecated alias
+    # ``instruction_to_sql_expression``) are registered below, after
+    # ``PROSE_RULE_MINING_PROMPT`` is defined — keep the ordering.
     "space_description": SPACE_DESCRIPTION_PROMPT,
     "sample_questions": SAMPLE_QUESTIONS_PROMPT,
     "gt_repair": GT_REPAIR_PROMPT,
@@ -3211,7 +4522,46 @@ BENCHMARK_PROMPTS: dict[str, str] = {
     "benchmark_alignment_check": BENCHMARK_ALIGNMENT_CHECK_PROMPT,
     "benchmark_coverage_gap": BENCHMARK_COVERAGE_GAP_PROMPT,
     "curated_sql_generation": CURATED_SQL_GENERATION_PROMPT,
+    # Phase 4.R4b — example-SQL variants. Registered alongside
+    # benchmark prompts so MLflow tracing + the registry-key lookup in
+    # ``get_registered_prompt_name`` find them by the same pathway.
+    "example_sql_generation": EXAMPLE_SQL_GENERATION_PROMPT,
+    "example_sql_correction": EXAMPLE_SQL_CORRECTION_PROMPT,
 }
+
+
+# ── 20d. Phase 2.R2b — Prompt isolation assertion ──────────────────────
+#
+# Isolation invariant #2 of the unified example-SQL generator: the
+# example prompts must NOT reference any benchmark-derived template
+# variable. A mis-edit to either template that accidentally pipes
+# benchmark text into the generator's prompt is caught at import time
+# rather than at runtime. See docs/example-sql-isolation.md.
+
+_BENCHMARK_DERIVED_VARS: frozenset[str] = frozenset({
+    "benchmarks",
+    "benchmark_list",
+    "existing_benchmarks",
+    "benchmark_questions",
+    "benchmark_sqls",
+    "expected_sqls",
+    "eval_questions",
+    "benchmark_corpus",
+})
+
+for _fwd_var in _BENCHMARK_DERIVED_VARS:
+    _forbidden_token = "{{ " + _fwd_var + " }}"
+    assert _forbidden_token not in EXAMPLE_SQL_GENERATION_PROMPT, (
+        f"Isolation invariant violated: EXAMPLE_SQL_GENERATION_PROMPT "
+        f"references benchmark-derived template variable '{_fwd_var}'. "
+        "See docs/example-sql-isolation.md."
+    )
+    assert _forbidden_token not in EXAMPLE_SQL_CORRECTION_PROMPT, (
+        f"Isolation invariant violated: EXAMPLE_SQL_CORRECTION_PROMPT "
+        f"references benchmark-derived template variable '{_fwd_var}'."
+    )
+
+del _fwd_var, _forbidden_token
 
 # ── 21. ASI Schema (12 fields) ─────────────────────────────────────────
 
@@ -3250,6 +4600,17 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("tvf_parameter_error", 3): "add_tvf_parameter",
     ("repeatability_issue", 3): "add_tvf_parameter",
     ("asset_routing_error", 3): "add_example_sql",
+    # S3 hardening: ASI blame-set rescue surfaces a missing asset (table,
+    # MV, or TVF). Lever 3 owns routing / example SQL so the patch is an
+    # ``add_example_sql`` that demonstrates the missing asset. Level 1 can
+    # also refresh descriptions if the asset does exist but is undersold.
+    ("missing_data_asset", 3): "add_example_sql",
+    ("missing_data_asset", 1): "update_description",
+    # S3 hardening: empty generated SQL is most plausibly a prompt /
+    # instruction gap (the model refused to emit any SQL). Route the
+    # default patch type to Lever 5 (instructions / example SQLs).
+    ("missing_sql_generation", 5): "add_example_sql",
+    ("missing_sql_generation", 1): "update_description",
     # Lever 4: Join Specifications
     ("wrong_join", 4): "update_join_spec",
     ("missing_join_spec", 4): "add_join_spec",
@@ -3284,7 +4645,7 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
 
 # ── 23. Lever 6 SQL Expression Prompt ──────────────────────────────────
 
-LEVER_6_SQL_EXPRESSION_PROMPT = """You are an expert at defining SQL Expressions for Databricks Genie Spaces.
+_LEVER_6_SQL_EXPRESSION_BODY = """You are an expert at defining SQL Expressions for Databricks Genie Spaces.
 
 ## Context
 
@@ -3344,81 +4705,262 @@ NOT bare `revenue`). The Genie API rejects bare column names.
 - Do NOT wrap in SELECT or WHERE — provide the raw expression only.
 - Do NOT duplicate an existing SQL Expression.
 - Prefer concise, reusable definitions over question-specific hacks.
+
+Naming policy (REQUIRED — be specific, never generic):
+- ``display_name`` MUST be specific enough to disambiguate the table or \
+business domain inside this space. If two fact tables or metric views \
+in the schema could plausibly share a concept, the name MUST encode \
+which one it applies to.
+- When the SQL references a domain-specific table such as \
+``mv_<domain>_fact_<entity>`` or ``mv_<domain>_dim_<entity>`` (for \
+example ``mv_orders_fact_lines`` or ``mv_claims_dim_date``), include \
+the compact qualifier (``ORDERS``, ``CLAIMS``, …) at the start of \
+``display_name`` — e.g. ``ORDERS Month-to-Date Filter``, NOT \
+``Month-to-Date Filter``.
+- ``instruction`` MUST state when to use the expression and which \
+table or domain it applies to.
+- Avoid generic names like ``Month-to-Date Filter``, ``Total Revenue``, \
+or ``Active Filter`` when more than one fact table or metric view in \
+the schema could host that concept.
 """
 
-# ── 24. Instruction-to-SQL-Expression Conversion ──────────────────────
+LEVER_6_SQL_EXPRESSION_PROMPT = _RCA_CONTRACT_HEADER + _LEVER_6_SQL_EXPRESSION_BODY
 
-INSTRUCTION_TO_SQL_EXPRESSION_PROMPT = """\
+# ── 24. Prose Rule Mining (multi-target; prose → structured) ──────────
+#
+# Replaces the earlier INSTRUCTION_TO_SQL_EXPRESSION_PROMPT. A single LLM
+# pass classifies each rule in the space's prose as one of six targets;
+# each target has its own validator and applier downstream. The prompt
+# intentionally reads any vocabulary (legacy ALL-CAPS or new canonical
+# ``##`` headers) so it can migrate pre-PR-#178 spaces on first run.
+#
+# The ``source_span`` field is REQUIRED — the rewrite step uses exact
+# substring removal to strip promoted content from prose, so the LLM
+# must return spans that match the input byte-for-byte.
+
+_PROSE_RULE_MINING_BODY = """\
 <role>
-You are a Databricks SQL expert extracting reusable SQL expressions from \
-Genie Space instructions.
+You are a Databricks Genie Space configuration expert. You are given the \
+full text_instructions of a Genie Space and the space's schema. Your job \
+is to promote every rule that belongs in structured config out of the \
+prose, and to keep only the rules that truly belong in text_instructions.
 </role>
 
 <context>
-## Genie Space Instructions
+## Genie Space Instructions (verbatim)
 {{ instructions_text }}
 
 ## Table Schema
 {{ schema_context }}
 
-## Existing SQL Expressions (do NOT duplicate)
+## Existing Structured Config
+### Existing SQL Expressions (do NOT duplicate)
 {{ existing_expressions }}
+
+### Existing Join Specs (do NOT duplicate)
+{{ existing_join_specs }}
+
+### Existing Example Question SQLs (do NOT duplicate)
+{{ existing_example_sqls }}
 </context>
 
 <instructions>
-Extract business rules from the instructions above that can be expressed as \
-reusable SQL snippets.  Focus on:
+Read the instructions top-to-bottom. Split compound bullets (e.g. "join \
+X to Y on Z and filter by status = 'active'") into one candidate per \
+rule. For each candidate, choose exactly one ``target`` from the list \
+below, produce a ``source_span`` that is an EXACT substring of the input \
+(byte-for-byte; the rewrite step removes this substring from prose), \
+and a ``confidence`` in [0.0, 1.0].
 
-1. **Default filters**: Rules like "always filter by X = Y", "default to ...", \
-"exclude ... unless explicitly requested".  These become snippet_type="filter".
-2. **Business KPI definitions**: "PSD sales means ...", "average transaction \
-size = ...".  These become snippet_type="measure".
-3. **Derived attributes**: "growth % = (CY - PY) / PY * 100", "day vs MTD".  \
-These become snippet_type="expression".
+## Target routing
 
-Rules:
-- ALL column references MUST use table_name.column_name syntax \
-(e.g. `mv_7now_fact_sales.same_store_7now = 'Y'`, NOT bare `same_store_7now = 'Y'`). \
-The Genie API rejects bare column names. Use the Table Schema to determine the correct table prefix.
-- SQL must reference ONLY columns that exist in the Table Schema.
-- For filters: SQL must be a valid boolean expression.
-- For measures: SQL must be a valid aggregation (e.g. `SUM(mv_sales.cy_sales) - SUM(mv_sales.py_sales)`).
-- For expressions: SQL must produce a scalar per row.
+Use this table (mirrors docs/gsl-instruction-schema.md — "What does NOT \
+go in text_instructions"):
+
+| Content shape                                            | target             |
+|----------------------------------------------------------|--------------------|
+| Aggregation formula (SUM, AVG, ...)                      | sql_snippet (measure)    |
+| Reusable WHERE / filter clause                           | sql_snippet (filter)     |
+| Computed / derived column                                | sql_snippet (expression) |
+| Table relationship / join path                           | join_spec          |
+| Full question → SQL pattern                              | example_qsql       |
+| "For X questions use table T" / asset routing            | table_desc         |
+| "Term 'revenue' means column net_rev_amt"                | column_synonym     |
+| Disambiguation / data-quality / PII / summary rendering  | keep_in_prose      |
+| "Do not / Never join X to Y" — negative join constraint  | keep_in_prose (## CONSTRAINTS) |
+
+## Per-target rules
+
+### sql_snippet
+- ALL column references MUST use ``catalog.schema.table.column`` syntax. \
+Bare columns are rejected by the Genie serving path.
 - Do NOT wrap in SELECT or WHERE — raw expression only.
-- Do NOT duplicate any Existing SQL Expression.
-- is_default=true means the instruction says to apply this filter BY DEFAULT (Genie SHOULD \
-include it automatically). Do NOT invert the logic — if the instruction says "Default filter: \
-X = Y for all Z queries", then is_default=true and the SQL is `table.X = 'Y'`.
-- Set omit_when to describe when the filter should NOT be applied \
-(e.g. "user explicitly asks for all stores including non-same-store").
+- ``is_default=true`` means the rule says "apply by default"; \
+``omit_when`` describes when the filter should NOT be applied.
+- Drop anything the Existing SQL Expressions list already covers.
+- ``display_name`` MUST be specific enough to disambiguate the source \
+table or business domain inside this space. When the SQL references a \
+domain-specific table such as ``mv_<domain>_fact_<entity>`` or \
+``mv_<domain>_dim_<entity>`` (for example ``mv_orders_fact_lines`` or \
+``mv_claims_dim_date``), prefix ``display_name`` with the compact \
+qualifier (e.g. ``ORDERS Month-to-Date Filter``, \
+``CLAIMS Total Premium Amount``). Avoid generic names like \
+``Month-to-Date Filter`` when multiple fact tables or metric views in \
+this space could plausibly share that concept.
+- ``description`` MUST mention when to use the snippet AND which \
+table or domain it applies to.
+
+### join_spec
+- Both ``left`` and ``right`` carry a fully-qualified ``identifier`` and \
+an ``alias`` (the unqualified table name). \
+- ``sql`` is a two-element array: ``[join_condition, relationship_tag]`` \
+e.g. ``["`fact_sales`.`region_id` = `dim_region`.`region_id`", \
+"--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"]``.
+- Use backtick-quoted aliases in the join condition.
+
+### example_qsql
+- Concrete ``question`` (not a placeholder) paired with a validated SQL \
+statement that uses fully-qualified table names.
+- Add ``usage_guidance`` telling Genie when this pattern applies.
+
+### table_desc
+- Use when a rule pins a topic or question kind to a specific table, e.g. \
+"For sessions, use fact_sessions, not raw_events".
+- ``description_append`` contains the sentence to append to the table's \
+existing description.
+
+### column_synonym
+- Use when a rule pins a business term to a specific column, e.g. \
+"revenue / sales / net sales = net_revenue_amt".
+- ``synonyms`` is the list of aliases the column answers to.
+
+### keep_in_prose
+- Use ONLY when the rule cannot be expressed as SQL or metadata: \
+clarification triggers, NULL handling, PII guardrails, summary-rendering \
+rules.
+- ``section`` MUST be one of the five canonical headers: \
+``## PURPOSE``, ``## DISAMBIGUATION``, ``## DATA QUALITY NOTES``, \
+``## CONSTRAINTS``, ``## Instructions you must follow when providing summaries``.
+- CONSTRAINTS that are SQL-expressible filters MUST be returned as \
+``sql_snippet`` (with ``is_default=true`` and ``snippet_type=filter``), \
+NOT as ``keep_in_prose``.
+- ``source_span`` that contains SQL keywords (SELECT, WHERE, JOIN, \
+GROUP BY, ORDER BY, HAVING) MUST be returned as ``sql_snippet`` or \
+``example_qsql`` — the scanner rejects SQL-in-prose.
+- NEGATIVE JOIN CONSTRAINTS ("Do not / Never join X to Y") are a \
+cross-cutting BEHAVIOURAL rule and belong in prose, NOT in \
+``join_spec`` (which represents joins the model MAY use). Return them \
+as ``target="keep_in_prose"`` with ``payload.section="## CONSTRAINTS"``. \
+The structure-aware scanner allows English imperatives like "Do not \
+join" to sit in prose without triggering the SQL-in-text finding.
+
+## Confidence
+
+- 0.9-1.0 — the rule maps unambiguously onto the target and the payload \
+is fully inferable from the prose + schema.
+- 0.7-0.9 — minor inference required (e.g. picking between two plausible \
+tables).
+- < 0.7 — speculative; the dispatcher will drop these.
+
+Return ``[]`` if nothing is promotable.
 </instructions>
 
 <output_schema>
-Return a JSON array. Each element:
-{{"snippet_type": "measure"|"filter"|"expression", \
-"sql": "...", \
-"display_name": "...", \
-"description": "One sentence on what this computes/filters", \
-"synonyms": ["term1", "term2"], \
-"alias": "snake_case_identifier", \
-"is_default": true|false, \
-"omit_when": "..." or null}}
+Respond with a single JSON array. Each element:
+{{
+  "target": "sql_snippet"|"join_spec"|"example_qsql"|"table_desc"|"column_synonym"|"keep_in_prose",
+  "source_span": "<EXACT substring of the input instructions>",
+  "confidence": 0.0-1.0,
+  "payload": {{
+    // sql_snippet:
+    "snippet_type": "measure"|"filter"|"expression",
+    "sql": "...",
+    "display_name": "...",
+    "description": "One sentence on what this computes/filters",
+    "synonyms": ["term1", "term2"],
+    "alias": "snake_case_identifier",
+    "is_default": true|false,
+    "omit_when": "..." or null,
+    // join_spec:
+    "left":  {{"identifier": "catalog.schema.t1", "alias": "t1"}},
+    "right": {{"identifier": "catalog.schema.t2", "alias": "t2"}},
+    "sql":   ["`t1`.`k` = `t2`.`k`", "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"],
+    "instruction": "when and how to use this join",
+    // example_qsql:
+    "question": "natural-language question",
+    "sql": "SELECT ... FROM catalog.schema.t ...",
+    "usage_guidance": "when this pattern applies",
+    // table_desc:
+    "table_identifier": "catalog.schema.t",
+    "description_append": "sentence to append",
+    // column_synonym:
+    "table_identifier": "catalog.schema.t",
+    "column_name": "net_revenue_amt",
+    "synonyms": ["revenue", "sales", "net sales"],
+    // keep_in_prose:
+    "section": "## PURPOSE" | "## DISAMBIGUATION" | "## DATA QUALITY NOTES" | "## CONSTRAINTS" | "## Instructions you must follow when providing summaries"
+  }}
+}}
 
-Return [] if no extractable business rules are found.
+Respond with a single JSON array and nothing else.
 </output_schema>"""
 
-# ── 25. SQL Expression Seeding (Proactive, Lever 0) ───────────────────
+PROSE_RULE_MINING_PROMPT = _RCA_CONTRACT_HEADER + _PROSE_RULE_MINING_BODY
 
-SQL_EXPRESSION_SEEDING_THRESHOLD = 5
-"""Skip proactive seeding if the space already has this many SQL snippets."""
+# Backward-compat alias for call sites that haven't migrated yet. The
+# registry key also gets aliased so MLflow prompt history is preserved
+# across the rename.
+INSTRUCTION_TO_SQL_EXPRESSION_PROMPT = PROSE_RULE_MINING_PROMPT
+
+# Post-definition registration of the miner prompt(s). ``LEVER_PROMPTS``
+# is defined earlier (line ~3315) but ``PROSE_RULE_MINING_PROMPT`` lives
+# further down; registering here keeps the single authoritative location
+# for the dict while respecting definition order. The deprecated
+# ``instruction_to_sql_expression`` key is retained for one release so
+# MLflow prompt-registry history stays linkable.
+LEVER_PROMPTS["prose_rule_mining"] = PROSE_RULE_MINING_PROMPT
+LEVER_PROMPTS["instruction_to_sql_expression"] = PROSE_RULE_MINING_PROMPT
+
+# ── 25. SQL Expression Seeding (Proactive, Lever 0) ───────────────────
 
 SQL_EXPRESSION_MIN_FREQUENCY = 2
 """Minimum benchmark occurrences for a pattern to become a candidate."""
 
-SQL_EXPRESSION_SEEDING_MAX_CANDIDATES = 20
-"""Maximum candidates to evaluate (budget cap for execution validation)."""
+SQL_EXPRESSION_SEEDING_MAX_CANDIDATES = 60
+"""Per-run mining budget. Caps warehouse EXPLAIN+execute cost for the
+validation loop. Seeding also respects the remaining per-space SQL-snippet
+headroom (``MAX_SQL_SNIPPETS`` minus existing count minus
+``SQL_EXPRESSION_SEEDING_LEVER_RESERVE``), whichever is smaller.
+"""
 
-SQL_EXPRESSION_SEEDING_PROMPT = """Given these SQL patterns extracted from \
+SQL_EXPRESSION_SEEDING_LEVER_RESERVE = 50
+"""Slots in the per-space ``MAX_SQL_SNIPPETS`` (200) budget reserved for
+the lever loop's iterative additions. Proactive seeding stops contributing
+once ``existing_sql_snippets + LEVER_RESERVE >= MAX_SQL_SNIPPETS``, leaving
+room for lever-loop proposals later in the optimisation run.
+
+Tune from observed production snippet-count growth distributions. A value
+of 50 reserves 25% of the 200-snippet budget for the lever loop, which is
+consistent with today's typical lever-loop snippet growth rate.
+
+NOTE (budget-model mismatch, deferred):
+    The Databricks knowledge-store docs
+    (https://docs.databricks.com/aws/en/genie/knowledge-store) state the
+    200-snippet limit combines table descriptions + join specs + SQL
+    expressions. Our internal code counts only SQL-snippet buckets. Joins
+    and table descriptions are effectively unbudgeted today. A separate
+    follow-up issue should reconcile ``_strict_validate``,
+    ``count_instruction_slots``, ``count_sql_snippets``, and any seeding
+    gates against the docs' combined budget.
+"""
+
+SQL_EXPRESSION_SEEDING_THRESHOLD = 5
+"""DEPRECATED: retained only so pre-existing callers and historical Delta
+rows keep deserialising. The seeding gate is now headroom-based; see
+``SQL_EXPRESSION_SEEDING_LEVER_RESERVE``.
+"""
+
+_SQL_EXPRESSION_SEEDING_BODY = """Given these SQL patterns extracted from \
 proven benchmark queries for a Genie Space, generate business-friendly \
 metadata for each:
 
@@ -3428,11 +4970,753 @@ Schema context:
 {{ schema }}
 
 For each candidate, provide:
-- display_name: A concise business-friendly name
-- synonyms: 2-3 alternative terms users might use
-- instruction: One sentence on when Genie should use this expression
-- alias: A snake_case identifier (for measures and expressions only)
+- display_name: A concise business-friendly name. MUST be specific \
+enough to disambiguate the source table or business domain inside \
+this space. When the SQL references a domain-specific table such as \
+``mv_<domain>_fact_<entity>`` or ``mv_<domain>_dim_<entity>`` (for \
+example ``mv_orders_fact_lines`` or ``mv_claims_dim_date``), prefix \
+the name with the compact qualifier (e.g. \
+``ORDERS Month-to-Date Filter``, ``CLAIMS Total Premium Amount``). \
+Avoid generic names like ``Month-to-Date Filter`` or \
+``Total Revenue`` when multiple fact tables or metric views in this \
+space could plausibly share that concept.
+- synonyms: 2-3 alternative terms users might use.
+- instruction: One sentence on when Genie should use this expression. \
+MUST mention the source table or business domain so Genie can pick \
+the correct snippet when several tables expose similar concepts.
+- alias: A snake_case identifier (for measures and expressions only).
 
 Output strict JSON array matching the input order. Each element:
 {{"display_name": "...", "synonyms": [...], "instruction": "...", "alias": "..."}}
 """
+
+SQL_EXPRESSION_SEEDING_PROMPT = _RCA_CONTRACT_HEADER + _SQL_EXPRESSION_SEEDING_BODY
+
+# ── 26. Pre-flight example_sql synthesis (Bug #4 follow-up; schema-driven) ──
+#
+# Proactive, leak-free "knowledge booster" that generates validated
+# question→SQL pairs and applies them as ``instructions.example_question_sqls``
+# until the target threshold is reached. Distinct from the reactive
+# AFS-driven path in ``optimization/synthesis.py`` — this fires in
+# pre-flight from *schema alone* with no failure cluster.
+#
+# Firewall invariants enforced by code:
+#   1. The generator prompt has no benchmark variables (structural).
+#   2. The orchestrator's context builder takes no ``benchmarks`` parameter
+#      (code review + unit test).
+#   3. Every candidate is fingerprint-checked against ``BenchmarkCorpus``
+#      before persist (runtime).
+#
+# Example_question_sqls do NOT count toward the Genie 200-snippet limit
+# (per docs/gsl-instruction-schema.md + public Databricks docs).
+
+ENABLE_PREFLIGHT_EXAMPLE_SQL_SYNTHESIS = os.getenv(
+    "GENIE_SPACE_OPTIMIZER_ENABLE_PREFLIGHT_EXAMPLE_SQL", "true",
+).lower() in ("true", "1", "yes")
+"""Feature kill switch. Default ON for all spaces; set to ``false`` to skip."""
+
+PREFLIGHT_EXAMPLE_SQL_TARGET = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PREFLIGHT_EXAMPLE_SQL_TARGET", "20") or "20"
+)
+"""Target count of ``example_question_sqls`` after pre-flight synthesis.
+
+Stage gates on ``need = max(0, TARGET - existing)`` — never produces more
+than required, idempotent across re-runs. 20 is a conservative upper
+cap; does not affect Genie's 200-snippet limit (example SQLs don't count).
+"""
+
+EXAMPLE_SQL_INITIAL_OVERDRAW = float(
+    os.getenv("GSO_EXAMPLE_SQL_INITIAL_OVERDRAW", "3.0") or "3.0"
+)
+"""Multiplier over ``PREFLIGHT_EXAMPLE_SQL_TARGET`` for the unified
+example-SQL generator's upfront candidate reservoir.
+
+This is intentionally separate from the final installed target. With the
+default target of 20 and overdraw of 3.0, the generator asks for about 60
+raw candidates across diversified LLM calls, validates them once, then
+selects at most 20 for persistence.
+"""
+
+EXAMPLE_SQL_GENERATION_CALLS = int(
+    os.getenv("GSO_EXAMPLE_SQL_GENERATION_CALLS", "3") or "3"
+)
+"""Number of independent diversified LLM calls made by unified example-SQL
+generation before final validation/selection.
+
+Clamped by the generator to the supported profile range. Defaults to 3 so
+the target=20, overdraw=3.0 path requests roughly 20 candidates per call.
+"""
+
+EXAMPLE_SQL_FIREWALL_STRICT = os.environ.get(
+    "GSO_EXAMPLE_SQL_FIREWALL_STRICT", "true",
+).lower() in {"1", "true", "yes", "on"}
+"""When True (default), the example-SQL leakage firewall blocks any
+candidate whose SQL fingerprint or n-gram overlap matches a benchmark.
+Set GSO_EXAMPLE_SQL_FIREWALL_STRICT=false to fall back to the
+warn-only relaxed policy. Strict mode is a methodological guard
+against benchmark leakage; regression prevention lives in the
+pre-promotion smoke test (see GSO_EXAMPLE_SQL_SMOKE_TEST)."""
+
+EXAMPLE_SQL_TEACHING_SAFETY_ENABLED = os.environ.get(
+    "GSO_EXAMPLE_SQL_TEACHING_SAFETY", "true",
+).lower() in {"1", "true", "yes", "on"}
+"""When True (default), every example-SQL candidate that survived the
+correctness arbiter is run through the teaching-safety judge before
+the apply step. Disable only for debugging — turning it off restores
+pre-tightening behaviour, which is what caused the regressions
+documented in 2026-04-30-enrichment-validation-tightening-plan.md."""
+
+
+EXAMPLE_SQL_SMOKE_TEST_ENABLED = os.environ.get(
+    "GSO_EXAMPLE_SQL_SMOKE_TEST", "true",
+).lower() in {"1", "true", "yes", "on"}
+"""When True (default), every batch of accepted example SQLs goes
+through a pre-promotion smoke test against baseline ``both_correct``
+questions before the actual apply. The whole batch is rejected if any
+baseline-correct question regresses by more than
+``GSO_EXAMPLE_SQL_SMOKE_REGRESSION_TOLERANCE_PP`` percentage points.
+Disable only for debugging."""
+
+
+EXAMPLE_SQL_SMOKE_REGRESSION_TOLERANCE_PP = float(
+    os.environ.get("GSO_EXAMPLE_SQL_SMOKE_REGRESSION_TOLERANCE_PP", "0.0")
+)
+"""Tolerance (in percentage points) for the smoke test. ``0.0`` means
+any regression on baseline both_correct questions rejects the patch.
+Raise carefully — non-zero values knowingly accept the risk that
+enrichment can degrade known-good behaviour."""
+
+
+EXAMPLE_SQL_SMOKE_MAX_QUESTIONS = int(
+    os.environ.get("GSO_EXAMPLE_SQL_SMOKE_MAX_QUESTIONS", "20")
+)
+"""Cap on the number of baseline both_correct questions sent to the
+smoke test, to keep wall time bounded. Sampled randomly with a fixed
+seed when the baseline pool is larger than this cap."""
+
+
+EXAMPLE_SQL_TEACHING_SAFETY_PROMPT = (
+    "You are a senior data engineer auditing example SQL pairs that "
+    "will be permanently installed as teaching context inside a "
+    "Databricks Genie space. The arbiter has already verified the "
+    "SQL is self-consistent (it answers its own question on its own "
+    "data). Your job is different: judge whether installing this "
+    "example would BIAS Genie's future answers in a HARMFUL way.\n\n"
+    "REJECT (verdict ``no``) when ANY of these apply:\n"
+    "- KPI over-teaching: the SQL hard-codes one metric variant when "
+    "  multiple equally valid forms exist (will bias Genie toward "
+    "  this one form on similar questions).\n"
+    "- Grain mismatch: question grain (monthly/daily/yearly) does "
+    "  not match SQL grain.\n"
+    "- Routing bias: the SQL uses an asset that is plausible but "
+    "  NOT the most canonical for the question (e.g. counting via a "
+    "  metric view when a dim table is the canonical source).\n"
+    "- Surprising defaults: ORDER BY/LIMIT/HAVING/CASE that the "
+    "  question did not ask for and that future variants will not "
+    "  want.\n"
+    "- Over-specification: extra columns or filters not asked for.\n"
+    "- Wrong column choice: uses an obscure or DQ-suffix column "
+    "  (``*_combination``, ``*_v2``, ``*_legacy``) when a plain "
+    "  column exists.\n\n"
+    "ACCEPT (verdict ``yes``) only when the example is canonical, "
+    "minimal, schema-safe, and grain-correct.\n\n"
+    "Use ``uncertain`` when the schema context is too thin to judge.\n\n"
+    "OUTPUT FORMAT (strict JSON, no prose):\n"
+    '{"value": "yes" | "no" | "uncertain", '
+    '"rationale": "<one sentence>"}'
+)
+
+PREFLIGHT_EXAMPLE_SQL_PER_ARCHETYPE = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PREFLIGHT_PER_ARCHETYPE", "2") or "2"
+)
+"""Upper bound on candidates generated per archetype per run — prevents
+any one query shape from dominating the applied pool."""
+
+PREFLIGHT_EXAMPLE_SQL_OVERDRAW = float(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PREFLIGHT_OVERDRAW", "1.5") or "1.5"
+)
+"""Multiplier over ``need`` to absorb gate rejections. With default 1.5 and
+target 20 on an empty space, the planner emits 30 candidate plans and we
+apply the first 20 that pass every gate."""
+
+PREFLIGHT_COLUMN_COVERAGE_K = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PREFLIGHT_COLUMN_K", "5") or "5"
+)
+"""Top-K columns per asset included in the narrowed identifier allowlist
+for synthesis. Small K keeps the LLM focused and raises EXPLAIN pass rate."""
+
+PREFLIGHT_PROFILE_VALUES_CAP = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PREFLIGHT_PROFILE_VALUES_CAP", "10") or "10"
+)
+"""Maximum number of distinct values rendered for any one column in the
+``## Column value profile`` section of the pre-flight synthesis prompt.
+Columns above this cap show ``+N more``; very high-cardinality columns
+(e.g. ``user_id`` with 10k distinct values) render only the cardinality."""
+
+PREFLIGHT_PROFILE_VALUE_LEN_CAP = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PREFLIGHT_PROFILE_VALUE_LEN_CAP", "60")
+    or "60"
+)
+"""Maximum characters any single profile value string is rendered with.
+Longer values are truncated with ``…`` so one pathological row cannot
+blow up the prompt budget on its own."""
+
+_PREFLIGHT_EXAMPLE_SYNTHESIS_BODY = """\
+<role>
+You are generating ONE high-quality question + SQL pair to teach a \
+Databricks Genie Space. Your output will be stored as an example so \
+Genie can learn the query shape for similar user questions.
+</role>
+
+<context>
+## Coverage focus (this example MUST reference these assets)
+Tables:
+{{ slice_tables }}
+
+Metric views:
+{{ slice_metric_views }}
+
+Join spec to exercise:
+{{ slice_join_spec }}
+
+Columns to prioritize:
+{{ slice_columns }}
+
+## Column value profile (use ONLY these values when building filters)
+{{ slice_data_profile }}
+
+## Constraint: identifier qualification (HARD)
+Every table reference in FROM, JOIN, and column-qualifier position MUST \
+be the EXACT identifier shown in the ``## Schema`` allowlist below. \
+Never a short name, never an inferred name, never a benchmark-style \
+alias you haven't declared for THIS query.
+
+Worked example (identifier = ``{{ schema_example_identifier }}``):
+- BAD   SELECT d.day_of_week FROM dim_date d
+- BAD   SELECT mv_<domain>_dim_date.day_of_week FROM mv_<domain>_dim_date
+- GOOD  SELECT t.day_of_week
+        FROM {{ schema_example_identifier }} t
+
+SQL aliases (``t``, ``f``, etc.) are allowed ONLY when declared in \
+THIS query's FROM clause. Never carry an alias over from another \
+query, a benchmark example, or an archetype snippet.
+
+## Constraint: filter values
+When writing filter predicates, quote values EXACTLY from the value \
+profile above. Do not invent values. For numeric columns, use values \
+within the stated range. When filter values are not in the profile \
+(high-cardinality columns), omit the filter instead of guessing.
+
+{{ metric_view_contract }}
+## Archetype
+Name: {{ archetype_name }}
+Shape guidance: {{ archetype_prompt_template }}
+Output contract: {{ archetype_output_shape }}
+
+## Schema (identifier allowlist — ONLY these identifiers may appear)
+{{ identifier_allowlist }}
+
+## Existing questions in this space (avoid duplicating intent)
+{{ existing_questions_list }}
+
+{{ retry_feedback }}
+</context>
+
+<instructions>
+Produce ONE example. Rules:
+
+- ``example_question`` is a clean, customer-style business question.
+- ``example_sql`` is a valid Databricks SQL query. Identifier \
+qualification is enforced in ``## Constraint: identifier qualification`` \
+above — obey that section exactly.
+- Match the archetype's shape contract.
+- The question MUST reference the coverage focus naturally — use the \
+listed assets and columns.
+- Do NOT duplicate the intent of any existing question.
+- NEVER quote benchmark questions, evaluation prompts, or test queries.
+- Do NOT invent columns, tables, or relationships that are not in the \
+allowlist — any unknown identifier is a hallucination.
+</instructions>
+
+<output_schema>
+Respond with a SINGLE JSON object, no prose, no code fences:
+{{"example_question": "...", "example_sql": "...", "rationale": "..."}}
+</output_schema>"""
+
+PREFLIGHT_EXAMPLE_SYNTHESIS_PROMPT = (
+    _EXAMPLE_SYNTHESIS_CONTRACT_HEADER + _PREFLIGHT_EXAMPLE_SYNTHESIS_BODY
+)
+
+LEVER_PROMPTS["preflight_example_synthesis"] = PREFLIGHT_EXAMPLE_SYNTHESIS_PROMPT
+
+
+# ── 27. Cluster-driven example_sql synthesis (Bug #4 Phase 3 — reactive) ──
+#
+# Reactive counterpart to pre-flight. Triggered from within the lever loop
+# when the strategist emits Lever 5 ``example_sqls`` for an action group.
+# Replaces the historical "verbatim-from-strategist" path at
+# ``optimizer.py:9597`` with the AFS-gated pre-flight synthesis engine.
+#
+# Three knobs:
+#   - ENABLE_CLUSTER_DRIVEN_SYNTHESIS: feature flag. Default ON; setting
+#     to false reverts to the legacy strategist-verbatim path (emergency
+#     rollback only). Kept as a kill switch until the new path has
+#     accumulated observability across multiple production runs.
+#   - CLUSTER_SYNTHESIS_PER_ITERATION: hard cap on synthesis attempts
+#     per lever-loop iteration. Shared counter lives in
+#     ``metadata_snapshot['_cluster_synthesis_count']`` and is reset by
+#     the lever loop at the top of each iteration.
+#   - EXAMPLE_QUESTION_SQLS_SAFETY_CAP: ceiling on
+#     ``instructions.example_question_sqls`` size. When reached, cluster-
+#     driven synthesis refuses to add more; Lever 5 falls back to
+#     ``instruction_only_fallback``. Pre-flight's 20-target is enforced
+#     upstream independently and cannot exceed 20 by construction.
+
+ENABLE_CLUSTER_DRIVEN_SYNTHESIS = os.getenv(
+    "GENIE_SPACE_OPTIMIZER_ENABLE_CLUSTER_DRIVEN_SYNTHESIS", "true",
+).lower() in ("true", "1", "yes")
+"""Feature flag for the cluster-driven synthesis path. Default ON for
+every space; set to ``false`` for emergency rollback to the legacy
+Lever 5 free-form example_sql path."""
+
+CLUSTER_SYNTHESIS_PER_ITERATION = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_CLUSTER_SYNTHESIS_PER_ITERATION", "3") or "3"
+)
+"""Upper bound on synthesis attempts per lever-loop iteration across all
+action groups. Prevents runaway cost when failures are dense. 3 is the
+default; tune via env var."""
+
+EXAMPLE_QUESTION_SQLS_SAFETY_CAP = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_EXAMPLE_QUESTION_SQLS_SAFETY_CAP", "50") or "50"
+)
+"""Absolute cap on ``instructions.example_question_sqls`` size before
+cluster-driven synthesis refuses to add more. Pre-flight's own 20-target
+is orthogonal — enforced upstream by ``PREFLIGHT_EXAMPLE_SQL_TARGET`` and
+cannot independently exceed 20. This cap is checked at the entry of
+``run_cluster_driven_synthesis_for_single_cluster``. Env var matches
+constant name for grep-ability."""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Optimizer Control-Plane Hardening Plan — flag helpers.
+#
+# Production-locked: every helper below returns ``True`` unconditionally.
+# The associated env-vars (``GSO_*``) are no longer honored; the
+# behaviour is part of the canonical optimizer pipeline. The helper
+# functions remain so existing call sites compile unchanged; if a
+# future regression demands an emergency disable, restore the
+# ``_flag_default_on`` body and document the env-var on the helper.
+#
+# Historical context: each flag was first introduced default-off behind
+# ``_flag_enabled`` (Cycle 1 plan), flipped default-on via
+# ``_flag_default_on`` for the cycle-9 deploy, then locked
+# unconditional here for the production release.
+# ──────────────────────────────────────────────────────────────────────
+
+
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_FALSY_VALUES = {"0", "false", "no", "off"}
+
+
+def _flag_enabled(env_name: str) -> bool:
+    raw = (os.environ.get(env_name) or "").strip().lower()
+    return raw in _TRUTHY_VALUES
+
+
+def _flag_default_on(env_name: str) -> bool:
+    raw = (os.environ.get(env_name) or "").strip().lower()
+    if raw in _FALSY_VALUES:
+        return False
+    return True
+
+
+def target_aware_acceptance_enabled() -> bool:
+    """Task A — below thresholds, ``decide_control_plane_acceptance``'s
+    ``accepted_with_attribution_drift`` branch rejects instead of
+    accepting. Production-locked: always on."""
+    return True
+
+
+def regression_debt_invariant_enabled() -> bool:
+    """``assert_regression_debt_partition_complete`` raises when
+    out_of_target_regressed_qids is not the disjoint union of
+    soft_to_hard / passing_to_hard / unknown_to_hard.
+    Production-locked: always on."""
+    return True
+
+
+def lever_qualified_patch_ids_enabled() -> bool:
+    """``_stamp_expanded_patch_identity`` builds expanded child ids as
+    ``L{lever}:{parent_id}#{child_index}``. Required for Cycle 2 Task 3's
+    DOA selected-proposal signature to be injective.
+    Production-locked: always on."""
+    return True
+
+
+def no_causal_applyable_halt_enabled() -> bool:
+    """Task B — when every RCA-grounded proposal in an AG is dropped
+    by upstream gates, halt the AG with reason
+    ``no_causal_applyable_patch`` instead of falling back to non-causal
+    proposals. Production-locked: always on."""
+    return True
+
+
+def bucket_driven_ag_selection_enabled() -> bool:
+    """Task C — strategist consumes prior-iteration failure buckets:
+    ``MODEL_CEILING`` qids drop from targets; clusters whose qids are
+    all ``EVIDENCE_GAP`` materialize as evidence-gathering AGs.
+    Production-locked: always on."""
+    return True
+
+
+def rca_aware_patch_cap_enabled() -> bool:
+    """Task D — proposals inherit the parent AG's ``rca_id`` at the F5
+    stage entry so ``select_causal_patch_cap`` can rank by
+    ``causal_attribution_tier``. Production-locked: always on."""
+    return True
+
+
+def lever_aware_blast_radius_enabled() -> bool:
+    """Task E — non-semantic patch types
+    (``update_column_description``, ``add_column_synonym``,
+    ``add_metric_view_instruction``, ``add_table_instruction``,
+    ``update_table_description``) downgrade ``high_collateral_risk``
+    blast-radius rejection to a warning.
+    Production-locked: always on."""
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cycle 2 Optimizer Improvement Plan — proposal-survival and
+# safety-gate hardening helpers. Production-locked: all return True.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def intra_ag_proposal_dedup_enabled() -> bool:
+    """Cycle 2 Task 1 — the gates pipeline runs an intra-AG
+    body-fingerprint dedup pass before blast-radius. Two proposals in
+    the same AG with identical body text but different ``patch_type``
+    values collapse to the first occurrence.
+    Production-locked: always on."""
+    return True
+
+
+def shared_cause_blast_radius_enabled() -> bool:
+    """Cycle 2 Task 2 — ``patch_blast_radius_is_safe`` downgrades
+    ``high_collateral_risk_flagged`` to
+    ``shared_cause_collateral_warning`` when every outside-target
+    dependent is itself currently-hard. Two hard failures sharing a
+    cause should not block each other's fix.
+    Production-locked: always on."""
+    return True
+
+
+def doa_selected_proposal_signature_enabled() -> bool:
+    """Cycle 2 Task 3 — the DOA ledger records and dedups by
+    selected-proposal-ID signatures (in addition to the applied-patch
+    signatures it already records). Closes the iter-3/iter-5 same-AG
+    replay loop where blast-radius drops every patch leaving an empty
+    applied-patch signature. Production-locked: always on."""
+    return True
+
+
+def question_shape_lever_preference_enabled() -> bool:
+    """Cycle 2 Task 4 — single-question clusters whose root_cause is
+    in the question-shape set (``plural_top_n_collapse``,
+    ``count_vs_distinct``, etc.) prefer per-question levers
+    (3, 5) over space-wide lever 6. Production-locked: always on."""
+    return True
+
+
+def force_structural_synthesis_on_lever5_drop_enabled() -> bool:
+    """The harness mandatorily invokes
+    ``run_cluster_driven_synthesis_for_single_cluster`` whenever the
+    lever-5 structural gate drops an instruction-only proposal for a
+    SQL-shape root cause. When the synthesis returns no proposal, an
+    explicit ``NO_STRUCTURAL_CANDIDATE`` DecisionRecord is emitted.
+
+    Closes the iter-2/iter-5 silent-skip path in run
+    2423b960-16e8-41d4-a0cb-74c563378e05 where the gate dropped the
+    proposal but no synthesis fallback was attempted.
+    Production-locked: always on."""
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cycle 9 — Patch-Acceptance Reliability flag accessors (default-on).
+# Anchor runs: 1099b152 (anchor) + 2afb0be2 596465849524605 (variance).
+
+
+def force_l6_reads_affected_questions_enabled() -> bool:
+    """Cycle 9 W1 — when on, the Cycle 7 N3 force-L6 wiring at the
+    per-AG aggregation block in ``harness.py`` falls back to
+    ``ag["affected_questions"]`` when ``ag["target_qids"]`` is empty.
+
+    Closes the silent failure observed in run 1099b152 where the
+    predicate's guard #4 (non-empty target_qids) blocked all
+    ``AG_DECOMPOSED_*`` AGs because the decompose-overbroad-AG
+    builder writes ``affected_questions`` rather than ``target_qids``.
+
+    Default-on. Set ``GSO_FORCE_L6_READS_AFFECTED_QUESTIONS=0`` to
+    restore the legacy decomposed-AG silent-skip behaviour.
+    """
+    return _flag_default_on("GSO_FORCE_L6_READS_AFFECTED_QUESTIONS")
+
+
+def plateau_requires_zero_open_hard_enabled() -> bool:
+    """Cycle 9 W2 — when on, ``resolve_terminal_on_plateau`` returns
+    ``PROGRESS_PENDING_OPEN_HARD`` (continue) when ``current_hard_qids
+    - quarantined_qids - regression_debt_qids`` is non-empty.
+    Default-on; set ``GSO_PLATEAU_REQUIRES_ZERO_OPEN_HARD=0`` for
+    legacy clean-plateau behaviour.
+    """
+    return _flag_default_on("GSO_PLATEAU_REQUIRES_ZERO_OPEN_HARD")
+
+
+def l6_narrow_replacement_on_hcrf_enabled() -> bool:
+    """Cycle 9 W3 — when on, the harness blast-radius site
+    synthesizes a narrow-scope variant of any L6 patch dropped at
+    ``high_collateral_risk_flagged`` and re-submits it to the same
+    gate. Default-on; set ``GSO_L6_NARROW_REPLACEMENT_ON_HCRF=0`` to
+    restore the legacy drop-and-give-up behaviour.
+    """
+    return _flag_default_on("GSO_L6_NARROW_REPLACEMENT_ON_HCRF")
+
+
+def doa_fingerprint_block_reproposal_enabled() -> bool:
+    """Cycle 9 W4 — when on, strategist preprocessing prunes any
+    candidate whose ``patch_retry_signature`` was already captured
+    in the per-run DOA fingerprint buffer (rolled back with
+    ``cause=target_still_hard`` in a prior iteration). Default-on.
+    """
+    return _flag_default_on("GSO_DOA_FINGERPRINT_BLOCK_REPROPOSAL")
+
+
+def plateau_reason_no_double_prefix_enabled() -> bool:
+    """Cycle 9 W5 — when on, ``_resolve_lever_loop_exit_reason`` does
+    not double-prefix ``plateau_*`` statuses. Pure observability fix.
+    Default-on; set ``GSO_PLATEAU_REASON_NO_DOUBLE_PREFIX=0`` for
+    replay byte-stability against legacy fixtures.
+    """
+    return _flag_default_on("GSO_PLATEAU_REASON_NO_DOUBLE_PREFIX")
+
+
+def require_lever6_for_sql_shape_rca_enabled() -> bool:
+    """Cycle 7 N3 — when on, every Action Group whose cluster has
+    ``root_cause`` in ``_SQL_SHAPE_ROOT_CAUSES`` AND
+    ``recommended_levers`` containing 6 AND at least one hard target
+    qid AND zero ``add_sql_snippet_*`` patches in its already-
+    aggregated proposal slate gets one forced
+    ``_generate_lever6_proposal`` candidate appended.
+
+    Closes the run-to-run variance on ``gs_009 missing_filter``
+    observed between attempts ``993610879088298`` (L6 emitted, 100%
+    in 2 iters) and ``596465849524605`` (no L6, terminal 95.8%) of
+    run ``2afb0be2-88b6-4832-99aa-c7e78fbc90f7``.
+
+    Default-on (default on): the predicate's 5 narrow guards mean
+    only AGs in the exact variance lane fire, the forced candidate
+    flows through existing safety gates, and LLM exceptions are
+    caught non-fatally. Set
+    ``GSO_REQUIRE_LEVER6_FOR_SQL_SHAPE_RCA=0`` to disable for
+    rollback. Corpus-validated on a future deploy via the
+    ``596465849524605`` analog; flipped default-on at code-freeze on
+    2026-05-04 to avoid Cycle 7 shipping as dead code."""
+    return _flag_default_on("GSO_REQUIRE_LEVER6_FOR_SQL_SHAPE_RCA")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cycle 5 — Process-Spine Hardening flag helpers (default on).
+#
+# Each flag was first introduced default-off behind ``_flag_enabled``
+# (Cycle 5 plan) and flipped default-on via ``_flag_default_on`` here
+# for the cycle-5 deploy. Set ``GSO_<NAME>=0`` for emergency disable.
+# Production-lock (return True unconditionally, env-var inert) lands
+# after corpus validation, mirroring the Cycle 1 flag-locking pattern.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def productive_iteration_budget_enabled() -> bool:
+    """Cycle 5 T1 — when on, an iteration that produces no applied
+    candidate AND emits a typed P4 no-progress outcome
+    (``proposal_generation_empty``,
+    ``structural_gate_dropped_instruction_only``,
+    ``no_structural_candidate``) does not consume the iteration counter.
+
+    Closes the iter-2..5 budget burn in run
+    2423b960-16e8-41d4-a0cb-74c563378e05 where 4 of 5 iterations were
+    consumed by deterministic no-ops. Default on for cycle-5 deploy;
+    set ``GSO_PRODUCTIVE_ITERATION_BUDGET=0`` for emergency disable."""
+    return _flag_default_on("GSO_PRODUCTIVE_ITERATION_BUDGET")
+
+
+def causal_drop_feedback_to_strategist_enabled() -> bool:
+    """Cycle 5 T2 — when on, gate-drops carrying a causal-target patch
+    are captured as typed ``DroppedCausalPatch`` records and exposed to
+    the next strategist call as
+    ``ActionGroupsInput.prior_iteration_dropped_causal_patches`` so the
+    LLM can propose a narrower variant or shift to a different lever
+    instead of re-emitting the same dropped pattern.
+
+    Closes the iter-1 → iter-2 silent-replay path in run
+    2423b960-16e8-41d4-a0cb-74c563378e05 where blast_radius dropped
+    ``add_sql_snippet_measure`` with 8 outside-target dependents and the
+    strategist re-emitted the same pattern next iteration. Default on
+    for cycle-5 deploy; set
+    ``GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST=0`` for emergency disable."""
+    return _flag_default_on("GSO_CAUSAL_DROP_FEEDBACK_TO_STRATEGIST")
+
+
+def diagnostic_ag_rca_regen_enabled() -> bool:
+    """Cycle 5 T3 — when on, a coverage-gap diagnostic AG materialized
+    for a cluster with ``rca_cards_present[c]=False`` triggers an RCA
+    regeneration step before proposal generation. If regeneration
+    fails, the AG is retired with ``RCA_REGENERATION_EXHAUSTED``
+    instead of producing empty proposals that the rca_groundedness
+    gate would drop.
+
+    Closes the iter-2 ``Proposals (0 total) — SKIPPING`` path in run
+    2423b960-16e8-41d4-a0cb-74c563378e05 where H001/H002 had no parent
+    RCA and the diagnostic AG inherited an empty ``rca_id`` →
+    ungrounded proposal generation → empty slate. Default on for
+    cycle-5 deploy; set ``GSO_DIAGNOSTIC_AG_RCA_REGEN=0`` for
+    emergency disable."""
+    return _flag_default_on("GSO_DIAGNOSTIC_AG_RCA_REGEN")
+
+
+def rca_ungrounded_records_enabled() -> bool:
+    """Cycle 10 W1 — emit ``RCA_FORMED + UNRESOLVED + RCA_UNGROUNDED``
+    record + marker for every cluster that reaches AG-emit with no fit
+    RCA. Default-on; tests/replay set ``GSO_RCA_UNGROUNDED_RECORDS_ENABLED=0``
+    to preserve the legacy silent-absorption byte-stable path.
+    """
+    return _flag_default_on("GSO_RCA_UNGROUNDED_RECORDS_ENABLED")
+
+
+def ag_levers_union_recommended_enabled() -> bool:
+    """Cycle 10 W2 — decomposer + strategist enforce
+    ``AG.Levers ⊇ cluster.recommended_levers``. Default-on; tests/replay
+    set ``GSO_AG_LEVERS_UNION_RECOMMENDED=0`` to preserve the legacy
+    "diagnostic-directive lever only" path.
+    """
+    return _flag_default_on("GSO_AG_LEVERS_UNION_RECOMMENDED")
+
+
+def lever6_force_typed_outcomes_enabled() -> bool:
+    """Cycle 10 W3 — emit typed records (``LEVER6_FORCE_LLM_DECLINED`` /
+    ``LEVER6_FORCE_RAISED`` / ``PROPOSAL_GENERATION_EMPTY``) when the
+    Cycle 7 N3 force-L6 path produces no candidate. Default-on; replay
+    sets ``GSO_LEVER6_FORCE_TYPED_OUTCOMES=0`` to preserve the legacy
+    DEBUG-swallow byte-stable path.
+    """
+    return _flag_default_on("GSO_LEVER6_FORCE_TYPED_OUTCOMES")
+
+
+def l6_narrow_replacement_patch_aware_enabled() -> bool:
+    """Cycle 10 W4 — narrow-L6 replacement branches by ``patch_type``
+    instead of assuming ``where_predicate``. Default-on; replay sets
+    ``GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE=0`` to preserve the legacy
+    filter-only path.
+    """
+    return _flag_default_on("GSO_L6_NARROW_REPLACEMENT_PATCH_AWARE")
+
+
+def l6_narrow_replacement_for_expression_enabled() -> bool:
+    """P0: extend narrow L6 replacement to add_sql_snippet_expression
+    and add_sql_snippet_measure patch types via question-scoped CASE
+    wrapping.
+
+    Default off so existing canonical replay fixtures stay byte-stable;
+    flipped on after the P0 re-pilot confirms the synthesized narrow
+    expressions clear the blast-radius gate AND improve target QID
+    accuracy on the run-809960554692716 fixture.
+    """
+    return _flag_enabled("GSO_L6_NARROW_REPLACEMENT_FOR_EXPRESSION")
+
+
+def doa_fingerprint_patch_body_match_enabled() -> bool:
+    """Cycle 10 W5 — DOA fingerprint buffer also indexes
+    ``patch_body_fingerprint`` so reproposals that switch
+    ``patch_type`` (e.g. ``update_instruction_section`` ↔
+    ``rewrite_instruction``) are still caught. Default-on; replay
+    sets ``GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH=0`` to preserve the
+    Cycle 9 W4 retry-signature-only path.
+    """
+    return _flag_default_on("GSO_DOA_FINGERPRINT_PATCH_BODY_MATCH")
+
+
+def plateau_counts_quarantined_enabled() -> bool:
+    """Cycle 10 W6 — convergence-quarantined hard qids count toward
+    plateau guard until an applied SQL delta retires them.
+    Default-on; replay sets ``GSO_PLATEAU_COUNTS_QUARANTINED=0`` to
+    preserve the legacy bypass path.
+    """
+    return _flag_default_on("GSO_PLATEAU_COUNTS_QUARANTINED")
+
+
+def proposal_trace_one_source_enabled() -> bool:
+    """Cycle 10 W7 — proposal trace ``consumed`` flag is computed in
+    one helper and read by both the post-strategist trace and the
+    acceptance trace, eliminating the dual-source drift visible in
+    run 1099b152. Default-on; replay sets
+    ``GSO_PROPOSAL_TRACE_ONE_SOURCE=0`` to preserve legacy.
+    """
+    return _flag_default_on("GSO_PROPOSAL_TRACE_ONE_SOURCE")
+
+
+def phase_b_producer_typed_exceptions_enabled() -> bool:
+    """Cycle 11 — emit a typed ``PRODUCER_EXCEPTION`` ``DecisionRecord``
+    at every harness producer try/except site so the Phase B trace
+    carries the exception class, ``repr``, and traceback head. Closes
+    the airline / 7NOW silent-mute defect (``producer_exceptions={...}``
+    with no payload). Default-on; production rollback via
+    ``GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS=0``.
+    """
+    return _flag_default_on("GSO_PHASE_B_PRODUCER_TYPED_EXCEPTIONS")
+
+
+def phase_h_manifest_strict_validation_enabled() -> bool:
+    """Cycle 11 — after building the Phase H manifest, walk every
+    declared artifact-index path and stamp ``manifest_path_missing``
+    entries for those absent from MLflow. Closes the 7NOW
+    ``missing_pieces=[]`` while 130/163 paths missing inconsistency.
+    Default-on; rollback via ``GSO_PHASE_H_MANIFEST_STRICT_VALIDATION=0``.
+    """
+    return _flag_default_on("GSO_PHASE_H_MANIFEST_STRICT_VALIDATION")
+
+
+def loop_invariants_enabled() -> bool:
+    """Cycle 11 — run the invariant suite at end-of-iteration and
+    end-of-run. Default-on; rollback via ``GSO_LOOP_INVARIANTS_ENABLED=0``.
+    """
+    return _flag_default_on("GSO_LOOP_INVARIANTS_ENABLED")
+
+
+def loop_invariants_strict() -> bool:
+    """Cycle 11 — when on, an invariant violation is fatal (assert).
+    When off, the violation is recorded as an ``INVARIANT_VIOLATION``
+    decision record and the run continues. Default-on (CI / replay);
+    production rollback via ``GSO_LOOP_INVARIANTS_STRICT=0``.
+    """
+    return _flag_default_on("GSO_LOOP_INVARIANTS_STRICT")
+
+
+def ag_levers_union_strategist_path_enabled() -> bool:
+    """Cycle 11 — apply union_ag_levers_with_recommended to
+    strategist-emit AGs (primary AG_DECOMPOSED_* / AG1 path), not
+    just to coverage AGs as in Cycle 10 W2. Closes 7NOW H002 lever
+    drift. Default-on; rollback via
+    ``GSO_AG_LEVERS_UNION_STRATEGIST_PATH=0``.
+    """
+    return _flag_default_on("GSO_AG_LEVERS_UNION_STRATEGIST_PATH")
+
+
+def plateau_input_uses_journey_after_rollback_enabled() -> bool:
+    """Cycle 11 — after a rollback, the plateau decision's
+    ``currently_failing`` input is sourced from the journey ledger's
+    current-baseline hard-cluster qid set, not from the candidate's
+    eval. Closes airline `plateau_no_open_failures` with 4 open
+    clusters. Default-on; rollback via
+    ``GSO_PLATEAU_INPUT_USES_JOURNEY_AFTER_ROLLBACK=0``.
+    """
+    return _flag_default_on("GSO_PLATEAU_INPUT_USES_JOURNEY_AFTER_ROLLBACK")

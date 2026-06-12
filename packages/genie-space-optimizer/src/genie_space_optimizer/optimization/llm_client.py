@@ -12,13 +12,14 @@ serving-endpoints URL and uses bearer-token auth extracted from
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
 from genie_space_optimizer.common.config import (
-    LLM_ENDPOINT,
     LLM_MAX_RETRIES,
     LLM_TEMPERATURE,
+    get_llm_endpoint,
 )
 
 if TYPE_CHECKING:
@@ -26,7 +27,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_LLM_TIMEOUT_SECONDS = 600
+_LLM_TIMEOUT_SECONDS_DEFAULT = 600
+
+
+def eval_llm_timeout_seconds() -> int:
+    """Per-request HTTP timeout for judge LLM calls.
+
+    Defaults to 600s (production-on). Override via env when debugging.
+    Floors at 30s to avoid pathological zero/negative values.
+    """
+    raw = os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_LLM_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _LLM_TIMEOUT_SECONDS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid GENIE_SPACE_OPTIMIZER_EVAL_LLM_TIMEOUT_SECONDS=%r; using %d",
+            raw,
+            _LLM_TIMEOUT_SECONDS_DEFAULT,
+        )
+        return _LLM_TIMEOUT_SECONDS_DEFAULT
+    return max(30, value)
+
 
 _openai_client_cache: dict[str, Any] = {}
 
@@ -99,14 +122,20 @@ def call_llm(
 
     This is the low-level building block — callers are responsible for
     JSON parsing, prompt linking, span wrapping, etc.
+
+    ``temperature`` is accepted for backwards-compatible call sites but is
+    not sent to Databricks, because some supported reasoning/frontier
+    endpoints reject the parameter.
     """
     client = get_openai_client(w)
+    model = get_llm_endpoint()
 
     call_kwargs: dict[str, Any] = {
-        "model": LLM_ENDPOINT,
+        "model": model,
         "messages": messages,
-        "temperature": temperature,
+        "timeout": eval_llm_timeout_seconds(),
     }
+    # Do not send temperature: Claude Opus 4.7/4.8 and some GPT 5.x endpoints reject it.
     if max_tokens is not None:
         call_kwargs["max_tokens"] = max_tokens
 

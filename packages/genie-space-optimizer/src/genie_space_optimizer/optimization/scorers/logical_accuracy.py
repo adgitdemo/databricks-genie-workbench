@@ -12,15 +12,18 @@ from typing import TYPE_CHECKING
 from mlflow.entities import Feedback
 from mlflow.genai.scorers import scorer
 
-from genie_space_optimizer.common.config import LLM_ENDPOINT
+from genie_space_optimizer.common.config import get_llm_endpoint
 from genie_space_optimizer.common.genie_client import resolve_sql, sanitize_sql
 from genie_space_optimizer.optimization.evaluation import (
-    LLM_SOURCE,
+    get_llm_source,
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
     format_asi_markdown,
     get_registered_prompt_name,
+)
+from genie_space_optimizer.optimization.genie_eval_taxonomy import (
+    with_genie_equivalent_eval,
 )
 from genie_space_optimizer.optimization.scorers import build_scorer_context
 
@@ -59,9 +62,14 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             "- MEASURE() on a metric view is logically equivalent to SUM/AVG on the underlying\n"
             "  fact table. A TVF call can also produce logically correct answers.\n\n"
             f"{context}\n\n"
-            'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_aggregation|wrong_filter|wrong_groupby|wrong_orderby>", '
+            'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_aggregation|wrong_filter|wrong_groupby|wrong_orderby|wrong_measure|incorrect_function_usage|tvf_parameter_error|missing_instruction|business_logic_missing|formatting_error>", '
             '"wrong_clause": "<the problematic SQL clause>", "blame_set": ["<column_or_function>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
+            '"rca_kind": "<metric_view_routing_confusion|measure_swap|canonical_dimension_missed|missing_required_dimension|extra_defensive_filter|unknown>", '
+            '"expected_objects": ["<table_or_column_or_measure_expected>"], '
+            '"actual_objects": ["<table_or_column_or_measure_generated>"], '
+            '"patch_family": "<contrastive_metric_routing|contrastive_measure_disambiguation|canonical_dimension_guidance|required_dimension_guidance|avoid_unrequested_defensive_filters|unknown>", '
+            '"recommended_levers": [1, 5], '
             '"rationale": "<brief explanation>"}\n'
             'If correct, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
         )
@@ -95,13 +103,18 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
                 "│ Prompt len:  %d chars\n"
                 "│ LLM endpoint: %s\n"
                 "└─────────────────────────────────────────────────────────────────────────",
-                question[:80], str(e)[:300], len(prompt), LLM_ENDPOINT,
+                question[:80], str(e)[:300], len(prompt), get_llm_endpoint(),
             )
             metadata = build_asi_metadata(
                 failure_type="other",
                 severity="info",
                 confidence=0.0,
                 counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
+            metadata = with_genie_equivalent_eval(
+                metadata,
+                judge_name="logical_accuracy",
+                value="unknown",
             )
             return Feedback(
                 name="logical_accuracy",
@@ -113,7 +126,7 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
                     metadata=metadata,
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
                 metadata=metadata,
             )
 
@@ -152,7 +165,7 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
                     extra={"llm_response": result, "override_reason": "result_match"},
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
             )
 
         if result.get("correct", False):
@@ -166,7 +179,7 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
                     extra={"llm_response": result},
                     question_id=question_id,
                 ),
-                source=LLM_SOURCE,
+                source=get_llm_source(),
             )
 
         base_confidence = 0.95
@@ -187,6 +200,18 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
                 f"Fix {result.get('failure_type', 'logic issue')} "
                 f"involving {', '.join(result.get('blame_set', ['unknown']))}"
             ),
+            expected_objects=result.get("expected_objects") or [],
+            actual_objects=result.get("actual_objects") or [],
+            rca_kind=result.get("rca_kind") or "",
+            patch_family=result.get("patch_family") or "",
+            recommended_levers=result.get("recommended_levers") or [],
+        )
+        metadata = with_genie_equivalent_eval(
+            metadata,
+            judge_name="logical_accuracy",
+            value="no",
+            failure_type=result.get("failure_type", "wrong_aggregation"),
+            comparison=cmp,
         )
         return Feedback(
             name="logical_accuracy",
@@ -199,7 +224,7 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
                 extra={"llm_response": result},
                 question_id=question_id,
             ),
-            source=LLM_SOURCE,
+            source=get_llm_source(),
             metadata=metadata,
         )
 

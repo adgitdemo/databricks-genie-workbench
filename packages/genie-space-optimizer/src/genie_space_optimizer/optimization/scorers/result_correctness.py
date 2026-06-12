@@ -9,11 +9,17 @@ from __future__ import annotations
 from mlflow.entities import Feedback
 from mlflow.genai.scorers import scorer
 
+from genie_space_optimizer.common.config import scoring_v2_is_legacy
+from genie_space_optimizer.common.genie_client import sanitize_sql
 from genie_space_optimizer.optimization.evaluation import (
     CODE_SOURCE,
+    _extract_response_text,
     build_asi_metadata,
     format_asi_markdown,
     slim_comparison,
+)
+from genie_space_optimizer.optimization.genie_eval_taxonomy import (
+    with_genie_equivalent_eval,
 )
 
 
@@ -68,6 +74,30 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                 source=CODE_SOURCE,
             )
 
+        if (
+            error_type == "genie_result_unavailable"
+            and not scoring_v2_is_legacy()
+            and sanitize_sql(_extract_response_text(outputs))
+        ):
+            return Feedback(
+                name="result_correctness",
+                value="excluded",
+                rationale=format_asi_markdown(
+                    judge_name="result_correctness",
+                    value="excluded",
+                    rationale=(
+                        "Genie returned valid SQL but the result set could not "
+                        "be retrieved (no-result defense under GSO_SCORING_V2). "
+                        "SQL-shape judges still score this row; this judge is "
+                        "blocked because result comparison requires Genie's "
+                        "result set. Excluded from the accuracy denominator."
+                    ),
+                    extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
+                ),
+                source=CODE_SOURCE,
+            )
+
         _GT_INFRA_ERROR_TYPES = frozenset({
             "infrastructure", "permission_blocked", "query_execution",
         })
@@ -93,6 +123,12 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
             severity="major",
             confidence=0.7,
             actual_value=cmp.get("error", "")[:100],
+        )
+        metadata = with_genie_equivalent_eval(
+            metadata,
+            judge_name="result_correctness",
+            value="no",
+            comparison=cmp,
         )
         return Feedback(
             name="result_correctness",
@@ -178,6 +214,12 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
         expected_value=f"rows={cmp.get('gt_rows')}, hash={cmp.get('gt_hash')}",
         actual_value=f"rows={cmp.get('genie_rows')}, hash={cmp.get('genie_hash')}",
         counterfactual_fix=_cfix,
+    )
+    metadata = with_genie_equivalent_eval(
+        metadata,
+        judge_name="result_correctness",
+        value="no",
+        comparison=cmp,
     )
     return Feedback(
         name="result_correctness",

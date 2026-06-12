@@ -21,6 +21,45 @@ router = APIRouter(prefix="/api/create")
 logger = logging.getLogger(__name__)
 
 
+# ── Preflight check ──────────────────────────────────────────────────────────
+
+@router.get("/preflight")
+async def create_preflight(request: Request):
+    """Check warehouse availability and OBO auth status for the Create flow."""
+    import os
+    from backend.services.auth import get_workspace_client
+
+    obo_enabled = bool(getattr(request.state, "user_token", ""))
+    app_name = os.environ.get("DATABRICKS_APP_NAME", "this app")
+
+    warehouses_available = False
+    try:
+        from backend.services.create_agent_tools import get_sql_warehouse_id
+        configured_id = get_sql_warehouse_id()
+        if configured_id:
+            # App has an explicitly granted warehouse resource — confirmed access
+            warehouses_available = True
+        else:
+            # No app resource assigned; fall back to checking OBO user's warehouses
+            if obo_enabled:
+                client = get_workspace_client()
+                for wh in client.warehouses.list():
+                    is_serverless = getattr(wh, "enable_serverless_compute", False)
+                    warehouse_type = getattr(wh, "warehouse_type", "")
+                    wh_type = getattr(warehouse_type, "value", warehouse_type)
+                    if is_serverless or wh_type == "PRO":
+                        warehouses_available = True
+                        break
+    except Exception as e:
+        logger.warning("preflight: warehouse check failed: %s", e)
+
+    return {
+        "warehouses_available": warehouses_available,
+        "obo_enabled": obo_enabled,
+        "app_name": app_name,
+    }
+
+
 # ── UC discovery ──────────────────────────────────────────────────────────────
 
 @router.get("/discover/catalogs")
@@ -139,6 +178,7 @@ class AgentChatRequest(BaseModel):
     session_id: str | None = Field(None, description="Existing session ID. Omit to start a new session.")
     selections: dict | None = Field(None, description="UI selections from interactive elements")
     space_id: str | None = Field(None, description="Pre-seed session with existing space ID for fix/update flows")
+    model: str | None = Field(None, max_length=256, description="Optional serving endpoint name for this session.")
 
 
 @router.post("/agent/chat")
@@ -158,7 +198,8 @@ async def agent_chat(body: AgentChatRequest, request: Request):
     from backend.services.create_agent_session import (
         create_session, get_session_async, persist_session,
     )
-    from backend.services.auth import set_obo_user_token, clear_obo_user_token
+    from backend.services.auth import get_workspace_client, set_obo_user_token, clear_obo_user_token
+    from backend.services.model_catalog import ModelValidationError, validate_chat_model
 
     agent = get_create_agent()
 
@@ -183,6 +224,21 @@ async def agent_chat(body: AgentChatRequest, request: Request):
                 logger.info("Pre-loaded space config for fix flow: %s", body.space_id)
             except Exception as e:
                 logger.warning("Could not pre-load space config for %s: %s", body.space_id, e)
+
+    requested_model = (body.model or "").strip() or None
+    if requested_model and not is_continuation:
+        try:
+            session.llm_model = validate_chat_model(
+                requested_model,
+                client=get_workspace_client(),
+            )
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    elif session.llm_model:
+        try:
+            validate_chat_model(session.llm_model, client=get_workspace_client())
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     user_message = body.message
     selections = body.selections
@@ -261,6 +317,7 @@ async def get_agent_session(session_id: str):
         "history": display_history,
         "space_id": session.space_id,
         "space_url": session.space_url,
+        "llm_model": session.llm_model,
         "has_config": session.space_config is not None,
     }
 

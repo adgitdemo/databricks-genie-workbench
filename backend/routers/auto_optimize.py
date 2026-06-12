@@ -16,8 +16,12 @@ from backend.routers._validators import RunId, SpaceId
 
 from backend.services.auth import get_workspace_client, get_service_principal_client, get_databricks_host
 from backend.services import gso_lakebase
+from backend.services.model_catalog import ModelValidationError, validate_chat_model
 from genie_space_optimizer.backend.utils import safe_int, safe_float, safe_finite, safe_json_parse
-from genie_space_optimizer.common.accuracy import derived_accuracy as _canonical_derived_accuracy
+from genie_space_optimizer.common.accuracy import (
+    compute_run_scores,
+    derived_accuracy as _canonical_derived_accuracy,
+)
 from genie_space_optimizer.integration import (
     trigger_optimization,
     apply_optimization,
@@ -44,7 +48,7 @@ _ITER_COLS = _ITER_COLS_V2 = (
     "iteration, eval_scope, overall_accuracy, total_questions, correct_count, "
     "evaluated_count, excluded_count, quarantined_benchmarks_json, "
     "scores_json, failures_json, thresholds_met, lever, repeatability_pct, "
-    "reflection_json, mlflow_run_id"
+    "reflection_json, mlflow_run_id, rolled_back"
 )
 _ITER_COLS_LEGACY = (
     "iteration, eval_scope, overall_accuracy, total_questions, correct_count, "
@@ -78,6 +82,7 @@ class TriggerRequest(BaseModel):
     apply_mode: str = "genie_config"
     levers: list[int] | None = None
     deploy_target: str | None = None
+    llm_model: str | None = Field(None, max_length=256)
 
 
 # PermissionCheckResponse + SchemaAccessStatus now live in `backend.models`
@@ -127,7 +132,7 @@ def _delta_table(name: str) -> str:
     return f"{config.catalog}.{config.schema_name}.{name}"
 
 
-# Bug #2 regression (April 2026): `_ITER_COLS_V2` requires three columns that
+# Bug #2 regression (April 2026): `_ITER_COLS_V2` requires columns that
 # only land on the Delta table when the GSO job's `_migrate_add_columns`
 # runs (see `packages/genie-space-optimizer/.../optimization/state.py`). If
 # the app wheel and the job wheel are on different deploy versions — e.g. the
@@ -160,7 +165,7 @@ def probe_iterations_schema() -> str:
     table = _delta_table("genie_opt_iterations")
     try:
         _delta_query(
-            f"SELECT evaluated_count, excluded_count, quarantined_benchmarks_json "
+            f"SELECT evaluated_count, excluded_count, quarantined_benchmarks_json, rolled_back "
             f"FROM {table} LIMIT 0",
             strict=True,
         )
@@ -171,7 +176,7 @@ def probe_iterations_schema() -> str:
                 "columns. The UI will fall back to stored overall_accuracy but "
                 "accuracy may appear stale until the GSO job bundle redeploys "
                 "and _migrate_add_columns adds evaluated_count / excluded_count "
-                "/ quarantined_benchmarks_json. err=%s",
+                "/ quarantined_benchmarks_json / rolled_back. err=%s",
                 table,
                 str(exc)[:200],
             )
@@ -180,7 +185,7 @@ def probe_iterations_schema() -> str:
         logger.warning("Schema probe failed: %s", str(exc)[:200])
         return "unreachable"
     _iterations_schema_legacy = False
-    logger.info("gso.runs.schema_ok %s has all Bug #2 denominator columns", table)
+    logger.info("gso.runs.schema_ok %s has all Bug #2 score-selection columns", table)
     return "ok"
 
 
@@ -190,6 +195,7 @@ _LEGACY_COL_ERROR_MARKERS = (
     "evaluated_count",
     "excluded_count",
     "quarantined_benchmarks_json",
+    "rolled_back",
 )
 
 
@@ -228,7 +234,7 @@ def _select_iterations_delta(run_id: str) -> list[dict]:
             return []
         logger.warning(
             "gso.runs.schema_drift genie_opt_iterations is missing Bug #2 columns "
-            "(evaluated_count / excluded_count / quarantined_benchmarks_json). "
+            "(evaluated_count / excluded_count / quarantined_benchmarks_json / rolled_back). "
             "Falling back to the legacy SELECT — scores render from stored "
             "overall_accuracy. Redeploy the GSO job bundle so "
             "_migrate_add_columns can ALTER TABLE ADD COLUMN. err=%s",
@@ -238,12 +244,13 @@ def _select_iterations_delta(run_id: str) -> list[dict]:
         return _delta_query(f"SELECT {_ITER_COLS_LEGACY} FROM {table} {order}")
 
 
-def _build_gso_config() -> IntegrationConfig:
+def _build_gso_config(llm_model_override: str | None = None) -> IntegrationConfig:
     return IntegrationConfig(
         catalog=os.environ.get("GSO_CATALOG", ""),
         schema_name=os.environ.get("GSO_SCHEMA", "genie_space_optimizer"),
         warehouse_id=os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", ""),
         job_id=int(os.environ["GSO_JOB_ID"]) if os.environ.get("GSO_JOB_ID", "").isdigit() else None,
+        llm_model=llm_model_override or os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
     )
 
 
@@ -1005,7 +1012,14 @@ async def trigger(body: TriggerRequest, request: Request):
 
     ws = get_workspace_client()
     sp_ws = get_service_principal_client()
-    config = _build_gso_config()
+    selected_llm_model = (body.llm_model or "").strip() or None
+    if selected_llm_model:
+        try:
+            selected_llm_model = validate_chat_model(selected_llm_model, client=sp_ws)
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    config = _build_gso_config(llm_model_override=selected_llm_model)
 
     # Server-side gate: re-verify Prompt Registry is available under the same
     # identity (sp_ws) the job will use. The UI also checks via /permissions,
@@ -1093,7 +1107,7 @@ async def trigger(body: TriggerRequest, request: Request):
 _STEP_DEFINITIONS = [
     {"stepNumber": 1, "name": "Preflight",             "stage_prefixes": ["PREFLIGHT"]},
     {"stepNumber": 2, "name": "Baseline Evaluation",   "stage_prefixes": ["BASELINE_EVAL"]},
-    {"stepNumber": 3, "name": "Proactive Enrichment",  "stage_prefixes": ["ENRICHMENT", "PROMPT_MATCH", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROACTIVE_INSTRUCTION", "EXAMPLE_SQL"]},
+    {"stepNumber": 3, "name": "Proactive Enrichment",  "stage_prefixes": ["ENRICHMENT", "PROMPT_MATCH", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROACTIVE_INSTRUCTION", "EXAMPLE_SQL", "POST_ENRICHMENT_EVAL"]},
     {"stepNumber": 4, "name": "Adaptive Optimization", "stage_prefixes": ["LEVER_", "AG_"]},
     {"stepNumber": 5, "name": "Finalization",          "stage_prefixes": ["FINALIZE", "REPEATABILITY", "HELD_OUT", "COMPLETE"]},
     {"stepNumber": 6, "name": "Deploy",                "stage_prefixes": ["DEPLOY", "UC_OBO_WRITE"]},
@@ -1222,18 +1236,13 @@ async def get_run(run_id: RunId):
             f"WHERE run_id = '{run_id}' ORDER BY iteration, lever, patch_index"
         )
 
-    # Inject baseline_accuracy into run_data for step summary builders
-    baseline_iter = next(
-        (r for r in iterations if _safe_int(r.get("iteration")) == 0 and str(r.get("eval_scope", "")).lower() == "full"),
-        None,
-    )
-    if not baseline_iter:
-        baseline_iter = next((r for r in iterations if _safe_int(r.get("iteration")) == 0), None)
-    # Bug #2: derive from correct/evaluated so the `baselineScore` we return
-    # agrees with what the frontend computes for the Baseline Evaluation tab
-    # label from the same iteration row. Falls back to stored overall_accuracy
-    # for legacy rows without evaluated_count.
-    baseline_accuracy = _derived_accuracy(baseline_iter, run_id=run_id, iteration=0)
+    # Canonical baseline + optimized + best_iteration. See
+    # ``genie_space_optimizer.common.accuracy.compute_run_scores`` for the
+    # contract — closes the "100% Optimized during Baseline Evaluation" UI
+    # bug by enforcing full-scope-only filtering, rolled-back exclusion, and
+    # the floor-at-baseline invariant.
+    run_scores = compute_run_scores(iterations, run_id=run_id, logger=logger)
+    baseline_accuracy = run_scores.baseline
     run["baseline_accuracy"] = baseline_accuracy
 
     # Build pipeline steps with rich IO
@@ -1273,30 +1282,10 @@ async def get_run(run_id: RunId):
         for s in stages
     ]
 
-    # Find baseline and best scores from full-scope iterations only.
-    # Bug #2: optimized_score is derived from correct_count/evaluated_count
-    # per iteration so the optimized card in ScoreSummary agrees to the
-    # decimal with what RunDetailView computes for the Final Evaluation tab.
-    baseline_score = baseline_accuracy
-    baseline_iteration = 0 if baseline_accuracy is not None else None
-    optimized_score = None
-    best_iteration = None
-    for it in iterations:
-        it_num = int(it.get("iteration", -1))
-        if it.get("eval_scope") == "full" and it_num > 0:
-            accuracy = _derived_accuracy(it, run_id=run_id, iteration=it_num)
-            if accuracy is not None and (optimized_score is None or accuracy > optimized_score):
-                optimized_score = accuracy
-                best_iteration = it_num
-
-    if optimized_score is None:
-        for it in iterations:
-            it_num = int(it.get("iteration", -1))
-            if it_num > 0:
-                accuracy = _derived_accuracy(it, run_id=run_id, iteration=it_num)
-                if accuracy is not None and (optimized_score is None or accuracy > optimized_score):
-                    optimized_score = accuracy
-                    best_iteration = it_num
+    baseline_score = run_scores.baseline
+    baseline_iteration = run_scores.baseline_iteration
+    optimized_score = run_scores.optimized
+    best_iteration = run_scores.best_iteration
 
     # Build resource links (absolute URLs)
     config = _build_gso_config()
@@ -1424,34 +1413,15 @@ async def get_run_status(run_id: RunId):
     if not iterations and _is_configured():
         iterations = _select_iterations_delta(run_id) or []
 
-    # Bug #2: derive from correct/evaluated. The monitoring ScoreSummary
-    # card in AutoOptimizeTab consumes these directly and must agree with
-    # RunDetailView's tab labels to the decimal.
-    baseline_score = None
-    optimized_score = None
-    for it in iterations:
-        it_num = _safe_int(it.get("iteration"))
-        scope = str(it.get("eval_scope", "")).lower()
-        if it_num == 0 and scope == "full":
-            acc = _derived_accuracy(it, run_id=run_id, iteration=0)
-            if acc is not None:
-                baseline_score = acc
-        elif it_num is not None and it_num > 0 and scope == "full":
-            acc = _derived_accuracy(it, run_id=run_id, iteration=it_num)
-            if acc is not None and (optimized_score is None or acc > optimized_score):
-                optimized_score = acc
-    if baseline_score is None:
-        for it in iterations:
-            if _safe_int(it.get("iteration")) == 0:
-                baseline_score = _derived_accuracy(it, run_id=run_id, iteration=0)
-                break
-    if optimized_score is None:
-        for it in iterations:
-            it_num = _safe_int(it.get("iteration"))
-            if it_num is not None and it_num > 0:
-                acc = _derived_accuracy(it, run_id=run_id, iteration=it_num)
-                if acc is not None and (optimized_score is None or acc > optimized_score):
-                    optimized_score = acc
+    # Canonical baseline + optimized + best_iteration. See
+    # ``genie_space_optimizer.common.accuracy.compute_run_scores``.
+    #
+    # This endpoint is the one feeding the AutoOptimizeTab ScoreSummary
+    # card. Pre-fix: a 100% slice/p0 probe row could win the optimized
+    # headline mid-run (the "100% Optimized at step 2/6" screenshot bug),
+    # and rolled-back iterations were not filtered. The canonical helper
+    # closes both: full-scope only, exclude rolled-back, floor-at-baseline.
+    run_scores = compute_run_scores(iterations, run_id=run_id, logger=logger)
 
     return {
         "runId": run.get("run_id"),
@@ -1459,8 +1429,9 @@ async def get_run_status(run_id: RunId):
         "spaceId": run.get("space_id"),
         "startedAt": _isoformat(run.get("started_at")),
         "completedAt": _isoformat(run.get("completed_at")),
-        "baselineScore": baseline_score,
-        "optimizedScore": optimized_score if optimized_score is not None else baseline_score,
+        "baselineScore": run_scores.baseline,
+        "optimizedScore": run_scores.optimized,
+        "bestIteration": run_scores.best_iteration,
         "convergenceReason": run.get("convergence_reason"),
         "stepsCompleted": steps_completed,
         "totalSteps": 6,
@@ -1588,7 +1559,7 @@ async def load_runs_with_fallback(space_id: str) -> list[dict]:
 
     return _delta_query(
         f"SELECT run_id, space_id, status, started_at, completed_at, "
-        f"best_accuracy, best_iteration, convergence_reason, triggered_by "
+        f"best_accuracy, best_iteration, convergence_reason, triggered_by, llm_model "
         f"FROM {_delta_table('genie_opt_runs')} "
         f"WHERE space_id = '{space_id}' ORDER BY started_at DESC"
     )

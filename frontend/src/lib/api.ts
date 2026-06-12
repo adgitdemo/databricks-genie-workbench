@@ -4,6 +4,7 @@
 
 import type {
   AppSettings,
+  LLMModelInfo,
   FetchSpaceResponse,
   SpaceDetailResponse,
   SpaceListItem,
@@ -178,6 +179,10 @@ export async function getSettings(): Promise<AppSettings> {
   return fetchWithTimeout<AppSettings>(`${API_BASE}/settings`, {}, DEFAULT_TIMEOUT)
 }
 
+export async function getModels(): Promise<LLMModelInfo[]> {
+  return fetchWithTimeout<LLMModelInfo[]>(`${API_BASE}/models`, {}, DEFAULT_TIMEOUT)
+}
+
 // ===== GenieIQ / Workbench API =====
 
 export async function listSpaces(params?: {
@@ -293,6 +298,10 @@ export function streamFixAgent(
 
 // ── Create Wizard ────────────────────────────────────────────────────────────
 
+export async function fetchCreatePreflight(): Promise<{ warehouses_available: boolean; obo_enabled: boolean; app_name: string }> {
+  return fetchWithTimeout(`${API_BASE}/create/preflight`)
+}
+
 export async function discoverCatalogs(): Promise<{ catalogs: UcCatalog[] }> {
   return fetchWithTimeout<{ catalogs: UcCatalog[] }>(`${API_BASE}/create/discover/catalogs`)
 }
@@ -370,6 +379,7 @@ export function streamAgentChat(
   selections: Record<string, unknown> | null,
   callbacks: AgentChatCallbacks,
   spaceId?: string | null,
+  model?: string | null,
 ): () => void {
   const abortController = new AbortController()
 
@@ -379,6 +389,7 @@ export function streamAgentChat(
     selections,
   }
   if (spaceId) body.space_id = spaceId
+  if (model) body.model = model
 
   fetch(`${API_BASE}/create/agent/chat`, {
     method: "POST",

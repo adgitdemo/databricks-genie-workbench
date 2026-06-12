@@ -7,6 +7,7 @@ no longer use ``serving_endpoints.query``.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -134,16 +135,24 @@ class TestGetOpenaiClientShared:
 
 class TestCallLlm:
     @patch("genie_space_optimizer.optimization.llm_client.get_openai_client")
-    def test_returns_text_and_response(self, mock_get_client):
+    def test_returns_text_and_response(self, mock_get_client, monkeypatch):
         from genie_space_optimizer.optimization.llm_client import call_llm
 
+        monkeypatch.setenv("LLM_MODEL", "custom-endpoint")
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = _make_openai_response('{"ok": true}')
         mock_get_client.return_value = mock_client
 
-        text, resp = call_llm(None, messages=[{"role": "user", "content": "hi"}])
+        text, resp = call_llm(
+            None,
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.0,
+        )
         assert text == '{"ok": true}'
         assert resp.usage.prompt_tokens == 100
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert kwargs["model"] == "custom-endpoint"
+        assert "temperature" not in kwargs
 
     @patch("genie_space_optimizer.optimization.llm_client.get_openai_client")
     def test_retries_on_failure(self, mock_get_client):
@@ -328,10 +337,13 @@ class TestTracedLlmCallTokenUsage:
             "Say hello",
             span_name="test_span",
             max_retries=1,
+            temperature=0.0,
         )
 
         assert text == "hello"
         assert resp.usage.prompt_tokens == 42
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "temperature" not in kwargs
 
     @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
     def test_no_usage_no_crash(self, mock_get_client):
@@ -367,3 +379,239 @@ class TestBackwardCompatReexports:
     def test_openai_client_cache_accessible(self):
         from genie_space_optimizer.optimization.optimizer import _openai_client_cache
         assert isinstance(_openai_client_cache, dict)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _traced_llm_call — post-success response validator retry (F1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTracedLlmCallValidator:
+    """The validator closes the gap where a provider returns HTTP 200 with
+    non-JSON content. Before this change the caller raised JSONDecodeError
+    with no retry attempted; now the call-loop treats a validator rejection
+    exactly like an RPC failure and retries with the same exponential
+    backoff.
+    """
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    @patch("time.sleep", return_value=None)
+    def test_retries_on_validator_failure_then_succeeds(
+        self, _mock_sleep, mock_get_client,
+    ):
+        """First two attempts return non-JSON; third returns parseable JSON."""
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            _make_openai_response("I cannot help with that."),
+            _make_openai_response("<thinking>..."),
+            _make_openai_response('{"changes": []}'),
+        ]
+        mock_get_client.return_value = mock_client
+
+        text, _ = _traced_llm_call(
+            None, "system", "user",
+            span_name="test_validator_retry",
+            max_retries=3,
+            response_validator=lambda t: _extract_json(t, strict=True),
+        )
+
+        assert text.startswith("{")
+        assert mock_client.chat.completions.create.call_count == 3
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    @patch("time.sleep", return_value=None)
+    def test_raises_validator_error_after_exhausted_retries(
+        self, _mock_sleep, mock_get_client,
+    ):
+        """All attempts fail validation → raises the validator's exception."""
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_openai_response(
+            "not json at all"
+        )
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(json.JSONDecodeError):
+            _traced_llm_call(
+                None, "system", "user",
+                span_name="test_validator_exhausted",
+                max_retries=2,
+                response_validator=lambda t: _extract_json(t, strict=True),
+            )
+
+        assert mock_client.chat.completions.create.call_count == 2
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    def test_validator_none_preserves_legacy_behavior(self, mock_get_client):
+        """Without a validator, non-JSON text is returned verbatim; no retry."""
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_openai_response(
+            "not json at all"
+        )
+        mock_get_client.return_value = mock_client
+
+        text, _ = _traced_llm_call(
+            None, "system", "user",
+            span_name="test_no_validator",
+            max_retries=3,
+        )
+
+        assert text == "not json at all"
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    def test_validator_accepts_empty_response_via_extract_json(self, mock_get_client):
+        """Task 8 — ``_extract_json`` returns ``None`` on whitespace-only
+        input so the default (non-strict) validator passes without retry,
+        preserving the "empty batch = no changes" contract."""
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_openai_response("   ")
+        mock_get_client.return_value = mock_client
+
+        text, _ = _traced_llm_call(
+            None, "system", "user",
+            span_name="test_validator_empty",
+            max_retries=3,
+            response_validator=_extract_json,
+        )
+
+        assert text == ""
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    @patch("time.sleep", return_value=None)
+    def test_validator_passes_on_first_attempt_no_retry(
+        self, _mock_sleep, mock_get_client,
+    ):
+        """Happy path: valid JSON on first attempt → no retry."""
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_openai_response(
+            '{"changes": [{"table": "t", "column": "c"}]}'
+        )
+        mock_get_client.return_value = mock_client
+
+        text, _ = _traced_llm_call(
+            None, "system", "user",
+            span_name="test_validator_happy",
+            max_retries=3,
+            response_validator=lambda t: _extract_json(t, strict=True),
+        )
+
+        assert '"changes"' in text
+        assert mock_client.chat.completions.create.call_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# F6 — Last-response attachment on validator exhaustion
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTracedLlmCallLastResponseAttachment:
+    """F6 — _traced_llm_call must stamp the last HTTP 200 body onto the
+    raised exception so callers can log what the model actually returned,
+    not an empty string.
+    """
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    @patch("time.sleep", return_value=None)
+    def test_exhausted_validator_attaches_last_response_text(
+        self, _mock_sleep, mock_get_client,
+    ):
+        """After all validator retries fail, exc.last_response_text holds
+        the last non-JSON body we saw."""
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            _make_openai_response("first non-json"),
+            _make_openai_response("second non-json body"),
+        ]
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(json.JSONDecodeError) as exc_info:
+            _traced_llm_call(
+                None, "system", "user",
+                span_name="test_last_response",
+                max_retries=2,
+                response_validator=lambda t: _extract_json(t, strict=True),
+            )
+
+        assert getattr(exc_info.value, "last_response_text", None) == (
+            "second non-json body"
+        )
+        assert getattr(exc_info.value, "last_response_chars", None) == len(
+            "second non-json body"
+        )
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    @patch("time.sleep", return_value=None)
+    def test_exhausted_rpc_failures_attach_empty_string(
+        self, _mock_sleep, mock_get_client,
+    ):
+        """If every attempt fails *before* producing a body (e.g. RPC
+        errors), last_response_text is '' — not a crash."""
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = RuntimeError(
+            "network down"
+        )
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(RuntimeError, match="network down") as exc_info:
+            _traced_llm_call(
+                None, "system", "user",
+                span_name="test_rpc_fail",
+                max_retries=2,
+            )
+
+        # Attribute is set to '' rather than missing — callers use
+        # getattr with a default anyway, but attachment should be
+        # symmetric across failure classes.
+        assert getattr(exc_info.value, "last_response_text", None) == ""
+        assert getattr(exc_info.value, "last_response_chars", None) == 0
+
+    @patch("genie_space_optimizer.optimization.optimizer._get_openai_client")
+    @patch("time.sleep", return_value=None)
+    def test_validator_failure_then_rpc_failure_keeps_last_good_body(
+        self, _mock_sleep, mock_get_client,
+    ):
+        """Mixed failure sequence: first attempt returns HTTP 200 with a
+        body that fails validation, second attempt RPC-fails. The caller
+        should still see the first body since that was the last
+        successful HTTP 200."""
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        from genie_space_optimizer.optimization.optimizer import _traced_llm_call
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            _make_openai_response("not json body"),
+            RuntimeError("429 rate limited"),
+        ]
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(RuntimeError, match="429 rate limited") as exc_info:
+            _traced_llm_call(
+                None, "system", "user",
+                span_name="test_mixed_failures",
+                max_retries=2,
+                response_validator=lambda t: _extract_json(t, strict=True),
+            )
+
+        assert getattr(exc_info.value, "last_response_text", None) == (
+            "not json body"
+        )
