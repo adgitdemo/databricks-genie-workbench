@@ -25,12 +25,12 @@ A Databricks workspace with:
 - MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
 - Databricks Foundation Model APIs enabled for the curated Create Agent and Auto-Optimize model list
 
-### Enable required Public Preview features
+### Enable required preview features
 
-Once your workspace is available, enable these features in the **Preview Portal** before installing:
+Before installing, enable these on the Databricks **Previews** page (workspace admins manage preview toggles):
 
-- **Managed MLflow Prompt Registry**
-- **Databricks Apps – On-Behalf-Of User Authorization**
+- **Managed MLflow Prompt Registry** (Beta) — required for Auto-Optimize judge prompts
+- **Databricks Apps – On-Behalf-Of User Authorization** (Public Preview)
 
 :::note
 On-Behalf-Of User Authorization is what lets the app act as the signed-in user (OBO auth). Without it, Genie API calls that require user identity will fail. See [Authentication & Permissions](/docs/platform/authentication) for details.
@@ -98,7 +98,7 @@ The installer uses the shared `scripts.deploy_lib` Python library and notebook-n
 2. Generates a clean source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app` (excluding deploy-only files, docs, tests, notebooks, `scripts/`, `.git`, `.env*`, `node_modules`, and `requirements.txt`)
 3. Provisions the UC schema, volume, GSO tables, CDF, and permissions
 4. Provisions or attaches Lakebase when requested
-5. Creates or updates the `gso-optimization-job` via the SDK/Jobs API
+5. Creates or updates the GSO optimization job (`<app-name>-gso-optimization-job`) via the SDK/Jobs API
 6. Renders a patched `app.yaml` into the generated source folder and patches app OAuth scopes and resources
 7. Deploys the app from the generated source folder
 8. Grants the app SP access to visible Genie Spaces
@@ -142,14 +142,13 @@ The installer will:
 2. Ask for your Databricks CLI profile
 3. Ask for catalog (auto-discovered from your workspace)
 4. Ask for SQL warehouse (auto-discovered)
-5. Ask for LLM model endpoint
-6. Optionally configure MLflow tracing (creates or links an experiment)
-7. Ask for Lakebase Autoscaling project name
-8. Ask for app name
-9. Write `.env.deploy` with your configuration
-10. Run `scripts/deploy.sh` to build and deploy the app
-11. Resolve the app's service principal
-12. Optionally grant the SP access to your existing Genie Spaces
+5. Optionally configure MLflow tracing (creates or links an experiment)
+6. Ask for app name
+7. Ask for the Lakebase Autoscaling project (create / existing / skip)
+8. Write `.env.deploy` with your configuration (including the default LLM endpoint)
+9. Run `scripts/deploy.sh` to build and deploy the app
+10. Resolve the app's service principal
+11. Optionally grant the SP access to your existing Genie Spaces
 
 ## Lakebase (automated)
 
@@ -224,7 +223,7 @@ Set these in `.env.deploy` or as environment variables:
 | `GENIE_APP_NAME` | No | `genie-workbench` | Databricks App name (unique in workspace) |
 | `GENIE_DEPLOY_PROFILE` | No | `DEFAULT` | Databricks CLI profile name |
 | `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM serving endpoint |
-| `GENIE_LAKEBASE_INSTANCE` | No | `<app-name>` | Lakebase Autoscaling project name (auto-provisioned by deploy) |
+| `GENIE_LAKEBASE_INSTANCE` | No | empty | Lakebase Autoscaling project name (auto-provisioned by deploy); installer suggests `<app-name>-lakebase` |
 
 ## Manual Setup (Method 2, without installer)
 
@@ -263,8 +262,7 @@ All dependencies are pinned to exact versions with integrity hashes. Lock files 
 
 | File | Covers | Verification |
 |------|--------|-------------|
-| `uv.lock` | Root Python transitive deps | SHA256 hashes |
-| `packages/genie-space-optimizer/uv.lock` | GSO Python deps | SHA256 hashes |
+| `uv.lock` | Workspace-wide Python transitive deps (root + GSO) | SHA256 hashes |
 | `frontend/package-lock.json` | Frontend npm deps | SHA-512 integrity |
 | `packages/genie-space-optimizer/package-lock.json` | GSO UI npm deps | SHA-512 integrity |
 
