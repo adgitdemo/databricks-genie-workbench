@@ -5,27 +5,118 @@ description: "First-time setup, deploy commands, Lakebase, and the configuration
 
 # Deployment Guide
 
-Genie Workbench is deployed as a Databricks App using the provided deploy scripts. This guide covers first-time setup, subsequent deploys, teardown, and configuration.
+Genie Workbench is deployed as a Databricks App. This guide covers both supported install paths:
+
+- **Method 1 (Recommended): Databricks Workspace Notebook** — run `notebooks/install.py` directly inside the Databricks workspace UI, using notebook-native `WorkspaceClient()` authentication. No local terminal, CLI profile, Node, npm, or uv setup required.
+- **Method 2 (Backup): Local Terminal** — `scripts/install.sh` plus `scripts/deploy.sh`, using the Databricks CLI and Asset Bundles.
+
+Both paths deploy the same app and provision the same core resources. If you are already working inside Databricks, use Method 1.
 
 ## Prerequisites
 
+### Workspace resources
+
+A Databricks workspace with:
+
+- Apps enabled
+- A SQL Warehouse (Serverless recommended)
+- A Unity Catalog with CREATE SCHEMA permission
+- Lakebase Autoscaling available (optional but recommended for persistent scan history, starred spaces, and agent sessions)
+- MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
+- Databricks Foundation Model APIs enabled for the curated Create Agent and Auto-Optimize model list
+
+### Enable required Public Preview features
+
+Once your workspace is available, enable these features in the **Preview Portal** before installing:
+
+- **Managed MLflow Prompt Registry**
+- **Databricks Apps – On-Behalf-Of User Authorization**
+
+:::note
+On-Behalf-Of User Authorization is what lets the app act as the signed-in user (OBO auth). Without it, Genie API calls that require user identity will fail. See [Authentication & Permissions](/docs/platform/authentication) for details.
+:::
+
+### Installer permissions
+
+The installer creates apps, UC objects, Lakebase projects, MLflow experiments, and jobs, and grants the app service principal across all of them. **The person running the installer typically needs workspace-admin equivalents.** If you are uncertain, have a workspace admin run the installer. See [Authentication & Permissions](/docs/platform/authentication) for the full entitlement list.
+
+### Method 1 (notebook) prerequisites
+
+- The repo cloned into a Databricks Git folder (covered in the steps below)
+- A Serverless compute session (**environment v5**) that can run the notebook
+
+### Method 2 (local terminal) prerequisites
+
 - [Databricks CLI](https://docs.databricks.com/dev-tools/cli/install.html) **v0.297.2+** (validated by preflight)
 - [uv](https://docs.astral.sh/uv/) — Python package manager
-- Node.js 18+ and npm
+- Node.js ^20.19.0 or >=22.12.0 and npm
 - Python 3.11+
-- **Network access to `registry.npmjs.org`** — required to install frontend npm dependencies during the build step. If you are behind a corporate firewall or VPN that blocks this, you must either allowlist `registry.npmjs.org` or connect via a network that permits outbound HTTPS to it. The deploy script validates this connectivity during pre-flight checks.
-- A Databricks workspace with:
-  - Apps enabled
-  - A SQL Warehouse (Serverless recommended)
-  - A Unity Catalog with CREATE SCHEMA permission
-  - MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
+- **Network access to your npm registry** — required to install frontend npm dependencies during the build step. Databricks internal users can run `npm config set registry https://npm-proxy.dev.databricks.com/`; external users use `registry.npmjs.org`. If you are behind a corporate firewall or VPN that blocks this, allowlist the registry or connect via a network that permits outbound HTTPS to it. The deploy script validates this connectivity during pre-flight checks.
 
 ## First-Time Setup
+
+Choose one install path. Do not mix Method 1 and Method 2 for the same app instance unless you intentionally understand which source path is being deployed.
+
+## Method 1: Databricks Workspace Notebook (Recommended)
+
+Use this path when you are already working inside Databricks. It runs entirely in the workspace UI — no local terminal, CLI profile, Node, npm, or uv required.
+
+### 1. Clone the repo into your workspace
+
+In the Databricks workspace, go to **Workspace → Create → Git folder** and paste the repo URL:
+
+```
+https://github.com/databricks-solutions/databricks-genie-workbench.git
+```
+
+This creates a Git folder containing the full project, including `notebooks/install.py`.
+
+### 2. Run `notebooks/install.py`
+
+Open `notebooks/install.py`, attach a **Serverless** compute session (**environment v5**), set the notebook widgets, and **Run All**.
+
+| Widget | Required | Description |
+|--------|----------|-------------|
+| `app_name` | Yes | Databricks App name to create or update |
+| `catalog` | Yes | Unity Catalog where the optimizer writes its tables and artifacts |
+| `warehouse_id` | Yes | Serverless SQL Warehouse ID used by the app and GSO |
+| `lakebase_mode` | Yes | `create`, `existing`, or `skip` |
+| `lakebase_project_name` | Conditional | Lakebase project name for `create` or `existing`; defaults to `<app-name>-lakebase` for `create`. Leave blank when `lakebase_mode` is `skip` |
+
+:::note
+The notebook user must hold the [installer permissions](/docs/platform/authentication). The notebook automatically grants visible Genie Spaces to the app service principal, so the user needs `CAN_MANAGE` on each visible space they want the app to manage.
+:::
+
+<!-- TODO(screenshot): the installer notebook open in the workspace with widgets visible -->
+<!-- TODO(screenshot): example of the input variables filled in -->
+
+### 3. What the notebook does
+
+The installer uses the shared `scripts.deploy_lib` Python library and notebook-native `WorkspaceClient()` authentication. It:
+
+1. Creates or updates the Databricks App and resolves its service principal
+2. Generates a clean source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app` (excluding deploy-only files, docs, tests, notebooks, `scripts/`, `.git`, `.env*`, `node_modules`, and `requirements.txt`)
+3. Provisions the UC schema, volume, GSO tables, CDF, and permissions
+4. Provisions or attaches Lakebase when requested
+5. Creates or updates the `gso-optimization-job` via the SDK/Jobs API
+6. Renders a patched `app.yaml` into the generated source folder and patches app OAuth scopes and resources
+7. Deploys the app from the generated source folder
+8. Grants the app SP access to visible Genie Spaces
+
+The Git folder is never modified — the generated workspace folder is deployment output; do not edit it by hand.
+
+### 4. Updating a notebook-installed app
+
+Pull the latest repo changes in the Databricks Git folder, then rerun `notebooks/install.py` from the top with the same `app_name` and Lakebase widget values.
+
+## Method 2: Local Terminal Installer (Backup)
+
+Use this path when you prefer to deploy from a local machine with the Databricks CLI.
 
 ### 1. Clone the repo
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/databricks-solutions/databricks-genie-workbench.git
 cd databricks-genie-workbench
 ```
 
@@ -60,25 +151,27 @@ The installer will:
 11. Resolve the app's service principal
 12. Optionally grant the SP access to your existing Genie Spaces
 
-### 4. Lakebase (automated)
+## Lakebase (automated)
 
 Lakebase provides persistent storage for scan history, starred spaces, and agent sessions. Without it, the app uses in-memory storage (data lost on restart).
 
-**Lakebase setup is fully automated by `deploy.sh`:**
-- Creates a Lakebase Autoscaling project via the SDK (`scripts/setup_lakebase.py`)
+**Lakebase setup is fully automated by both install paths:**
+- Creates a Lakebase Autoscaling project via the SDK
 - Creates a Postgres role for the app's service principal
 - Grants database permissions (CONNECT, CREATE ON DATABASE)
 - Attaches the `postgres` resource to the app via the Apps API
 
 The app creates the `genie` schema and tables on first startup. Since the SP executes the DDL, it owns all objects — no manual grants needed.
 
-The installer asks for a Lakebase project name (defaults to the app name, stored as `GENIE_LAKEBASE_INSTANCE` in `.env.deploy`). No manual steps required.
+The notebook path reads the Lakebase project from the `lakebase_mode` / `lakebase_project_name` widgets. The local terminal path asks for a project name (defaults to the app name, stored as `GENIE_LAKEBASE_INSTANCE` in `.env.deploy`). No manual steps required for either.
 
 :::note
 The GRANT step requires `psycopg[binary]` in the project venv (installed by `uv sync`). If unavailable, the script prints the commands to run manually in the Lakebase SQL Editor.
 :::
 
 ## What `deploy.sh` Does
+
+This applies to **Method 2 (local terminal)**. The notebook installer runs the equivalent steps through the `scripts.deploy_lib` library instead — see [What the notebook does](#3-what-the-notebook-does).
 
 ### Full Deploy (8 steps)
 
@@ -133,9 +226,9 @@ Set these in `.env.deploy` or as environment variables:
 | `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM serving endpoint |
 | `GENIE_LAKEBASE_INSTANCE` | No | `<app-name>` | Lakebase Autoscaling project name (auto-provisioned by deploy) |
 
-## Manual Setup (without installer)
+## Manual Setup (Method 2, without installer)
 
-If you prefer non-interactive setup:
+If you prefer non-interactive local terminal setup:
 
 ### 1. Create `.env.deploy`
 
@@ -173,7 +266,7 @@ All dependencies are pinned to exact versions with integrity hashes. Lock files 
 | `uv.lock` | Root Python transitive deps | SHA256 hashes |
 | `packages/genie-space-optimizer/uv.lock` | GSO Python deps | SHA256 hashes |
 | `frontend/package-lock.json` | Frontend npm deps | SHA-512 integrity |
-| `packages/genie-space-optimizer/bun.lock` | GSO UI deps | Integrity hashes |
+| `packages/genie-space-optimizer/package-lock.json` | GSO UI npm deps | SHA-512 integrity |
 
 ### Updating Python dependencies
 
@@ -199,6 +292,10 @@ git add package.json package-lock.json
 ```
 
 ## Typical Workflow
+
+**Method 1 (notebook):** pull the latest repo changes in the Databricks Git folder and rerun `notebooks/install.py` from the top — for both first-time installs and updates.
+
+**Method 2 (local terminal):**
 
 ```bash
 # First time
