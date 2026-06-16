@@ -1,5 +1,5 @@
 ---
-sidebar_position: 4
+sidebar_position: 3
 description: "Benchmark-driven optimization: a 6-task pipeline, 5 levers, 3 gates, and 9 judges."
 ---
 
@@ -9,7 +9,7 @@ Auto-Optimize is a benchmark-driven optimization pipeline that measures Genie Sp
 
 ## Overview
 
-Unlike the [Fix Agent](/docs/features/fix-agent) (which applies targeted patches from scan findings), Auto-Optimize runs a **closed-loop pipeline**: it generates benchmarks, evaluates Genie's generated SQL against expected answers using specialized judges, identifies failure patterns, proposes and tests metadata changes, and only commits changes that pass multi-stage evaluation gates.
+Unlike the [IQ Scanner](/docs/features/iq-scanner) (which produces instant rule-based findings), Auto-Optimize runs a **closed-loop pipeline**: it generates benchmarks, evaluates Genie's generated SQL against expected answers using specialized judges, identifies failure patterns, proposes and tests metadata changes, and only commits changes that pass multi-stage evaluation gates.
 
 ## The 6-Task Pipeline
 
@@ -148,5 +148,4 @@ Users trigger optimization from the **Optimize** tab in the Space Detail view:
 
 - [Authentication & Permissions](/docs/platform/authentication) — SP-based execution model
 - [IQ Scanner](/docs/features/iq-scanner) — checks 11–12 evaluate optimization results
-- [Fix Agent](/docs/features/fix-agent) — the simpler, scan-driven alternative
 - [Operations Guide](/docs/platform/operations) — managing the GSO job

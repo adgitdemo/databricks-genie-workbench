@@ -24,7 +24,6 @@ const DOC_NAV = [
     items: [
       {label: 'Create Agent', to: '/docs/features/create-agent'},
       {label: 'IQ Scanner', to: '/docs/features/iq-scanner'},
-      {label: 'Fix Agent', to: '/docs/features/fix-agent'},
       {label: 'Auto-Optimize (GSO)', to: '/docs/features/auto-optimize'},
     ],
   },

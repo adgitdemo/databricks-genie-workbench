@@ -11,7 +11,6 @@ Genie Workbench is a unified developer tool for creating, scoring, and optimizin
 | 03 | [Authentication & Permissions](03-authentication-and-permissions.md) | OBO vs SP dual auth model, trigger flow, GRANT statements |
 | 04 | [Create Agent](04-create-agent.md) | Multi-turn LLM agent for building Genie Spaces from scratch |
 | 05 | [IQ Scanner](05-iq-scanner.md) | Rule-based quality scoring: 12 checks, 3 maturity tiers |
-| 06 | [Fix Agent](06-fix-agent.md) | Scan-to-patch pipeline: findings to JSON patches to Genie API |
 | 07 | [Auto-Optimize (GSO)](07-auto-optimize.md) | Benchmark-driven optimization: 6-stage DAG, levers, gates |
 | 08 | [Deployment Guide](08-deployment-guide.md) | Local terminal installer, Databricks notebook installer, Lakebase setup, configuration reference |
 | 09 | [Operations Guide](09-operations-guide.md) | Lakebase management, MLflow, monitoring, GSO job ops |

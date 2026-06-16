@@ -17,11 +17,6 @@ const CAPABILITIES = [
     to: '/docs/features/iq-scanner',
   },
   {
-    title: 'Fix',
-    body: 'An AI agent reads scan findings and generates targeted JSON patches to close configuration gaps.',
-    to: '/docs/features/fix-agent',
-  },
-  {
     title: 'Optimize',
     body: 'A benchmark-driven pipeline measures real accuracy, diagnoses failures, and iterates to a target.',
     to: '/docs/features/auto-optimize',

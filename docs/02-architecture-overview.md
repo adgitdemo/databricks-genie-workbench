@@ -52,7 +52,7 @@ The backend is a FastAPI application (`backend/main.py`) that provides REST API 
 | Router | Prefix | Purpose |
 |--------|--------|---------|
 | `analysis.py` | `/api` | Space fetch/parse, app settings, debug auth |
-| `spaces.py` | `/api` | Space listing, scanning, history, starring, fix agent |
+| `spaces.py` | `/api` | Space listing, scanning, history, starring |
 | `admin.py` | `/api/admin` | Org-wide dashboard, leaderboard, alerts |
 | `auth.py` | `/api/auth` | Current user info, health check |
 | `create.py` | `/api/create` | Create agent chat, UC discovery, wizard, session management |
@@ -67,7 +67,6 @@ See [Appendix A: API Reference](appendices/A-api-reference.md) for the complete 
 | Auth | `services/auth.py` | OBO `ContextVar` management, SP singleton, `WorkspaceClient` factory |
 | Genie Client | `services/genie_client.py` | Genie API: fetch space, list spaces, SP fallback on scope error |
 | Scanner | `services/scanner.py` | Rule-based IQ scoring (12 checks, 3 maturity tiers) |
-| Fix Agent | `services/fix_agent.py` | LLM-driven patch generation and Genie API application |
 | Create Agent | `services/create_agent.py` | Multi-turn tool-calling LLM agent for space creation |
 | Create Agent Tools | `services/create_agent_tools.py` | Tool definitions: UC discovery, SQL, config generation |
 | Create Agent Session | `services/create_agent_session.py` | Session persistence (L1 in-memory + L2 Lakebase) |
@@ -79,7 +78,7 @@ See [Appendix A: API Reference](appendices/A-api-reference.md) for the complete 
 
 ### Prompt Templates
 
-- `backend/prompts/` — templates for analysis and fix agent
+- `backend/prompts/` — templates for analysis
 - `backend/prompts_create/` — modular templates for the create agent (step detection, system prompts, tool instructions)
 - `backend/references/schema.md` — Genie Space JSON schema reference (needed at runtime)
 
@@ -129,11 +128,10 @@ The main Workbench app proxies GSO functionality through `backend/routers/auto_o
 
 ### SSE Streaming
 
-Two endpoints use Server-Sent Events via FastAPI's `StreamingResponse`:
+One endpoint uses Server-Sent Events via FastAPI's `StreamingResponse`:
 
 | Endpoint | Use |
 |----------|-----|
-| `/api/spaces/{id}/fix` | Fix agent progress + patches (10s keepalive) |
 | `/api/create/agent/chat` | Create agent events (15s keepalive) |
 
 The frontend consumes SSE via manual `fetch` + `ReadableStream` in `lib/api.ts` (not the `EventSource` API). Buffers are split on `\n\n` delimiters.

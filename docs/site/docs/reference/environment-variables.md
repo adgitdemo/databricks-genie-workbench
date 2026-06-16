@@ -21,7 +21,7 @@ These variables are defined in `app.yaml` and injected into the app runtime. Pla
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `LLM_MODEL` | `__LLM_MODEL__` | Databricks model serving endpoint for analysis, fix agent, create agent. Default: `databricks-claude-sonnet-4-6` |
+| `LLM_MODEL` | `__LLM_MODEL__` | Databricks model serving endpoint for analysis and the create agent. Default: `databricks-claude-sonnet-4-6` |
 
 ### SQL Warehouse
 

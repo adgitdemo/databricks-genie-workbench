@@ -31,7 +31,7 @@ Genie Workbench provides five capabilities that form a continuous improvement lo
 | **`serialized_space`** | The JSON configuration of a Genie Space, accessed via the Genie Conversation API. Contains `data_sources`, `instructions`, `config`, and `benchmarks` sections. |
 | **IQ Score** | A 0–12 score based on 12 binary checks. Each check evaluates one aspect of space configuration quality. |
 | **Maturity Tier** | One of three labels derived from the IQ Score: **Not Ready**, **Ready to Optimize**, or **Trusted**. |
-| **Finding** | A specific configuration gap identified by the IQ Scanner (e.g., "No join specifications for multi-table space"). Findings feed the Fix Agent. |
+| **Finding** | A specific configuration gap identified by the IQ Scanner (e.g., "No join specifications for multi-table space"), paired with a recommended next step. |
 | **Benchmark** | A question-answer pair used to measure Genie accuracy. The expected SQL is compared against Genie's generated SQL by specialized judges. |
 | **Lever** | An optimization strategy category in Auto-Optimize. Five lever types: tables/columns, metric views, TVFs, join specs, and instructions/example SQL. |
 | **Patch** | A targeted change to the `serialized_space` configuration, represented as a `field_path` + `new_value` pair. |
@@ -46,15 +46,13 @@ The features form a lifecycle that can be entered at any point and repeated as t
 ```mermaid
 flowchart LR
     Create["Create Agent"] --> Score["IQ Scan (Score)"]
-    Score --> Fix["Fix Agent"]
-    Fix --> Optimize["Auto-Optimize (GSO)"]
+    Score --> Optimize["Auto-Optimize (GSO)"]
     Optimize --> Track["Track (History)"]
     Track -. "re-scan · continuous improvement" .-> Score
 ```
 
 - **Create Agent** builds a new space from scratch (or updates an existing one).
-- **IQ Scanner** evaluates the space and produces findings.
-- **Fix Agent** applies targeted patches based on those findings.
+- **IQ Scanner** evaluates the space and produces findings with recommended next steps.
 - **Auto-Optimize** runs a deeper benchmark-driven pipeline for accuracy improvement.
 - **Track** persists all results to Lakebase so you can see progress over time.
 - The cycle repeats: after optimization, re-scan to see the updated score.

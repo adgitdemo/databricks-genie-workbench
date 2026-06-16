@@ -163,5 +163,4 @@ Agent sessions are persisted across page refreshes:
 ## Related Documentation
 
 - [IQ Scanner](/docs/features/iq-scanner) — run after creating a space to assess quality
-- [Fix Agent](/docs/features/fix-agent) — automatically fix issues found by the scanner
 - [Architecture Overview](/docs/getting-started/architecture-overview) — how the create agent fits in the app

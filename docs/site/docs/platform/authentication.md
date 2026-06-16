@@ -35,7 +35,7 @@ flowchart TB
 
 ### SSE streaming caveat
 
-For Server-Sent Events endpoints (fix agent, create agent), the `ContextVar` is **not** cleared after `call_next` in the middleware. This is because the response body streams lazily — the generator runs after the middleware returns. Streaming handlers stash the raw token on `request.state.user_token` and re-set it inside the generator function.
+For the Create Agent's Server-Sent Events endpoint, the `ContextVar` is **not** cleared after `call_next` in the middleware. This is because the response body streams lazily — the generator runs after the middleware returns. Streaming handlers stash the raw token on `request.state.user_token` and re-set it inside the generator function.
 
 ### What OBO protects
 
@@ -162,7 +162,6 @@ These are granted automatically by `scripts/grant_permissions.py` during deploym
 | Browse Genie Spaces, UC catalogs/schemas/tables | OBO (user) | `services/uc_client.py`, `routers/create.py` | User sees only what they have access to |
 | Genie API — fetch/list spaces | OBO → SP fallback | `services/genie_client.py` `_is_scope_error()` | User token may lack `dashboards.genie` scope |
 | Create Agent — tools, SQL, space creation | OBO (user) | `services/create_agent.py`, `services/create_agent_tools.py` | Space created under user identity |
-| Fix Agent — generate + apply patches | OBO (user) | `services/fix_agent.py` | Patches applied as the user |
 | Trigger optimization — permission check | OBO (user) | `integration/trigger.py` `user_can_edit_space()` | Verify user has CAN_EDIT/CAN_MANAGE |
 | Trigger optimization — SP entitlement check | SP | `integration/trigger.py` `sp_can_manage_space()` | Verify SP can manage the space |
 | Optimization job submission | SP | `backend/job_launcher.py` `submit_optimization()` | `jobs.run_now()` requires SP |

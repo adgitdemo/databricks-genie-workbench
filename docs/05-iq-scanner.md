@@ -1,6 +1,6 @@
 # IQ Scanner
 
-The IQ Scanner is a **deterministic, rule-based** quality assessment engine for Genie Space configurations. It evaluates 12 binary checks, assigns a maturity tier, and produces actionable findings that feed Quick Fix.
+The IQ Scanner is a **deterministic, rule-based** quality assessment engine for Genie Space configurations. It evaluates 12 binary checks, assigns a maturity tier, and produces actionable findings with recommended next steps.
 
 Unlike the LLM-based analysis tools, the scanner runs instantly with no LLM calls — it inspects the `serialized_space` JSON directly.
 
@@ -81,7 +81,7 @@ The scanner returns:
 }
 ```
 
-- **`findings`** and **`next_steps`** come from failed checks — these are the inputs for the [Quick Fix](06-fix-agent.md).
+- **`findings`** and **`next_steps`** come from failed checks — they tell you which configuration gaps to address and how.
 - **`warnings`** and **`warning_next_steps`** come from warning-severity checks — advisory guidance that doesn't block maturity progression.
 - Both lists are capped at 8 items.
 
@@ -131,6 +131,5 @@ Historical scans are available via `GET /api/spaces/{id}/history`.
 
 ## Related Documentation
 
-- [Quick Fix](06-fix-agent.md) — automatically fixes findings from the scanner
 - [Auto-Optimize](07-auto-optimize.md) — the optimization pipeline that satisfies checks 11–12
 - [Introduction](01-introduction.md) — how the scanner fits in the feature workflow

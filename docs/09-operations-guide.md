@@ -49,7 +49,7 @@ If `LAKEBASE_HOST` is not configured (no Lakebase attached), the app falls back 
 
 ### Experiment Tracking
 
-LLM calls in the fix agent, create agent, and optimization pipeline are traced via MLflow. Tracing is **optional** — controlled by the `MLFLOW_EXPERIMENT_ID` environment variable in `app.yaml`.
+LLM calls in the create agent and optimization pipeline are traced via MLflow. Tracing is **optional** — controlled by the `MLFLOW_EXPERIMENT_ID` environment variable in `app.yaml`.
 
 At startup, the app validates that the experiment ID exists in the workspace. If it doesn't, tracing is silently disabled (the variable is cleared).
 
