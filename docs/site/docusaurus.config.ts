@@ -170,7 +170,10 @@ const config: Config = {
           title: 'More',
           items: [
             {label: 'GitHub', href: `https://github.com/${ORG}/${REPO}`},
-            {label: 'Databricks Genie', href: 'https://docs.databricks.com/aws/en/genie/'},
+            {
+              label: 'Medium Blog',
+              href: 'https://medium.com/@jenny.j.park/getting-your-genie-spaces-production-ready-with-genie-workbench-e9e7db8a88ca',
+            },
           ],
         },
       ],
