@@ -217,6 +217,56 @@ h3 {
   border-color: #475569;
 }
 
+/* Footer: symmetric, consistent side gutter at every width. */
+.footer {
+  padding-inline: clamp(1.5rem, 5vw, 4rem);
+}
+
+/* Content-sized columns with controlled breakpoints (5 → 3 → 2 → 1), centered
+   with even gaps. Sizing columns to content (auto, not 1fr) guarantees the
+   longest label fits on one line; justify-content keeps the group centered and
+   overrides Infima's .row negative margins. */
+.footer__links {
+  display: grid;
+  grid-template-columns: repeat(5, auto);
+  justify-content: center;
+  gap: 2.5rem 4rem;
+  margin-inline: auto;
+  margin-bottom: 1rem;
+}
+/* Neutralize Infima's .col flex sizing inside the grid. */
+.footer__col {
+  flex: unset;
+  max-width: 100%;
+  margin-bottom: 0;
+  padding: 0;
+}
+/* Hard guarantee: no footer label ever wraps to a second line. */
+.footer__item,
+.footer__title {
+  white-space: nowrap;
+}
+
+/* 5 → 3 columns (2 rows: 3 + 2). Matches the navbar-collapse breakpoint. */
+@media (max-width: 1140px) {
+  .footer__links {
+    grid-template-columns: repeat(3, auto);
+  }
+}
+/* 3 → 2 columns (3 rows: 2 + 2 + 1). */
+@media (max-width: 768px) {
+  .footer__links {
+    grid-template-columns: repeat(2, auto);
+  }
+}
+/* 2 → 1 column (phones). */
+@media (max-width: 480px) {
+  .footer__links {
+    grid-template-columns: 1fr;
+    justify-content: stretch;
+  }
+}
+
 /* Accessibility: underline links inside doc content so they're distinguishable
    without relying on color alone (navbar/sidebar/cards keep their own affordances). */
 .markdown a {
