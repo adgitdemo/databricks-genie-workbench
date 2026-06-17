@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ─── In-process TTL cache ─────────────────────────────────────────────────
 _CACHE_TTL_SECONDS = 300
+_LONG_CACHE_TTL_SECONDS = 1800
 _CACHE_MAX = 256
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -70,13 +71,13 @@ def _cache_key(sql: str, parameters: list[StatementParameterListItem]) -> str:
     return f"{hash(sql)}|{json.dumps(bag)}"
 
 
-def _cache_get(key: str) -> list[dict[str, Any]] | None:
+def _cache_get(key: str, ttl_seconds: int = _CACHE_TTL_SECONDS) -> list[dict[str, Any]] | None:
     with _CACHE_LOCK:
         entry = _CACHE.get(key)
         if not entry:
             return None
         ts, rows = entry
-        if time.monotonic() - ts > _CACHE_TTL_SECONDS:
+        if time.monotonic() - ts > ttl_seconds:
             _CACHE.pop(key, None)
             return None
         return rows
@@ -88,6 +89,20 @@ def _cache_put(key: str, rows: list[dict[str, Any]]) -> None:
             oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
             _CACHE.pop(oldest, None)
         _CACHE[key] = (time.monotonic(), rows)
+
+
+def warm_cost_overview_cache(days: int = 7) -> None:
+    """Pre-run the Cost-tab overview queries so the cache is hot before users
+    hit the page. Call from a background task."""
+    for fn, kwargs in (
+        (workspace_summary, {"days": days}),
+        (daily_volume_all_spaces, {"days": days}),
+        (top_spenders, {"days": days, "limit": 10}),
+    ):
+        try:
+            fn(**kwargs)
+        except Exception:
+            logger.warning("warmup of %s failed", fn.__name__, exc_info=True)
 
 
 def _warehouse_id() -> str:
@@ -107,10 +122,11 @@ def _run(
     poll_total_seconds: int = 180,
     poll_interval_seconds: float = 2.0,
     track_health: bool = True,
+    ttl_seconds: int = _CACHE_TTL_SECONDS,
 ) -> list[dict[str, Any]]:
     global _SYSTEM_TABLES_ACCESSIBLE
     key = _cache_key(sql, parameters)
-    cached = _cache_get(key)
+    cached = _cache_get(key, ttl_seconds=ttl_seconds)
     if cached is not None:
         return cached
 
@@ -363,7 +379,7 @@ WHERE workspace_id IN ({placeholders})
 def top_spenders(days: int = 7, limit: int = 10) -> list[dict[str, Any]]:
     params = [_p("days", days, "INT"), _p("limit", limit, "INT")]
     sql = _TOP_SPENDERS_SQL.format(ws=_ws_clause(params))
-    rows = _run(sql, params)
+    rows = _run(sql, params, ttl_seconds=_LONG_CACHE_TTL_SECONDS)
     workspace_ids = {r.get("workspace_id") for r in rows if r.get("workspace_id")}
     names = _workspace_names(workspace_ids)
     for r in rows:
@@ -579,7 +595,7 @@ def workspace_summary(days: int = 7) -> dict[str, Any]:
     # only a single ws_id param is appended.
     params = [_p("days", days, "INT")]
     sql = _WORKSPACE_SUMMARY_SQL.format(ws=_ws_clause(params))
-    rows = _run(sql, params)
+    rows = _run(sql, params, ttl_seconds=_LONG_CACHE_TTL_SECONDS)
     return rows[0] if rows else {}
 
 
@@ -610,7 +626,7 @@ ORDER BY d.day
 def daily_volume_all_spaces(days: int = 30) -> list[dict[str, Any]]:
     params = [_p("days", days, "INT")]
     sql = _DAILY_VOLUME_ALL_SQL.format(ws=_ws_clause(params))
-    return _run(sql, params)
+    return _run(sql, params, ttl_seconds=_LONG_CACHE_TTL_SECONDS)
 
 
 _TOP_QUERIES_SQL = """
