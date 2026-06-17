@@ -195,6 +195,11 @@ async def startup():
     except Exception:
         logger.warning("iterations schema probe failed", exc_info=True)
 
+    # Pre-warm the Cost-tab overview cache in the background since it 
+    # takes a long time ro run.
+    from backend.watch.services.system_tables import warm_cost_overview_cache
+    asyncio.create_task(asyncio.to_thread(warm_cost_overview_cache, 7))
+
 
 @app.on_event("shutdown")
 async def shutdown():
