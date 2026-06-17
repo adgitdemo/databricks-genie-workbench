@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from typing import Optional
 
@@ -23,7 +24,7 @@ router = APIRouter(prefix="/api/watch")
 
 
 @router.get("/overview")
-async def workspace_overview(days: int = Query(7, ge=1, le=365)) -> dict:
+def workspace_overview(days: int = Query(7, ge=1, le=365)) -> dict:
     """Workspace-wide KPIs + daily query volume for the native cost-tab overview."""
     days = validate_days(days, default=7)
     summary = system_tables.workspace_summary(days=days)
@@ -45,7 +46,7 @@ async def workspace_overview(days: int = Query(7, ge=1, le=365)) -> dict:
 
 
 @router.get("/spaces/{space_id}/cost")
-async def get_space_cost(space_id: str, days: int = Query(7, ge=1, le=365)) -> dict:
+def get_space_cost(space_id: str, days: int = Query(7, ge=1, le=365)) -> dict:
     sid = validate_space_id(space_id)
     days = validate_days(days, default=7)
 
@@ -99,7 +100,7 @@ async def get_space_cost(space_id: str, days: int = Query(7, ge=1, le=365)) -> d
 @router.get("/cost/top")
 async def top_spenders(days: int = Query(7, ge=1, le=365), limit: int = Query(10, ge=1, le=200)) -> list[dict]:
     days = validate_days(days, default=7)
-    rows = system_tables.top_spenders(days=days, limit=limit)
+    rows = await asyncio.to_thread(system_tables.top_spenders, days=days, limit=limit)
 
     # Genie space titles aren't in the system tables; resolve them from the
     # space cache (same source SpacesList uses). Best-effort: a missing cache
@@ -128,7 +129,7 @@ async def top_spenders(days: int = Query(7, ge=1, le=365), limit: int = Query(10
 
 
 @router.get("/spaces/{space_id}/cost/top-queries")
-async def top_expensive_queries(
+def top_expensive_queries(
     space_id: str,
     days: int = Query(7, ge=1, le=365),
     limit: int = Query(20, ge=1, le=100),
@@ -139,7 +140,7 @@ async def top_expensive_queries(
 
 
 @router.get("/spaces/{space_id}/cost/conversations")
-async def cost_per_conversation(
+def cost_per_conversation(
     space_id: str,
     days: int = Query(7, ge=1, le=365),
     limit: int = Query(50, ge=1, le=500),
