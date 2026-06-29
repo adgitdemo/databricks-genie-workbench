@@ -85,7 +85,7 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           routeBasePath: '/docs',
-          editUrl: `https://github.com/${ORG}/${REPO}/tree/main/docs/site/`,
+          editUrl: `https://github.com/${ORG}/${REPO}/tree/main/docs/`,
         },
         blog: false,
         theme: {

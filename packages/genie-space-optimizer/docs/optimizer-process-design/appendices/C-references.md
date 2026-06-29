@@ -6,12 +6,12 @@ This appendix gathers the internal documents, code anchors, and external referen
 
 ### Workbench-level
 
-- [`docs/00-index.md`](../../../../../docs/00-index.md) — repo-root documentation hub.
-- [`docs/07-auto-optimize.md`](../../../../../docs/07-auto-optimize.md) — operator-level overview of the auto-optimize feature in the Workbench app.
-- [`docs/03-authentication-and-permissions.md`](../../../../../docs/03-authentication-and-permissions.md) — OBO + SP dual auth model relied on by deploy.
-- [`docs/04-create-agent.md`](../../../../../docs/04-create-agent.md) — Create Agent flow that produces the spaces GSO optimizes.
-- [`docs/gsl-instruction-schema.md`](../../../../../docs/gsl-instruction-schema.md) — near-term GSL instruction schema; Lever 5 must comply.
-- [`docs/appendices/A-api-reference.md`](../../../../../docs/appendices/A-api-reference.md) — API reference for the Workbench backend.
+- [`docs/archives/00-index.md`](../../../../../docs/archives/00-index.md) — repo-root documentation hub.
+- [`docs/archives/07-auto-optimize.md`](../../../../../docs/archives/07-auto-optimize.md) — operator-level overview of the auto-optimize feature in the Workbench app.
+- [`docs/archives/03-authentication-and-permissions.md`](../../../../../docs/archives/03-authentication-and-permissions.md) — OBO + SP dual auth model relied on by deploy.
+- [`docs/archives/04-create-agent.md`](../../../../../docs/archives/04-create-agent.md) — Create Agent flow that produces the spaces GSO optimizes.
+- [`docs/archives/gsl-instruction-schema.md`](../../../../../docs/archives/gsl-instruction-schema.md) — near-term GSL instruction schema; Lever 5 must comply.
+- [`docs/archives/appendices/A-api-reference.md`](../../../../../docs/archives/appendices/A-api-reference.md) — API reference for the Workbench backend.
 
 ### Package-level
 

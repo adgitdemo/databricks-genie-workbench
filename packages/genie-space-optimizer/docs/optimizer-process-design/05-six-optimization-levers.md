@@ -167,7 +167,7 @@ Lever 0 sits outside this taxonomy because it is a **task** (Enrichment) rather 
 
 **Risk profile:** Medium-high. Instructions are global — a single edit can affect every question. Teaching-safety gates check for contradictions with existing sections; structural gates validate against the GSL near-term schema; regression guardrails check accepted themes don't break.
 
-**Special note:** Lever 5 must respect the GSL near-term schema documented in `docs/gsl-instruction-schema.md` (in the workbench app). The fix agent and create agent share this contract.
+**Special note:** Lever 5 must respect the GSL near-term schema documented in `docs/archives/gsl-instruction-schema.md` (in the workbench app). The fix agent and create agent share this contract.
 
 ## Lever 6 — SQL Expressions
 

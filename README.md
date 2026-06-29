@@ -29,7 +29,7 @@ The recommended install path is the Databricks notebook installer.
 
 The notebook uses notebook-native `WorkspaceClient()` auth, creates a generated deployment source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app`, patches `app.yaml` there, provisions UC/Lakebase/GSO resources, and deploys the Databricks App from that generated source. The Git folder remains unchanged.
 
-For widget details, prerequisites, Lakebase behavior, updates, and troubleshooting, see [docs/08-deployment-guide.md](docs/08-deployment-guide.md).
+For widget details, prerequisites, Lakebase behavior, updates, and troubleshooting, see [docs/archives/08-deployment-guide.md](docs/archives/08-deployment-guide.md).
 
 ### Local Terminal Installer
 
@@ -82,21 +82,21 @@ The installer creates a Databricks App, UC schema/volume/tables, a Lakebase Auto
 - `CAN_MANAGE` on any Genie Spaces being granted to the app SP (optional step)
 - Workspace admin to enable MLflow Prompt Registry, if it is not already on
 
-For the full list and a step-by-step mapping (install action → required permission → code reference), see [docs/03-authentication-and-permissions.md → Installer Permissions](docs/03-authentication-and-permissions.md#installer-permissions).
+For the full list and a step-by-step mapping (install action → required permission → code reference), see [docs/archives/03-authentication-and-permissions.md → Installer Permissions](docs/archives/03-authentication-and-permissions.md#installer-permissions).
 
 ## Documentation
 
-Start with [docs/00-index.md](docs/00-index.md) for the full documentation map.
+Start with [docs/archives/00-index.md](docs/archives/00-index.md) for the full documentation map.
 
 Common references:
 
-- [Deployment Guide](docs/08-deployment-guide.md): notebook and local installer flows, Lakebase setup, updates, teardown
-- [Architecture Overview](docs/02-architecture-overview.md): backend, frontend, persistence, deployment design
-- [Authentication & Permissions](docs/03-authentication-and-permissions.md): OBO vs service principal behavior and required grants
-- [Auto-Optimize](docs/07-auto-optimize.md): GSO optimization pipeline
-- [Operations Guide](docs/09-operations-guide.md): Lakebase, MLflow, app logs, GSO job operations
-- [Troubleshooting](docs/appendices/B-troubleshooting.md): common install and runtime failures
-- [Environment Variables](docs/appendices/C-environment-variables.md): `app.yaml`, `.env.deploy`, and notebook widget variable flow
+- [Deployment Guide](docs/archives/08-deployment-guide.md): notebook and local installer flows, Lakebase setup, updates, teardown
+- [Architecture Overview](docs/archives/02-architecture-overview.md): backend, frontend, persistence, deployment design
+- [Authentication & Permissions](docs/archives/03-authentication-and-permissions.md): OBO vs service principal behavior and required grants
+- [Auto-Optimize](docs/archives/07-auto-optimize.md): GSO optimization pipeline
+- [Operations Guide](docs/archives/09-operations-guide.md): Lakebase, MLflow, app logs, GSO job operations
+- [Troubleshooting](docs/archives/appendices/B-troubleshooting.md): common install and runtime failures
+- [Environment Variables](docs/archives/appendices/C-environment-variables.md): `app.yaml`, `.env.deploy`, and notebook widget variable flow
 
 ## Development Notes
 

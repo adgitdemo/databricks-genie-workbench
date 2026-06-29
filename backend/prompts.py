@@ -290,7 +290,7 @@ _VALID_FIELD_PATHS_BLOCK = """## Valid Field Paths (ONLY use these exact names p
 - `data_sources.metric_views[N].identifier` — string (same structure as tables)
 
 **instructions:**
-- `instructions.text_instructions[N].content` — array of strings (max 1 per space). Holds the agent's natural-language guidance organized under canonical GSL `## Section` headers (`## PURPOSE`, `## DISAMBIGUATION`, `## DATA QUALITY NOTES`, `## CONSTRAINTS`, `## Instructions you must follow when providing summaries`). When patching, **preserve every existing `## Section` header** — only edit bullets within a section or add a new section at the correct position. See `docs/gsl-instruction-schema.md`.
+- `instructions.text_instructions[N].content` — array of strings (max 1 per space). Holds the agent's natural-language guidance organized under canonical GSL `## Section` headers (`## PURPOSE`, `## DISAMBIGUATION`, `## DATA QUALITY NOTES`, `## CONSTRAINTS`, `## Instructions you must follow when providing summaries`). When patching, **preserve every existing `## Section` header** — only edit bullets within a section or add a new section at the correct position. See `docs/archives/gsl-instruction-schema.md`.
 - `instructions.example_question_sqls[N].question` — array of strings
 - `instructions.example_question_sqls[N].sql` — array of strings (each line as element)
 - `instructions.example_question_sqls[N].usage_guidance` — array of strings

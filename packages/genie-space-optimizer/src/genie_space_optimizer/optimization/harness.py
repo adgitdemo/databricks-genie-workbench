@@ -9625,7 +9625,7 @@ def _extract_arbiter_approved_benchmarks(
     """Return the subset of ``benchmarks`` whose baseline arbiter verdict
     was ``both_correct`` ONLY.
 
-    Per docs/gsl-instruction-schema.md design decision:
+    Per docs/archives/gsl-instruction-schema.md design decision:
 
     * ``both_correct`` — Genie and the benchmark's ``expected_sql`` both
       produce the same correct result. The ``expected_sql`` is gold

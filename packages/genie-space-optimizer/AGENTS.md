@@ -278,7 +278,8 @@ break the delta view.
   (owned by the frontend team; GSO only exposes the backend contract).
 - Run-detail pre/post IQ delta widget (GSO guarantees two rows per run;
   the widget itself is a frontend deliverable).
-- Repo-root `docs/` audit and the fate of `docs/06-fix-agent.md`.
+- Repo-root `docs/` audit (the flat docs are now archived under `docs/archives/`;
+  the former `06-fix-agent.md` was removed when the Fix Agent left the UI).
 - End-to-end validation in `tests/test_e2e_deployed.py`.
 
 ### Evaluation hang defense (default ON)

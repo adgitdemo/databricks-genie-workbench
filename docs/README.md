@@ -6,7 +6,7 @@ Docusaurus 3 site for the Genie Workbench docs, styled with Databricks branding
 ## Local development
 
 ```bash
-cd docs/site
+cd docs
 npm install      # first time
 npm start        # dev server at http://localhost:3000/databricks-genie-workbench/
 npm run build    # production build into ./build
@@ -20,7 +20,7 @@ in repo Settings → Pages). There is no CI workflow — the built site is pushe
 `gh-pages` manually:
 
 ```bash
-cd docs/site
+cd docs
 npm run build                                  # produces ./build
 # push ./build to the gh-pages branch (e.g. with the `gh-pages` CLI,
 # `docusaurus deploy`, or a manual git push of the build output)
@@ -40,4 +40,4 @@ processing).
 - `docusaurus.config.ts` — site config, navbar, plugins (Mermaid, search, image zoom).
 
 Source markdown is ported from the repo's top-level `docs/*.md`. See
-`docs/site/docs/` for the site copy.
+`docs/docs/` for the site copy.
