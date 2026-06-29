@@ -68,6 +68,11 @@ const config: Config = {
   },
   themes: ['@docusaurus/theme-mermaid'],
 
+  // Post-render enhancer that rewrites the two row-to-row connectors of the
+  // "Optimization Trigger Flow" diagram into node-to-node elbow connectors
+  // (Mermaid can't draw those natively without collapsing the 3x3 grid).
+  clientModules: [require.resolve('./src/js/triggerFlowElbows.js')],
+
   i18n: {
     defaultLocale: 'en',
     locales: ['en'],

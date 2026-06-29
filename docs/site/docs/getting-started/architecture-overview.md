@@ -10,26 +10,54 @@ Genie Workbench is a full-stack application deployed as a [Databricks App](https
 ## High-Level Architecture
 
 ```mermaid
+%%{init: {'flowchart': {'wrappingWidth': 330, 'rankSpacing': 16, 'subGraphTitleMargin': {'top': 16, 'bottom': 10}}, 'themeVariables': {'fontSize': '24px'}}}%%
 flowchart TB
-    proxy["Reverse Proxy (OBO)<br/>x-forwarded-access-token injection"]
     subgraph platform["Databricks Apps Platform"]
+        direction TB
+        pTop[" "]
+        proxy["Reverse Proxy (OBO)<br/>x-forwarded-access-token injection"]
         subgraph backend["FastAPI Backend (uvicorn)"]
-            routers["Routers<br/>/api/*"]
-            services["Services<br/>auth · genie · llm · lakebase · scanner"]
-            static["Static File Server<br/>frontend/dist/"]
+            direction TB
+            subgraph bRow[" "]
+                direction LR
+                subgraph bRouters["Routers"]
+                    rContent["analysis · spaces · admin<br/>auth · create · auto_optimize"]
+                end
+                subgraph bServices["Services"]
+                    sContent["auth · genie · llm<br/>lakebase · scanner"]
+                end
+                subgraph bStatic["Static File Server"]
+                    stContent["assets · fonts · favicon"]
+                end
+                bRouters ~~~ bServices ~~~ bStatic
+            end
         end
         subgraph ext["External Services"]
-            genie["Genie API"]
-            uc["Unity Catalog"]
-            wh["SQL Warehouse"]
-            ms["Model Serving"]
-            lb["Lakebase"]
-            mlflow["MLflow"]
-            delta["Delta (GSO state)"]
+            direction TB
+            subgraph eRow1[" "]
+                direction LR
+                genie["Genie API"] ~~~ uc["Unity Catalog"] ~~~ wh["SQL Warehouse"] ~~~ ms["Model Serving"]
+            end
+            subgraph eRow2[" "]
+                direction LR
+                lb["Lakebase"] ~~~ mlflow["MLflow"] ~~~ delta["Delta (GSO state)"]
+            end
+            eRow1 ~~~ eRow2
         end
+        pTop ~~~ proxy
+        proxy ---> backend
+        backend ---> ext
     end
-    proxy --> backend
-    backend --> ext
+
+    style bRow fill:none,stroke:none
+    style pTop fill:none,stroke:none
+    style eRow1 fill:none,stroke:none
+    style eRow2 fill:none,stroke:none
+
+    class platform gw-l0
+    class backend,ext gw-l1
+    class bRouters,bServices,bStatic gw-l2
+    class proxy,rContent,sContent,stContent,genie,uc,wh,ms,lb,mlflow,delta gw-node
 ```
 
 ## Backend Structure

@@ -290,3 +290,149 @@ html[data-theme='dark'] .edgeLabel p {
   color: #e6edf3 !important;
   background-color: transparent !important;
 }
+
+/* Architecture diagram: nested gray surfaces that echo the page's tonal system
+   (page background -> elevated surface -> code chip). Tagged via gw-* classes in
+   the Mermaid source; theme-scoped so they match tables/figures in both themes.
+   Dark-mode fills/strokes are sampled from the docs tables so the diagram shares
+   one colorway with them: #192429 base, #293338 elevated, #303a3f code chip, with
+   #3f484c (dividers) and #62676f (chip outline) borders. Keep these in sync if the
+   table palette changes. */
+.docusaurus-mermaid-container g.cluster.gw-l0 > rect { fill: #f6f7f8 !important; stroke: #d0d7de !important; }
+.docusaurus-mermaid-container g.cluster.gw-l1 > rect { fill: #eef0f2 !important; stroke: #d0d7de !important; }
+.docusaurus-mermaid-container g.cluster.gw-l2 > rect { fill: #e6e9eb !important; stroke: #cdd3d8 !important; }
+.docusaurus-mermaid-container g.node.gw-node > rect { fill: #ffffff !important; stroke: #c2c8cd !important; }
+
+html[data-theme='dark'] .docusaurus-mermaid-container g.cluster.gw-l0 > rect { fill: #192429 !important; stroke: #3f484c !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container g.cluster.gw-l1 > rect { fill: #293338 !important; stroke: #3f484c !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container g.cluster.gw-l2 > rect { fill: #293338 !important; stroke: #3f484c !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container g.node.gw-node > rect { fill: #303a3f !important; stroke: #62676f !important; }
+
+/* Connector arrows: neutral table border gray to match the recolored surfaces. */
+html[data-theme='dark'] .docusaurus-mermaid-container .flowchart-link { stroke: #62676f !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container .marker { fill: #62676f !important; stroke: #62676f !important; }
+
+/* Enlarge only the top-level platform title (gw-l0). The init fontSize is global, so
+   per-title sizing is done here; the direct-child selector avoids touching the nested
+   backend/External titles, and overflow:visible prevents clipping the larger label. */
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label .nodeLabel,
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label span,
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label p { font-size: 34px !important; }
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label foreignObject { overflow: visible !important; }
+/* The 34px size above is applied after layout, so dagre centered the label for the
+   original (smaller) width and the bigger text overflows rightward. Re-center the
+   label group on the foreignObject's own center so the enlarged title stays centered. */
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label foreignObject > div {
+  position: absolute !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  width: max-content !important;
+  white-space: nowrap !important;
+}
+
+/* Section titles (backend, External Services) one step larger than node text for
+   hierarchy. Same after-layout overflow/centering caveat as gw-l0 above. */
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label .nodeLabel,
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label span,
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label p { font-size: 28px !important; }
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label foreignObject { overflow: visible !important; }
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label foreignObject > div {
+  position: absolute !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  width: max-content !important;
+  white-space: nowrap !important;
+}
+
+/* External Services: pull the bottom row (eRow2) up so the inter-row gap is 2/3 of the
+   layout default, then trim the section + platform rectangles by the same amount so the
+   row->bottom-edge gap and outer padding are preserved. Mermaid's spacing config is
+   global, so this post-layout overlay is the only way to retune just this one gap
+   without disturbing the backend section above. Uses `translate:` (NOT `transform:`) so
+   it COMPOSES with the dagre-generated transform on the group instead of replacing it.
+   The px values are tied to the current diagram geometry and would need re-tuning if the
+   External Services node set changes. */
+.docusaurus-mermaid-container g.root:has(> g.clusters > g.cluster[id$="eRow2"]) {
+  translate: 0 -54px;            /* 162px gap -> 108px (2/3) */
+}
+.docusaurus-mermaid-container g.cluster[id$="ext"] > rect {
+  height: 428px;                 /* current 482 - 54: bottom edge follows the row up */
+}
+.docusaurus-mermaid-container g.cluster[id$="platform"] > rect {
+  height: 1269px;                /* 1308 - 54 + 15: extra ~10px bottom padding below External Services */
+}
+
+/* Create Agent page: enlarge each step node's first line (the title) by 6px for
+   hierarchy over its description line. Both lines live in one <p> split by <br>; the
+   node div is white-space:nowrap, so ::first-line targets exactly the title. Page-scoped
+   via the Docusaurus per-doc <html> class so only this diagram is affected; `1em` resolves
+   to the node's 16px base, so calc() is exactly +6px and survives a base-size change.
+   The descriptions carry manual <br> breaks in the Mermaid source so dagre sizes each box
+   tall enough to fit the wrapped text; overflow:visible is a safety net so the enlarged
+   title (sized by dagre at the 16px base, rendered at 22px) is never clipped. */
+html.docs-doc-id-features\/create-agent
+  .docusaurus-mermaid-container g.node .nodeLabel p::first-line {
+  font-size: calc(1em + 6px) !important;
+}
+html.docs-doc-id-features\/create-agent
+  .docusaurus-mermaid-container g.node foreignObject {
+  overflow: visible !important;
+}
+/* Center the wrapped label on both axes inside the box. Mermaid's inline
+   `display:table-cell; max-width:200px` on the label div leaves the text off-center once
+   the descriptions wrap narrower than 200px (the div renders wider than the dagre-sized
+   foreignObject, so the centered text centers on the div, not the box). Flex-centering the
+   div to fill the foreignObject fixes the horizontal offset, and centering the now-taller
+   content (22px first line) on the foreignObject's middle keeps it vertically centered. */
+html.docs-doc-id-features\/create-agent
+  .docusaurus-mermaid-container g.node foreignObject > div {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+}
+
+/* Auto-Optimize page, Lever Loop diagram only: enlarge each node's first line (the title)
+   by 2px for hierarchy over its description. Scoped to this page via the per-doc <html> class,
+   and to this one diagram via :has() on the unique `gate` node so the 6-Task Pipeline diagram
+   on the same page is untouched. overflow:visible is a safety net so the slightly taller title
+   (sized by dagre at the 16px base, rendered at 18px) is never clipped. */
+html.docs-doc-id-features\/auto-optimize
+  .docusaurus-mermaid-container:has(g.node[id*="flowchart-gate-"])
+  g.node .nodeLabel p::first-line {
+  font-size: calc(1em + 4px) !important;
+}
+html.docs-doc-id-features\/auto-optimize
+  .docusaurus-mermaid-container:has(g.node[id*="flowchart-gate-"])
+  g.node foreignObject {
+  overflow: visible !important;
+}
+/* Center the wrapped label on both axes inside each box. Mermaid's inline
+   `display:table-cell; max-width:200px` on the label div leaves the text off-center once the
+   enlarged title makes the div render wider than the dagre-sized foreignObject; flex-centering
+   the div to fill the foreignObject fixes both the horizontal offset and vertical centering. */
+html.docs-doc-id-features\/auto-optimize
+  .docusaurus-mermaid-container:has(g.node[id*="flowchart-gate-"])
+  g.node foreignObject > div {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+}
+
+/* Doc sidebar: size the sticky box to its content so a short nav list stays fully pinned
+   and visible. Only scroll the menu once it is genuinely taller than the viewport. */
+@media (min-width: 997px) {
+  .theme-doc-sidebar-container > div {
+    height: fit-content;
+    max-height: 100vh;
+  }
+  .theme-doc-sidebar-container .menu.thin-scrollbar {
+    max-height: calc(100vh - var(--ifm-navbar-height));
+    overflow-y: auto;
+  }
+}

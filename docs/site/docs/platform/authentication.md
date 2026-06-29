@@ -10,11 +10,13 @@ This is the authoritative reference for how identity and authorization work in G
 ## Overview
 
 ```mermaid
-flowchart TB
+flowchart LR
     browser["Browser"] --> proxy["Reverse Proxy"]
     proxy -->|"injects x-forwarded-access-token"| backend["FastAPI Backend"]
     backend -->|"reads header → ContextVar"| obo["OBO WorkspaceClient<br/>(per-request)"]
     backend --> sp["SP WorkspaceClient<br/>(singleton · platform env vars)"]
+    classDef box font-size:20px;
+    class browser,proxy,backend,obo,sp box;
 ```
 
 ## OBO (On-Behalf-Of) Authentication
@@ -82,15 +84,24 @@ Reads and writes to the optimizer state tables (12 Delta tables under `GSO_CATAL
 When a user triggers Auto-Optimize, the app uses **both** identities in a carefully sequenced flow:
 
 ```mermaid
+%%{init: {'flowchart': {'wrappingWidth': 250}}}%%
 flowchart TB
-    click(["User clicks Optimize"]) --> trigger["POST /api/auto-optimize/trigger"]
-    trigger --> s1["1 · user_can_edit_space (OBO)<br/>verify CAN_EDIT / CAN_MANAGE — reject if unauthorized"]
-    s1 --> s2["2 · fetch_space_config<br/>OBO first, then SP fallback"]
-    s2 --> s3["3 · fetch_uc_metadata (OBO)<br/>respects user visibility"]
-    s3 --> s4["4 · sp_can_manage_space (SP)<br/>reject if SP lacks access"]
-    s4 --> s5["5 · wh_create_run (OBO)<br/>insert run row in Delta"]
-    s5 --> s6["6 · submit_optimization (SP)<br/>jobs.run_now() → Lakeflow Job"]
-    s6 --> s7["7 · 6-task DAG executes as SP<br/>preflight → baseline → enrichment → lever_loop → finalize → deploy"]
+    subgraph r1 [" "]
+        direction LR
+        click(["User clicks Optimize"]) --> trigger["POST /api/auto-optimize/trigger"] --> s1["1 · user_can_edit_space (OBO)<br/>verify CAN_EDIT / CAN_MANAGE<br/>— reject if unauthorized"]
+    end
+    subgraph r2 [" "]
+        direction LR
+        s2["2 · fetch_space_config<br/>OBO first, then SP fallback"] --> s3["3 · fetch_uc_metadata (OBO)<br/>respects user visibility"] --> s4["4 · sp_can_manage_space (SP)<br/>reject if SP lacks access"]
+    end
+    subgraph r3 [" "]
+        direction LR
+        s5["5 · wh_create_run (OBO)<br/>insert run row in Delta"] --> s6["6 · submit_optimization (SP)<br/>jobs.run_now() → Lakeflow Job"] --> s7["7 · 6-task DAG executes (SP)<br/>preflight → baseline →<br/>enrichment → lever_loop →<br/>finalize → deploy"]
+    end
+    r1 --> r2 --> r3
+    style r1 fill:none,stroke:none
+    style r2 fill:none,stroke:none
+    style r3 fill:none,stroke:none
 ```
 
 **Source:** `packages/genie-space-optimizer/src/genie_space_optimizer/integration/trigger.py` — `trigger_optimization()`

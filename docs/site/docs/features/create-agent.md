@@ -13,11 +13,11 @@ The agent follows a structured progression through six steps. Each step focuses 
 
 ```mermaid
 flowchart LR
-    req["Requirements<br/>what does the space need to do?"] --> ds["Data Sources<br/>which tables and schemas?"]
-    ds --> insp["Inspection<br/>profile columns · assess quality"]
-    insp --> plan["Plan<br/>generate and present the plan"]
-    plan --> cfg["Config Create<br/>build · validate · deploy"]
-    cfg --> post["Post-Creation<br/>summary and next steps"]
+    req["Requirements<br/>what does the space<br/>need to do?"] --> ds["Data Sources<br/>which tables and<br/>schemas?"]
+    ds --> insp["Inspection<br/>profile columns ·<br/>assess quality"]
+    insp --> plan["Plan<br/>generate and present<br/>the plan"]
+    plan --> cfg["Config Create<br/>build · validate ·<br/>deploy"]
+    cfg --> post["Post-Creation<br/>summary and next<br/>steps"]
 ```
 
 ### Step Descriptions

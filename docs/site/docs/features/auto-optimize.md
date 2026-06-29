@@ -31,49 +31,106 @@ flowchart LR
 | 1 | **Preflight** | Validate prerequisites | Check SP permissions, verify benchmark questions, validate table access, ensure Prompt Registry is enabled |
 | 2 | **Baseline Evaluation** | Measure current accuracy | Run all benchmark questions through Genie, evaluate with 9 judges, establish baseline score |
 | 3 | **Enrichment** | Gather optimization context | Proactive metadata enrichment — profile tables, analyze query patterns, identify improvement opportunities |
-| 4 | **Lever Loop** | Iterative optimization | The core loop: cluster failures → pick levers → generate patches → 3-gate evaluation → accept or rollback |
+| 4 | **Lever Loop** | Iterative optimization | The core loop: RCA-ground failures → cluster → pick one action group (cluster + lever) → generate patches → safety gates → apply → re-evaluate → accept or roll back |
 | 5 | **Finalize** | Consolidate results | Merge accepted patches, validate final configuration, compute final accuracy |
 | 6 | **Deploy** | Apply to space | Optionally apply the optimized configuration to the live Genie Space |
 
-## The 5 Lever Categories
+## The Levers
 
-Levers are categories of metadata changes the optimizer can apply. Each lever targets a different aspect of the space configuration:
+Levers are the categories of metadata change the optimizer can apply. **Lever 0 (Proactive Enrichment)** always runs first — in the Enrichment task — and is not user-selectable. **Levers 1–6** are the adaptive levers the lever loop chooses from; they can be selected per run from the Optimize tab.
 
-| Lever | Target | Examples |
-|-------|--------|----------|
-| **Tables/Columns** | Table and column metadata | Add descriptions, synonyms, entity matching, format assistance |
-| **Metric Views** | Pre-computed metric definitions | Add metric views for common aggregations |
-| **TVFs (Table-Valued Functions)** | Custom SQL functions | Add TVFs for complex business logic |
-| **Join Specs** | Table relationship definitions | Add or refine join specifications between tables |
-| **Instructions/Example SQL** | Behavioral guidance | Add text instructions, example SQL pairs, SQL snippets (filters, measures, expressions) |
+| Lever | Name | Target | Examples |
+|-------|------|--------|----------|
+| **0** | Proactive Enrichment *(always-on)* | UC metadata the space doesn't yet inline | Table/column descriptions, glossary terms, UC tags — non-behavioral context only |
+| **1** | Tables & Columns | Table allowlist + per-column metadata | Add a table, add column synonyms/aliases, mark deprecated columns |
+| **2** | Metric Views | Governed metric definitions | Add or refine a metric view for a common aggregation |
+| **3** | Table-Valued Functions | Parameterized SQL patterns | Register a TVF for a recurring query shape |
+| **4** | Join Specifications | Table relationships | Add or correct a join spec / preferred join key |
+| **5** | Genie Space Instructions | Natural-language guidance | Add a domain term, routing rule, or guardrail to the instructions block |
+| **6** | SQL Expressions | Example SQL library | Add a worked example, replace a stale one |
 
-The lever loop's **strategist** analyzes current failure patterns and selects the lever category most likely to address them.
+The lever loop's **strategist** analyzes current failure patterns and selects the lever most likely to address them.
 
-## 3-Gate Evaluation
+## The Lever Loop
 
-Before accepting any set of patches, the optimizer runs them through three progressively broader evaluation gates:
+The heart of Auto-Optimize is an evidence-grounded iteration — **measure, diagnose, intervene, prove, learn** — that never changes the space on a hunch:
 
 ```mermaid
 flowchart LR
-    g1["Gate 1 · Slice<br/>failing questions only"] --> g2["Gate 2 · P0<br/>high-priority questions"]
-    g2 --> g3["Gate 3 · Full<br/>all benchmark questions"]
+    rca["Diagnose<br/>RCA-ground<br/>failing traces"] --> cl["Cluster<br/>group similar<br/>failures"]
+    cl --> ag["Intervene<br/>one action group<br/>(cluster + lever)"]
+    ag --> gate["Gate + Apply<br/>safety gates →<br/>patch the config"]
+    gate --> ev["Prove<br/>re-evaluate on<br/>the train set"]
+    ev --> acc["Accept / Rollback<br/>+ write a<br/>reflection"]
 ```
 
-| Gate | Scope | Purpose |
-|------|-------|---------|
-| **Slice** | Only the questions that currently fail | Quick check — did the patches fix the targeted failures? |
-| **P0** | High-priority / critical questions | Regression check — did we break anything important? |
-| **Full** | All benchmark questions | Complete evaluation — net accuracy improvement |
+1. **Diagnose** — for every failing benchmark question, the optimizer builds a root-cause (RCA) ledger from the trace: the SQL Genie wrote, the judge verdicts, and the tables/joins it used.
+2. **Cluster** — failures sharing a root cause are grouped so one patch can fix a whole theme.
+3. **Intervene** — the strategist commits to exactly **one** action group per iteration (a cluster paired with a lever). One change at a time keeps cause and effect attributable.
+4. **Gate + apply** — proposed patches run the safety gates (below); survivors are applied to a candidate config, with a pre-iteration snapshot kept for rollback.
+5. **Prove** — the train benchmark is re-evaluated through the patched space with the same judge panel.
+6. **Accept / learn** — the acceptance rule (below) keeps or rolls back the change, and a reflection entry records what worked so the strategist won't repeat a dead end.
 
-If a patch set fails at any gate, it is **rolled back** and the optimizer tries a different approach. The strategist records the failure in a reflection buffer to avoid retrying the same strategy.
+## Acceptance: did the score actually improve?
 
-## 9 Specialized Judges
+Each iteration is kept or discarded by a single explicit rule (`decide_acceptance`): the **post-arbiter accuracy** of the patched space must beat the carried baseline by at least a gain floor.
 
-Accuracy evaluation uses 9 specialized judges that compare Genie's generated SQL against expected benchmark answers:
+```
+accept if  candidate_accuracy ≥ baseline_accuracy + min_gain_pp
+```
 
-Each judge evaluates a different dimension of SQL correctness (e.g., table selection, join logic, filter conditions, aggregation, column selection, output format). A question is considered "correct" when it passes the required subset of judges.
+| Outcome | Condition |
+|---------|-----------|
+| `ACCEPTED` | Gain ≥ `min_gain_pp` and no regression |
+| `REJECTED_INSUFFICIENT_GAIN` | Score moved up by less than the floor |
+| `REJECTED_REGRESSION` | Score went down |
+
+The gain floor is `MIN_POST_ARBITER_GAIN_PP` (env `GSO_MIN_POST_ARBITER_GAIN_PP`, default `0.0` — so any genuine positive gain is accepted). A rejected patch set is **rolled back** from its pre-iteration snapshot, and the strategist records a reflection entry so it doesn't retry the same approach.
+
+## Safety Gates
+
+Before a proposed patch is ever applied, it must clear a pipeline of safety gates (`GATE_PIPELINE_ORDER`). Only survivors get applied and evaluated:
+
+| Gate | What it checks |
+|------|----------------|
+| `intra_ag_dedup` | Collapses duplicate proposals within the action group |
+| `lever5_structural` | Rejects proposals with empty patch content (no `patch_text` / `value` / `new_text` / `example_sql`) |
+| `rca_groundedness` | The patch must carry an `rca_id` linking it to a clustered RCA finding — no guessing |
+| `blast_radius` | Caps how many distinct tables a single patch may touch (default 5) |
+| `content_fingerprint_dedup` | Drops patches whose content fingerprint was already rolled back |
+| `dead_on_arrival` | Drops no-op patches (they wouldn't change the config) and records their signature |
+
+:::note
+`slice`, `p0`, `full`, `held_out`, and `enrichment` are evaluation **scopes**, not gates. The older slice + P0 pre-gates are disabled by default (`GSO_ENABLE_LEGACY_SLICE_P0_GATES=false`); acceptance is now decided by the single full-eval criterion above.
+:::
+
+## The 9 Judges
+
+Every benchmark answer is scored by a panel of nine judges (`make_all_scorers` / `EXPECTED_JUDGE_SET`), each evaluating a different dimension of SQL correctness:
+
+| Judge | Kind | What it evaluates |
+|-------|------|-------------------|
+| `syntax_validity` | code | The generated SQL is valid (passes `EXPLAIN`) |
+| `schema_accuracy` | LLM | References the correct tables, columns, and joins |
+| `logical_accuracy` | LLM | Correct aggregations, filters, GROUP BY / ORDER BY / WHERE |
+| `semantic_equivalence` | LLM | Measures the same thing as the expected SQL, even if written differently |
+| `completeness` | LLM | Fully answers the question (no missing dimensions/measures/filters) |
+| `response_quality` | LLM | Genie's natural-language explanation accurately describes the SQL and answer |
+| `asset_routing` | code | Genie used the correct asset type (metric view / TVF / table) |
+| `result_correctness` | code | Returned result set matches the expected result |
+| `arbiter` | LLM (conditional) | On a result mismatch, decides whether the ground-truth or Genie's SQL is correct |
+
+The panel is **3 deterministic code judges** (`syntax_validity`, `asset_routing`, `result_correctness`) plus **6 LLM judges**. The `arbiter` fires only when `result_correctness` flags a mismatch; after it adjudicates, the resulting **post-arbiter accuracy** is the single number the acceptance rule compares against the baseline. Two further judges (`repeatability`, `previous_sql`) are diagnostic-only and never drive acceptance.
 
 Judge prompts are managed via **MLflow Prompt Registry**, providing version control and traceability for evaluation criteria.
+
+## Finalize: generalization & repeatability
+
+A candidate that scores well on the questions it was tuned against might simply be overfit. The Finalize task guards against that before anything is promoted:
+
+- **Held-out generalization** — at preflight the benchmark is split, reserving ~15% (`HELD_OUT_RATIO = 0.15`) of questions that the lever loop **never sees**. Finalize evaluates the candidate against this held-out set; a large train-vs-held-out gap flags overfitting.
+- **Repeatability** — the candidate is re-run to confirm the score is stable rather than a lucky draw from LLM-graded variance.
+- **Champion promotion** — each accepted iteration is snapshotted as an MLflow **LoggedModel**; the best is promoted to the **`champion`** alias (`promote_best_model`). The Deploy task applies that champion config to the live space.
 
 ## Convergence
 
@@ -83,7 +140,7 @@ The lever loop terminates when one of three conditions is met:
 |--------|-----------|---------|
 | `CONVERGED` | Accuracy target reached (typically ≥ 85%) | Optimization succeeded |
 | `STALLED` | No improvement across consecutive iterations | Further optimization is unlikely |
-| `MAX_ITERATIONS` | Iteration limit reached | Time-boxed stop |
+| `MAX_ITERATIONS` | Iteration limit reached (default 5) | Time-boxed stop |
 
 The IQ Scanner checks for terminal GSO runs when evaluating checks 11 and 12. A `CONVERGED` run with `best_accuracy ≥ 85%` satisfies both checks.
 
@@ -120,6 +177,7 @@ The optimization job runs entirely as the app's **Service Principal** (SP). See 
 
 - **Experiment tracking**: each optimization run is tracked as an MLflow experiment
 - **Prompt Registry**: judge prompts are versioned in MLflow Prompt Registry, enabling reproducible evaluations
+- **Configuration versioning**: each accepted iteration is snapshotted as an MLflow LoggedModel; the winning config is promoted to the **`champion`** alias and applied on deploy
 - **`MLFLOW_EXPERIMENT_ID`**: configured in `app.yaml`, validated at startup
 
 :::warning
