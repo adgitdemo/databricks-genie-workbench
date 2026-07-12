@@ -1,67 +1,117 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# preflight.sh — reusable pre-flight validation functions for deploy.sh
+# preflight.sh — reusable pre-flight validation functions and shared shell
+# helpers (colors, status printers) for deploy.sh and install.sh.
 #
-# Sourced (not executed) by deploy.sh. Each function prints a clear error
-# with remediation steps and exits non-zero if the check fails.
+# Sourced (not executed) by deploy.sh and install.sh. Each _preflight_*
+# function prints a clear error with remediation steps and exits non-zero
+# if the check fails.
 # ---------------------------------------------------------------------------
 
+MIN_DB_CLI_VERSION="0.297.2"
+
+# ── Shared color + status helpers ───────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+_info()   { echo -e "${BLUE}ℹ${NC} $*"; }
+_ok()     { echo -e "${GREEN}✓${NC} $*"; }
+_warn()   { echo -e "${YELLOW}⚠${NC} $*"; }
+_error()  { echo -e "${RED}✗${NC} $*" >&2; }
+_header() { echo -e "\n${BOLD}${CYAN}── $* ──${NC}\n"; }
+
+# ── Pre-flight checks ───────────────────────────────────────────────────────
+
+# Collect-all tool and version check. Reports every problem in one pass so
+# the user can fix everything before re-running.
 _preflight_check_tools() {
     echo "  Checking required tools..."
     local missing=()
-    command -v databricks &>/dev/null || missing+=("databricks")
-    command -v python3 &>/dev/null    || missing+=("python3")
-    command -v node &>/dev/null       || missing+=("node")
-    command -v npm &>/dev/null        || missing+=("npm")
-    command -v uv &>/dev/null         || missing+=("uv")
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo ""
-        echo "  ✗ Missing required tools: ${missing[*]}"
-        echo ""
-        if [[ " ${missing[*]} " == *" uv "* ]]; then
-            echo "  Install uv:"
-            echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"
-            echo "    or: brew install uv"
-            echo ""
-        fi
-        echo "  Remediation: install the missing tools and re-run scripts/deploy.sh"
-        exit 1
-    fi
-    echo "  ✓ All required tools available (databricks, python3, node, npm, uv)"
+    local issues=()
 
-    local node_version
-    node_version=$(node --version 2>/dev/null || echo "unknown")
-    if ! node -e '
+    # databricks CLI presence + minimum version
+    if command -v databricks &>/dev/null; then
+        local cli_version
+        cli_version=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+        if [ -n "$cli_version" ]; then
+            local lowest
+            lowest=$(printf '%s\n%s\n' "$MIN_DB_CLI_VERSION" "$cli_version" | sort -V | head -1)
+            if [ "$lowest" != "$MIN_DB_CLI_VERSION" ]; then
+                issues+=("databricks CLI $cli_version is older than required $MIN_DB_CLI_VERSION — upgrade with: brew upgrade databricks  (or: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh)")
+            else
+                echo -e "  ${GREEN}✓${NC} databricks CLI $cli_version"
+            fi
+        else
+            echo -e "  ${YELLOW}⚠${NC} databricks CLI present, but version could not be parsed (minimum: $MIN_DB_CLI_VERSION) — proceeding without a version guarantee"
+        fi
+    else
+        missing+=("databricks CLI — https://docs.databricks.com/dev-tools/cli/install.html")
+    fi
+
+    # python3
+    if command -v python3 &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Python ($(python3 --version 2>/dev/null))"
+    else
+        missing+=("Python 3.11+ — https://python.org/")
+    fi
+
+    # node presence + version supported by Vite
+    if command -v node &>/dev/null; then
+        local node_version
+        node_version=$(node --version 2>/dev/null || echo "unknown")
+        if node -e '
 const [major, minor] = process.versions.node.split(".").map(Number);
 const supported = (major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22;
 process.exit(supported ? 0 : 1);
-'; then
-        echo ""
-        echo "  ✗ Node.js $node_version is not supported by the frontend toolchain."
-        echo ""
-        echo "  Vite requires Node.js ^20.19.0 or >=22.12.0."
-        echo ""
-        echo "  Remediation: install Node.js 22 LTS or newer, then re-run scripts/deploy.sh"
-        exit 1
-    fi
-    echo "  ✓ Node.js version $node_version"
-
-    # Verify Databricks CLI version meets minimum for bundle app/job support
-    local cli_version min_cli_version="0.297.2"
-    cli_version=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-    if [ -n "$cli_version" ]; then
-        local lowest
-        lowest=$(printf '%s\n%s\n' "$min_cli_version" "$cli_version" | sort -V | head -1)
-        if [ "$lowest" != "$min_cli_version" ]; then
-            echo ""
-            echo "  ✗ Databricks CLI version $cli_version is too old (minimum: $min_cli_version)."
-            echo ""
-            echo "  Remediation:"
-            echo "    brew upgrade databricks"
-            echo "    or: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh"
-            exit 1
+' 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} Node.js $node_version"
+        else
+            issues+=("Node.js $node_version is not supported by the frontend toolchain — Vite requires ^20.19.0 or >=22.12.0")
         fi
-        echo "  ✓ Databricks CLI version $cli_version"
+    else
+        missing+=("Node.js ^20.19.0 or >=22.12.0 — https://nodejs.org/")
+    fi
+
+    # npm
+    if command -v npm &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} npm ($(npm --version 2>/dev/null))"
+    else
+        missing+=("npm — installed with Node.js")
+    fi
+
+    # uv
+    if command -v uv &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} uv ($(uv --version 2>/dev/null))"
+    else
+        missing+=("uv — curl -LsSf https://astral.sh/uv/install.sh | sh  (or: brew install uv)")
+    fi
+
+    # Report all problems together, then exit.
+    if [ ${#missing[@]} -gt 0 ] || [ ${#issues[@]} -gt 0 ]; then
+        echo ""
+        if [ ${#missing[@]} -gt 0 ]; then
+            echo -e "  ${RED}✗${NC} Missing required tools:"
+            local m
+            for m in "${missing[@]}"; do
+                echo "    - $m"
+            done
+        fi
+        if [ ${#issues[@]} -gt 0 ]; then
+            [ ${#missing[@]} -gt 0 ] && echo ""
+            echo -e "  ${RED}✗${NC} Version issues:"
+            local i
+            for i in "${issues[@]}"; do
+                echo "    - $i"
+            done
+        fi
+        echo ""
+        echo "  Fix all of the above, then re-run."
+        exit 1
     fi
 }
 
