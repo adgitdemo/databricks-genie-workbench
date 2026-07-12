@@ -279,7 +279,7 @@ if [ -z "$SP_CLIENT_ID" ]; then
 fi
 echo "  ✓ SP client ID: $SP_CLIENT_ID"
 
-python3 "$SCRIPT_DIR/grant_permissions.py" \
+uv run python "$SCRIPT_DIR/grant_permissions.py" \
     --profile "$PROFILE" \
     --app-name "$APP_NAME" \
     --catalog "$CATALOG" \
