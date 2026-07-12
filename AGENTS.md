@@ -59,7 +59,7 @@ backend/
   sql_executor.py          # SQL execution via Databricks SQL warehouse
   _telemetry.py            # Databricks SDK telemetry constants (PRODUCT_VERSION — keep in sync with pyproject.toml)
   routers/
-    analysis.py            # /api/space/* (fetch, parse), /api/settings, /api/debug/auth
+    analysis.py            # /api/space/* (fetch, parse), /api/settings, /api/models, /api/debug/auth
     spaces.py              # /api/spaces/* (list, scan, history, star, fix)
     admin.py               # /api/admin/* (dashboard, leaderboard, alerts)
     auth.py                # /api/auth/me
@@ -79,7 +79,12 @@ backend/
     gso_lakebase.py        # GSO synced table reads from Lakebase PostgreSQL
     lakebase.py            # PostgreSQL persistence (asyncpg pool, in-memory fallback)
     llm_utils.py           # OpenAI-compatible LLM client via Databricks serving endpoints
+    model_catalog.py       # Curated list + validation of user-selectable chat serving endpoints (/api/models)
     uc_client.py           # Unity Catalog browsing (catalogs, schemas, tables)
+  watch/                   # GenieWatch observability surface (see Key Patterns) — all routes under /api/watch/*
+    routers/               # spaces, cost, usage, feedback, resources, settings, admin
+    services/              # system_tables (SP-only reads), conversations_client, genie_client, uc_client
+    models.py              # GenieWatch Pydantic models
   prompts/                 # Prompt templates for analysis
   prompts_create/          # Prompt templates for create agent (multi-file, modular)
   references/schema.md     # Genie Space JSON schema reference
@@ -99,12 +104,13 @@ notebooks/
   install.py               # Databricks-native installer using WorkspaceClient() and generated workspace source
 frontend/
   src/
-    App.tsx                # Root: SpaceList | SpaceDetail | AdminDashboard | CreateAgentChat
+    App.tsx                # Root: five views — SpaceList | SpaceDetail | AdminDashboard | CreateSpace | HowItWorks
     lib/api.ts             # All API calls (fetch, SSE streaming helpers)
     types/index.ts         # TypeScript types mirroring backend Pydantic models
     components/            # UI components (analysis, optimization, fix agent, etc.)
       auto-optimize/       # GSO pipeline UI (24 components: config, run history, patches, scores, etc.)
-    pages/                 # SpaceList, SpaceDetail, AdminDashboard, HistoryTab, IQScoreTab
+    pages/                 # SpaceList, SpaceDetail, AdminDashboard, HowItWorks, HistoryTab, IQScoreTab
+    watch/                 # GenieWatch UI (own api.ts/types), lazy-loaded as AdminDashboard sub-tabs
     hooks/                 # useAnalysis, useTheme
   vite.config.ts           # Vite config with /api proxy to localhost:8000
 packages/
@@ -128,7 +134,10 @@ Frontend consumes these via manual `fetch` + `ReadableStream` in `lib/api.ts` (n
 `services/lakebase.py` uses asyncpg with graceful fallback to in-memory dicts when `LAKEBASE_HOST` is not set. Supports both provisioned Lakebase and Lakebase Autoscaling — for autoscaling, uses `client.postgres.get_endpoint()` to resolve DNS and `client.postgres.generate_database_credential()` for OAuth tokens. Schema and tables are created by the app at startup via `_ensure_schema()` (the SP owns everything it creates). Lakebase project, SP role, and database-level grants (CONNECT, CREATE) are automated by `scripts/setup_lakebase.py` for the local terminal path and by `scripts.deploy_lib.lakebase` for the notebook path.
 
 ### LLM Calls
-All LLM calls go through Databricks model serving endpoints using OpenAI-compatible API. Model configured via `LLM_MODEL` env var (default: `databricks-claude-sonnet-4-6`). MLflow tracing is optional — controlled by `MLFLOW_EXPERIMENT_ID`.
+All LLM calls go through Databricks model serving endpoints using OpenAI-compatible API. Model configured via `LLM_MODEL` env var (default: `databricks-claude-sonnet-4-6`). `services/model_catalog.py` exposes a curated set of chat-compatible endpoints via `/api/models` so the UI can let users override the model per Create Agent / Auto-Optimize run; `validate_chat_model()` guards those overrides. MLflow tracing is optional — controlled by `MLFLOW_EXPERIMENT_ID`.
+
+### GenieWatch (observability surface)
+`backend/watch/` is a self-contained subsystem mounted under `/api/watch/*` (registered separately in `main.py`), surfaced in the frontend as lazy-loaded sub-tabs inside `AdminDashboard` (Spaces / Cost / Resources / Feedback / Settings). It reports per-space cost, usage, feedback, and executed-resource lineage by querying Databricks **system tables** (`system.query.history`, `system.billing.usage`, `system.access.audit`, `system.access.table_lineage`). System tables are **not OBO-readable**, so `watch/services/system_tables.py` always runs as the **service principal** (`get_service_principal_client()`) and caches results in an in-process TTL cache. The SP needs `USE CATALOG system` + schema/SELECT grants — `scripts/grant_permissions.py` is the source of truth for that grant list. The watch frontend lives in `frontend/src/watch/` with its own `api.ts` (base `/api/watch`) and types, kept namespaced to avoid colliding with the workbench API surface.
 
 ### Analysis
 IQ Scan (`scanner.py`) is the only analysis path — rule-based, instant, 0-12 score with 12 checks and 3-tier maturity (Not Ready / Ready to Optimize / Trusted). Before scoring, `scan_space()` enriches the config with upstream Unity Catalog table/column descriptions so checks 2–3 reflect metadata that exists in UC even if not inlined in the Genie Space config. `routers/analysis.py` only handles space fetching/parsing and settings — it does not perform analysis.
