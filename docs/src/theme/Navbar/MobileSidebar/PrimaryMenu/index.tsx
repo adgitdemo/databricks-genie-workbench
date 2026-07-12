@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {type ReactNode} from 'react';
 import {useThemeConfig} from '@docusaurus/theme-common';
 import {useNavbarMobileSidebar} from '@docusaurus/theme-common/internal';
 import NavbarItem from '@theme/NavbarItem';
@@ -12,7 +12,7 @@ function useNavbarItems() {
 // The primary menu displays the navbar items.
 // Swizzled: append the color mode toggle after the items so it sits next to the
 // GitHub icon at the bottom of the drawer (moved out of the sidebar header).
-export default function NavbarMobilePrimaryMenu(): JSX.Element {
+export default function NavbarMobilePrimaryMenu(): ReactNode {
   const mobileSidebar = useNavbarMobileSidebar();
   const items = useNavbarItems();
   return (

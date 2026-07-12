@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {type ReactNode} from 'react';
 import {useWindowSize} from '@docusaurus/theme-common';
 import {
   useLockBodyScroll,
@@ -17,7 +17,7 @@ import NavbarMobileSidebarSecondaryMenu from '@theme/Navbar/MobileSidebar/Second
 // the --collapse media queries in custom.css.
 const COLLAPSE_BREAKPOINT = 1140;
 
-export default function NavbarMobileSidebar(): JSX.Element | null {
+export default function NavbarMobileSidebar(): ReactNode {
   const mobileSidebar = useNavbarMobileSidebar();
   const windowSize = useWindowSize({desktopBreakpoint: COLLAPSE_BREAKPOINT});
   useLockBodyScroll(mobileSidebar.shown);

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {type ReactNode} from 'react';
 import {useNavbarMobileSidebar} from '@docusaurus/theme-common/internal';
 import {translate} from '@docusaurus/Translate';
 import IconClose from '@theme/Icon/Close';
@@ -23,7 +23,7 @@ function CloseButton() {
 
 // Swizzled: the color mode toggle is moved out of this header and rendered next
 // to the GitHub icon at the bottom of the drawer (see ../PrimaryMenu).
-export default function NavbarMobileSidebarHeader(): JSX.Element {
+export default function NavbarMobileSidebarHeader(): ReactNode {
   return (
     <div className="navbar-sidebar__brand">
       <NavbarLogo />

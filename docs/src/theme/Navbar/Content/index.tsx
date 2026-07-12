@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {type ReactNode} from 'react';
 import {useThemeConfig, ErrorCauseBoundary} from '@docusaurus/theme-common';
 import {
   splitNavbarItems,
@@ -16,7 +16,7 @@ function useNavbarItems() {
   return useThemeConfig().navbar.items as any[];
 }
 
-function NavbarItems({items}: {items: any[]}): JSX.Element {
+function NavbarItems({items}: {items: any[]}): ReactNode {
   return (
     <>
       {items.map((item, i) => (
@@ -60,7 +60,7 @@ function NavbarContentLayout({
   );
 }
 
-export default function NavbarContent(): JSX.Element {
+export default function NavbarContent(): ReactNode {
   const mobileSidebar = useNavbarMobileSidebar();
   const items = useNavbarItems();
   const [leftItems, rightItems] = splitNavbarItems(items);
