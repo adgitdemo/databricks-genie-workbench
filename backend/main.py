@@ -80,6 +80,7 @@ from backend.watch.routers import (
     watch_spaces_router,
     watch_usage_router,
 )
+from backend.watch.services.system_tables import warm_cost_overview_cache
 
 
 class OBOAuthMiddleware(BaseHTTPMiddleware):
@@ -194,6 +195,10 @@ async def startup():
         await asyncio.to_thread(probe_iterations_schema)
     except Exception:
         logger.warning("iterations schema probe failed", exc_info=True)
+
+    # Pre-warm the Cost-tab overview cache in the background since it
+    # takes a long time ro run.
+    asyncio.create_task(asyncio.to_thread(warm_cost_overview_cache, 7))
 
 
 @app.on_event("shutdown")
