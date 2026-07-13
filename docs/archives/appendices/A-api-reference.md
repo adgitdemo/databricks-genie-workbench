@@ -27,7 +27,6 @@ All API endpoints are prefixed with `/api` and served by FastAPI routers. This r
 | POST | `/api/spaces/{space_id}/scan` | OBO | Run IQ scan and persist result to Lakebase |
 | GET | `/api/spaces/{space_id}/history` | OBO | Scan + auto-optimize run history for a space |
 | PUT | `/api/spaces/{space_id}/star` | OBO | Toggle starred status (Lakebase) |
-| POST | `/api/spaces/{space_id}/fix` | OBO | **SSE** — Fix agent: stream patches and progress |
 
 ## Admin Router (`/api/admin`)
 
@@ -88,11 +87,10 @@ All API endpoints are prefixed with `/api` and served by FastAPI routers. This r
 
 ## SSE Streaming Endpoints
 
-Two endpoints use Server-Sent Events:
+One endpoint uses Server-Sent Events:
 
 | Endpoint | Keepalive | Events |
 |----------|-----------|--------|
-| `POST /api/spaces/{id}/fix` | 10s | `thinking`, `patch`, `applying`, `complete`, `error` |
 | `POST /api/create/agent/chat` | 15s | `session`, `step`, `thinking`, `tool_call`, `tool_result`, `message_delta`, `message`, `created`, `updated`, `heartbeat`, `error`, `done` |
 
 The frontend consumes SSE via manual `fetch` + `ReadableStream` in `lib/api.ts` (not `EventSource`). Buffers are split on `\n\n`.

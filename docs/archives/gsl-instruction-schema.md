@@ -2,19 +2,17 @@
 
 ## Why a schema
 
-Three agents write `text_instructions`:
+Two agents write `text_instructions`:
 
 - **Create Agent** — generates the initial block when a user builds a
   new space.
-- **Fix Agent** — patches the block in response to IQ Scanner findings.
 - **Optimizer (GSO)** — rewrites the block as part of
   benchmark-driven optimization.
 
 Historically each used a different authoring convention, so a Create
-Agent space with `## Terminology` headers would be overwritten by a
-Fix Agent patch that emitted loose prose, or stripped by an
+Agent space with `## Terminology` headers could be stripped by an
 optimizer that expected `PURPOSE:` ALL-CAPS headers. This doc is the
-shared vocabulary Create and Fix both target so the output is
+shared vocabulary the Create Agent targets so the output is
 coherent end-to-end. The optimizer migrates to this schema in
 Workbench 0.1 (#91, #173).
 
@@ -105,30 +103,12 @@ section is one or more bullets. Output shape stays
 canonical single-item `[full_text]` shape is tracked in #177
 (Workbench 0.1).
 
-### Fix Agent
-
-**Must preserve existing section headers when patching.**
-`instructions.text_instructions[N].content` is the only patchable path
-into this block (`backend/prompts.py::_VALID_FIELD_PATHS_BLOCK`). When
-the Fix Agent proposes a patch, it must:
-
-1. Identify the Markdown `## Section` headers already in the content.
-2. Preserve each header in its `new_value`; edit only bullets within
-   a section, or add a new section at the correct position in the
-   order above.
-3. If the only way to address a finding is to delete a canonical
-   section, decline the patch by returning
-   `{"decline": true, "rationale": "..."}` instead.
-
 ### Optimizer (GSO) — NOT YET MIGRATED
 
 GSO currently emits a **wider section vocabulary in ALL-CAPS plain
 text** (see
 `packages/genie-space-optimizer/src/genie_space_optimizer/common/config.py`
-`INSTRUCTION_SECTION_ORDER` / `INSTRUCTION_FORMAT_RULES`). The Fix
-Agent's header-preservation rule handles GSO-authored content
-correctly because "preserve existing headers" applies whether they
-are Markdown or ALL-CAPS plain text.
+`INSTRUCTION_SECTION_ORDER` / `INSTRUCTION_FORMAT_RULES`).
 
 Full GSO alignment (Markdown format, narrower vocabulary, content
 routing to `sql_snippets` / `join_specs` / `example_question_sqls`,
@@ -138,6 +118,6 @@ shared Python module) is tracked in epic #173.
 
 - Databricks best practices: <https://docs.databricks.com/aws/en/genie/best-practices>
 - Genie Space serialized schema: <https://docs.databricks.com/aws/en/genie/conversation-api#understanding-the-serialized_space-field>
-- Near-term epic: #87 (this doc + #89 Create Agent + #90 Fix Agent)
+- Near-term epic: #87 (this doc + #89 Create Agent)
 - Full unification epic: #173 (Workbench 0.1)
 - IQ Scanner check this schema supports: `backend/services/scanner.py` check #4 (text-instructions length + SQL-in-text)

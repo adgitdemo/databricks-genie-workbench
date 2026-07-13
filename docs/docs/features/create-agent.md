@@ -1,3 +1,8 @@
+---
+sidebar_position: 1
+description: "Multi-turn, tool-calling LLM agent that builds Genie Spaces from requirements."
+---
+
 # Create Agent
 
 The Create Agent is a multi-turn, tool-calling LLM agent that walks users from business requirements to a fully configured and deployed Genie Space. It handles data discovery, profiling, plan generation, config assembly, validation, and space creation — all through a conversational interface.
@@ -6,22 +11,13 @@ The Create Agent is a multi-turn, tool-calling LLM agent that walks users from b
 
 The agent follows a structured progression through six steps. Each step focuses on gathering specific information before moving to the next:
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Requirements │───▶│ Data Sources │───▶│  Inspection  │
-│ What does    │    │ Which tables │    │ Profile cols │
-│ the space    │    │ and schemas? │    │ assess data  │
-│ need to do?  │    │              │    │ quality      │
-└──────────────┘    └──────────────┘    └──────────────┘
-                                               │
-       ┌───────────────────────────────────────┘
-       ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│     Plan     │───▶│ Config Create│───▶│Post-Creation │
-│ Generate and │    │ Build, valid-│    │ Summary and  │
-│ present the  │    │ ate, deploy  │    │ next steps   │
-│ space plan   │    │ the space    │    │              │
-└──────────────┘    └──────────────┘    └──────────────┘
+```mermaid
+flowchart LR
+    req["Requirements<br/>what does the space<br/>need to do?"] --> ds["Data Sources<br/>which tables and<br/>schemas?"]
+    ds --> insp["Inspection<br/>profile columns ·<br/>assess quality"]
+    insp --> plan["Plan<br/>generate and present<br/>the plan"]
+    plan --> cfg["Config Create<br/>build · validate ·<br/>deploy"]
+    cfg --> post["Post-Creation<br/>summary and next<br/>steps"]
 ```
 
 ### Step Descriptions
@@ -102,16 +98,6 @@ When the agent calls `generate_plan`, the request is routed to `backend/services
 
 These sections are generated concurrently using a `ThreadPoolExecutor` with 3 workers. After all sections complete, `_assemble()` merges the results and `_validate_plan_sqls()` runs SQL validation with 8 concurrent checks to catch syntax errors.
 
-## Model Selection
-
-Create Agent can use a curated set of Databricks-hosted FMAPI chat endpoints returned by `GET /api/models`. The workspace-wide `LLM_MODEL` value remains the default when the request omits `model`, as long as it is in the curated compatibility list.
-
-The curated list only includes models compatible with the current Chat Completions tool-calling loop. GPT 5.5 endpoints are intentionally excluded until Create Agent moves to the Responses API, because they reject function tools with reasoning effort on `/v1/chat/completions`.
-
-The UI disables model switching while an SSE stream is active. A change made between turns is saved on the `CreateAgentSession` and applies to the next non-continuation request; auto-continuation rounds keep the session's current model so a single logical turn does not mix models.
-
-The selected model is persisted in Lakebase with the session and is used for streaming agent calls, config repair, and parallel plan generation.
-
 ## Fast Path
 
 When the user reviews the plan in the UI and clicks "Create" (sending `action: "create"` with `edited_plan`), the agent uses `_fast_create` to skip additional LLM rounds. It directly:
@@ -176,6 +162,5 @@ Agent sessions are persisted across page refreshes:
 
 ## Related Documentation
 
-- [IQ Scanner](05-iq-scanner.md) — run after creating a space to assess quality
-- [Fix Agent](06-fix-agent.md) — automatically fix issues found by the scanner
-- [Architecture Overview](02-architecture-overview.md) — how the create agent fits in the app
+- [IQ Scanner](/docs/features/iq-scanner) — run after creating a space to assess quality
+- [Architecture Overview](/docs/getting-started/architecture-overview) — how the create agent fits in the app

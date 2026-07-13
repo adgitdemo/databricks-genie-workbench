@@ -139,7 +139,7 @@ class TestSinglePromptStructure:
 # ---------------------------------------------------------------------------
 # The Fix Agent must preserve canonical `## Section` headers in
 # text_instructions content and must know how to decline a patch that would
-# erase one. See docs/gsl-instruction-schema.md.
+# erase one. See docs/archives/gsl-instruction-schema.md.
 
 CANONICAL_GSL_SECTIONS = [
     "## PURPOSE",
@@ -157,7 +157,7 @@ class TestFixAgentGslSectionPreservation:
         for section in CANONICAL_GSL_SECTIONS:
             assert section in single_prompt, (
                 f"Single-finding fix prompt missing canonical GSL section header: {section!r}. "
-                f"See docs/gsl-instruction-schema.md."
+                f"See docs/archives/gsl-instruction-schema.md."
             )
 
     def test_batch_prompt_mentions_canonical_sections(self, sample_prompt):

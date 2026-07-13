@@ -28,9 +28,9 @@ def format_mlflow_template(template: str, **kwargs: Any) -> str:
 
     return re.sub(r"\{\{\s*(\w+)\s*\}\}", _replacer, template)
 
-# ── 0. Canonical Instruction Schema (PR #178 — docs/gsl-instruction-schema.md) ──
+# ── 0. Canonical Instruction Schema (PR #178 — docs/archives/gsl-instruction-schema.md) ──
 #
-# Keep in sync with docs/gsl-instruction-schema.md introduced by PR #178.
+# Keep in sync with docs/archives/gsl-instruction-schema.md introduced by PR #178.
 # Consolidation into a shared Python module tracked under epic #173 / issue #174;
 # until that lands, this is the authoritative source for GSO. Once the shared
 # module exists, delete these constants in a follow-up PR and import instead.
@@ -74,7 +74,7 @@ MIN_EXPAND_BUDGET = 100
 PROMOTE_MIN_CONFIDENCE = 0.7
 
 # Legacy ALL-CAPS section → promotion target, authoritative per
-# docs/gsl-instruction-schema.md (the "What does NOT go in text_instructions"
+# docs/archives/gsl-instruction-schema.md (the "What does NOT go in text_instructions"
 # table). Used by the multi-target miner for routing hints; not a strict filter
 # (the miner reads full prose and classifies every span regardless of header).
 SECTION_TO_TARGET: dict[str, str] = {
@@ -4774,7 +4774,7 @@ and a ``confidence`` in [0.0, 1.0].
 
 ## Target routing
 
-Use this table (mirrors docs/gsl-instruction-schema.md — "What does NOT \
+Use this table (mirrors docs/archives/gsl-instruction-schema.md — "What does NOT \
 go in text_instructions"):
 
 | Content shape                                            | target             |
@@ -5008,7 +5008,7 @@ SQL_EXPRESSION_SEEDING_PROMPT = _RCA_CONTRACT_HEADER + _SQL_EXPRESSION_SEEDING_B
 #      before persist (runtime).
 #
 # Example_question_sqls do NOT count toward the Genie 200-snippet limit
-# (per docs/gsl-instruction-schema.md + public Databricks docs).
+# (per docs/archives/gsl-instruction-schema.md + public Databricks docs).
 
 ENABLE_PREFLIGHT_EXAMPLE_SQL_SYNTHESIS = os.getenv(
     "GENIE_SPACE_OPTIMIZER_ENABLE_PREFLIGHT_EXAMPLE_SQL", "true",

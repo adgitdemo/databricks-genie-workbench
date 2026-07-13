@@ -101,6 +101,6 @@ Every concept in this documentation set is a refinement of these five words.
 
 ## Related Documentation
 
-- Repo-root [docs/07-auto-optimize.md](../../../../docs/07-auto-optimize.md) — operator-level overview
+- Repo-root [docs/archives/07-auto-optimize.md](../../../../docs/archives/07-auto-optimize.md) — operator-level overview
 - Package [AGENTS.md](../../AGENTS.md) — engineering invariants (Bug #1–#4)
 - Plan archive in [packages/genie-space-optimizer/docs/](..) — historical plans and run postmortems

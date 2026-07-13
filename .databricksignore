@@ -39,6 +39,9 @@ test_*.py
 CLAUDE.md
 README.md
 
+# Docs site (Docusaurus) — not needed at runtime; deployed separately to GitHub Pages
+/docs/
+
 # Python virtual environments
 .venv/
 venv/

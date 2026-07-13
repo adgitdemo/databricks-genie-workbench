@@ -1,0 +1,438 @@
+/* Genie Workbench documentation — Databricks-branded Docusaurus theme.
+   Fonts and color tokens mirror the Databricks Labs (Lakebridge) docs. */
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ifm-font-family-base: 'DM Sans', system-ui, -apple-system, sans-serif;
+  --ifm-heading-font-family: 'DM Sans', system-ui, sans-serif;
+  --ifm-font-family-monospace: 'DM Mono', ui-monospace, monospace;
+  --ifm-code-font-size: 95%;
+
+  /* Databricks blue */
+  --ifm-color-primary: #2272b4;
+  --ifm-color-primary-dark: #1f66a2;
+  --ifm-color-primary-darker: #1d6099;
+  --ifm-color-primary-darkest: #184f7e;
+  --ifm-color-primary-light: #2c83c9;
+  --ifm-color-primary-lighter: #3a8ed0;
+  --ifm-color-primary-lightest: #5ba6da;
+
+  --ifm-footer-background-color: #1b3139;
+  /* Mobile drawer takes half the viewport (default 83vw), kept proportionate. */
+  --ifm-navbar-sidebar-width: 50vw;
+  --ifm-navbar-shadow: none;
+  --ifm-link-decoration: none;
+  --ifm-link-hover-decoration: underline;
+
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme='dark'] {
+  --ifm-color-primary: #4299e0;
+  --ifm-color-primary-dark: #2f8fdc;
+  --ifm-color-primary-darker: #2387d9;
+  --ifm-color-primary-darkest: #1d6fb3;
+  --ifm-color-primary-light: #57a4e4;
+  --ifm-color-primary-lighter: #6aafe7;
+  --ifm-color-primary-lightest: #93c5ee;
+
+  --ifm-background-color: #16242a;
+  --docusaurus-highlighted-code-line-bg: rgba(255, 255, 255, 0.1);
+}
+
+/* Heading scale tuned to the DM Sans display look */
+h1 {
+  font-weight: 500;
+  font-size: 2.6rem;
+  letter-spacing: -0.02em;
+}
+h2 {
+  font-weight: 400;
+  font-size: 2rem;
+  letter-spacing: -0.01em;
+}
+h3 {
+  font-weight: 500;
+  font-size: 1.5rem;
+}
+
+/* GitHub icon in the navbar (matches the Lakebridge pattern) */
+.header-github-link:hover {
+  opacity: 0.7;
+}
+.header-github-link::before {
+  content: '';
+  width: 24px;
+  height: 24px;
+  display: flex;
+  background-color: var(--ifm-navbar-link-color);
+  mask-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12'/%3E%3C/svg%3E");
+}
+
+/* Breathing room between the brand and the first navbar dropdown */
+.navbar__brand {
+  margin-right: 1.75rem;
+}
+
+/* Never abbreviate the brand title — let it keep its full width. */
+.navbar__title {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* Collapse the navbar to the hamburger sooner than Docusaurus's hardcoded 996px,
+   so the desktop bar never has to cram or truncate at mid-size widths. This
+   mirrors Infima's max-width:996px rules at a higher threshold; the matching JS
+   gate lives in src/theme/Navbar/MobileSidebar (keep the values in sync). */
+@media (max-width: 1140px) {
+  .navbar > .container,
+  .navbar > .container-fluid {
+    padding: 0;
+  }
+  .navbar__toggle {
+    display: inherit;
+  }
+  .navbar__item {
+    display: none;
+  }
+  /* Hide the desktop color-mode toggle below the breakpoint (it moves into the
+     drawer next to GitHub). */
+  .navbar-color-mode-toggle {
+    display: none;
+  }
+  /* In the collapsed (hamburger) view, push the search to the right edge instead
+     of letting Docusaurus center the navbar center-group. */
+  .navbar__items--center {
+    margin-left: auto;
+  }
+  .navbar__items--center + .navbar__items--right {
+    flex: 0 0 auto;
+  }
+  /* Fixed search size in the collapsed view (does not shrink with the window).
+     Scoped to the center group so it beats Infima's own max-width:996px rule. */
+  .navbar__items--center .navbar__search-input {
+    width: 20rem;
+  }
+}
+
+/* Desktop only: three-zone navbar — left items / search / right icons.
+   `auto 1fr auto` keeps the left (brand + dropdowns) and right (icons) clusters
+   at their content width; the search sits in the middle gap, right-aligned next
+   to the icons, and scales fluidly (capped at 24rem, shrinking with the window).
+   Below the breakpoint this reverts to Infima's flex layout. */
+@media (min-width: 1141px) {
+  .navbar__inner {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    column-gap: 1rem;
+  }
+  .navbar__items--center {
+    min-width: 0;
+    justify-content: flex-end;
+  }
+  .navbar__items--right {
+    justify-content: flex-end;
+  }
+  .navbar__search-input {
+    width: clamp(13rem, 24vw, 24rem);
+  }
+}
+
+/* Replace the default filled-triangle dropdown caret with a sleek chevron.
+   Flex the toggle so the chevron is centered against the label vertically. */
+.dropdown > .navbar__link {
+  display: inline-flex;
+  align-items: center;
+}
+.dropdown > .navbar__link::after {
+  content: '';
+  flex: none;
+  width: 0.78em;
+  height: 0.78em;
+  margin-left: 0.35em;
+  border: none;
+  /* Optical centering: the cap-height midpoint sits above the text's visual
+     mass (x-height), and a downward chevron is top-heavy — nudge down to match. */
+  position: relative;
+  top: 0.43em;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / contain no-repeat;
+  transition: transform 0.18s ease;
+}
+
+.dropdown--show > .navbar__link::after {
+  transform: rotate(180deg);
+}
+
+/* Mobile drawer: keep the GitHub icon and the (moved) theme toggle on one row */
+.navbar-sidebar__items .menu__list-item:has(.header-github-link),
+.navbar-sidebar__items .navbar-sidebar__toggle-item {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+/* Tighten sidebar typography a touch */
+.menu {
+  font-size: 0.92rem;
+}
+
+/* Accessibility: WCAG-AA badge colors (Infima defaults fail white-on-light).
+   Fixed dark backgrounds + white text, ≥4.5:1 in both themes. */
+.badge {
+  color: #fff;
+  font-weight: 600;
+}
+.badge--success {
+  background-color: #1a7f37;
+  border-color: #1a7f37;
+}
+.badge--info {
+  background-color: #1862ab;
+  border-color: #1862ab;
+}
+.badge--warning {
+  background-color: #8a5a00;
+  border-color: #8a5a00;
+}
+.badge--danger {
+  background-color: #b3261e;
+  border-color: #b3261e;
+}
+.badge--primary {
+  background-color: #1f6699;
+  border-color: #1f6699;
+}
+.badge--secondary {
+  background-color: #475569;
+  border-color: #475569;
+}
+
+/* Footer: symmetric, consistent side gutter at every width. */
+.footer {
+  padding-inline: clamp(1.5rem, 5vw, 4rem);
+}
+
+/* Content-sized columns with controlled breakpoints (5 → 3 → 2 → 1), centered
+   with even gaps. Sizing columns to content (auto, not 1fr) guarantees the
+   longest label fits on one line; justify-content keeps the group centered and
+   overrides Infima's .row negative margins. */
+.footer__links {
+  display: grid;
+  grid-template-columns: repeat(5, auto);
+  justify-content: center;
+  gap: 2.5rem 4rem;
+  margin-inline: auto;
+  margin-bottom: 1rem;
+}
+/* Neutralize Infima's .col flex sizing inside the grid. */
+.footer__col {
+  flex: unset;
+  max-width: 100%;
+  margin-bottom: 0;
+  padding: 0;
+}
+/* Hard guarantee: no footer label ever wraps to a second line. */
+.footer__item,
+.footer__title {
+  white-space: nowrap;
+}
+
+/* 5 → 3 columns (2 rows: 3 + 2). Matches the navbar-collapse breakpoint. */
+@media (max-width: 1140px) {
+  .footer__links {
+    grid-template-columns: repeat(3, auto);
+  }
+}
+/* 3 → 2 columns (3 rows: 2 + 2 + 1). */
+@media (max-width: 768px) {
+  .footer__links {
+    grid-template-columns: repeat(2, auto);
+  }
+}
+/* 2 → 1 column (phones). */
+@media (max-width: 480px) {
+  .footer__links {
+    grid-template-columns: 1fr;
+    justify-content: stretch;
+  }
+}
+
+/* Accessibility: underline links inside doc content so they're distinguishable
+   without relying on color alone (navbar/sidebar/cards keep their own affordances). */
+.markdown a {
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+/* Accessibility: lift the dark-mode primary slightly so sidebar/breadcrumb/TOC
+   links clear 4.5:1 on the elevated dark surface (#222f35). */
+html[data-theme='dark'] {
+  --ifm-color-primary: #5aa9ec;
+}
+
+/* Accessibility: Mermaid's dark-theme edge labels (#ccc on #585858 = 4.43) miss
+   AA. Darken the label background and lighten the text for high contrast. */
+html[data-theme='dark'] .labelBkg {
+  background-color: #16242a !important;
+}
+html[data-theme='dark'] .edgeLabel,
+html[data-theme='dark'] .edgeLabel p {
+  color: #e6edf3 !important;
+  background-color: transparent !important;
+}
+
+/* Architecture diagram: nested gray surfaces that echo the page's tonal system
+   (page background -> elevated surface -> code chip). Tagged via gw-* classes in
+   the Mermaid source; theme-scoped so they match tables/figures in both themes.
+   Dark-mode fills/strokes are sampled from the docs tables so the diagram shares
+   one colorway with them: #192429 base, #293338 elevated, #303a3f code chip, with
+   #3f484c (dividers) and #62676f (chip outline) borders. Keep these in sync if the
+   table palette changes. */
+.docusaurus-mermaid-container g.cluster.gw-l0 > rect { fill: #f6f7f8 !important; stroke: #d0d7de !important; }
+.docusaurus-mermaid-container g.cluster.gw-l1 > rect { fill: #eef0f2 !important; stroke: #d0d7de !important; }
+.docusaurus-mermaid-container g.cluster.gw-l2 > rect { fill: #e6e9eb !important; stroke: #cdd3d8 !important; }
+.docusaurus-mermaid-container g.node.gw-node > rect { fill: #ffffff !important; stroke: #c2c8cd !important; }
+
+html[data-theme='dark'] .docusaurus-mermaid-container g.cluster.gw-l0 > rect { fill: #192429 !important; stroke: #3f484c !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container g.cluster.gw-l1 > rect { fill: #293338 !important; stroke: #3f484c !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container g.cluster.gw-l2 > rect { fill: #293338 !important; stroke: #3f484c !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container g.node.gw-node > rect { fill: #303a3f !important; stroke: #62676f !important; }
+
+/* Connector arrows: neutral table border gray to match the recolored surfaces. */
+html[data-theme='dark'] .docusaurus-mermaid-container .flowchart-link { stroke: #62676f !important; }
+html[data-theme='dark'] .docusaurus-mermaid-container .marker { fill: #62676f !important; stroke: #62676f !important; }
+
+/* Enlarge only the top-level platform title (gw-l0). The init fontSize is global, so
+   per-title sizing is done here; the direct-child selector avoids touching the nested
+   backend/External titles, and overflow:visible prevents clipping the larger label. */
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label .nodeLabel,
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label span,
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label p { font-size: 34px !important; }
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label foreignObject { overflow: visible !important; }
+/* The 34px size above is applied after layout, so dagre centered the label for the
+   original (smaller) width and the bigger text overflows rightward. Re-center the
+   label group on the foreignObject's own center so the enlarged title stays centered. */
+.docusaurus-mermaid-container g.cluster.gw-l0 > .cluster-label foreignObject > div {
+  position: absolute !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  width: max-content !important;
+  white-space: nowrap !important;
+}
+
+/* Section titles (backend, External Services) one step larger than node text for
+   hierarchy. Same after-layout overflow/centering caveat as gw-l0 above. */
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label .nodeLabel,
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label span,
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label p { font-size: 28px !important; }
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label foreignObject { overflow: visible !important; }
+.docusaurus-mermaid-container g.cluster.gw-l1 > .cluster-label foreignObject > div {
+  position: absolute !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  width: max-content !important;
+  white-space: nowrap !important;
+}
+
+/* External Services: pull the bottom row (eRow2) up so the inter-row gap is 2/3 of the
+   layout default, then trim the section + platform rectangles by the same amount so the
+   row->bottom-edge gap and outer padding are preserved. Mermaid's spacing config is
+   global, so this post-layout overlay is the only way to retune just this one gap
+   without disturbing the backend section above. Uses `translate:` (NOT `transform:`) so
+   it COMPOSES with the dagre-generated transform on the group instead of replacing it.
+   The px values are tied to the current diagram geometry and would need re-tuning if the
+   External Services node set changes. */
+.docusaurus-mermaid-container g.root:has(> g.clusters > g.cluster[id$="eRow2"]) {
+  translate: 0 -54px;            /* 162px gap -> 108px (2/3) */
+}
+.docusaurus-mermaid-container g.cluster[id$="ext"] > rect {
+  height: 428px;                 /* current 482 - 54: bottom edge follows the row up */
+}
+.docusaurus-mermaid-container g.cluster[id$="platform"] > rect {
+  height: 1269px;                /* 1308 - 54 + 15: extra ~10px bottom padding below External Services */
+}
+
+/* Create Agent page: enlarge each step node's first line (the title) by 6px for
+   hierarchy over its description line. Both lines live in one <p> split by <br>; the
+   node div is white-space:nowrap, so ::first-line targets exactly the title. Page-scoped
+   via the Docusaurus per-doc <html> class so only this diagram is affected; `1em` resolves
+   to the node's 16px base, so calc() is exactly +6px and survives a base-size change.
+   The descriptions carry manual <br> breaks in the Mermaid source so dagre sizes each box
+   tall enough to fit the wrapped text; overflow:visible is a safety net so the enlarged
+   title (sized by dagre at the 16px base, rendered at 22px) is never clipped. */
+html.docs-doc-id-features\/create-agent
+  .docusaurus-mermaid-container g.node .nodeLabel p::first-line {
+  font-size: calc(1em + 6px) !important;
+}
+html.docs-doc-id-features\/create-agent
+  .docusaurus-mermaid-container g.node foreignObject {
+  overflow: visible !important;
+}
+/* Center the wrapped label on both axes inside the box. Mermaid's inline
+   `display:table-cell; max-width:200px` on the label div leaves the text off-center once
+   the descriptions wrap narrower than 200px (the div renders wider than the dagre-sized
+   foreignObject, so the centered text centers on the div, not the box). Flex-centering the
+   div to fill the foreignObject fixes the horizontal offset, and centering the now-taller
+   content (22px first line) on the foreignObject's middle keeps it vertically centered. */
+html.docs-doc-id-features\/create-agent
+  .docusaurus-mermaid-container g.node foreignObject > div {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+}
+
+/* Auto-Optimize page, Lever Loop diagram only: enlarge each node's first line (the title)
+   by 2px for hierarchy over its description. Scoped to this page via the per-doc <html> class,
+   and to this one diagram via :has() on the unique `gate` node so the 6-Task Pipeline diagram
+   on the same page is untouched. overflow:visible is a safety net so the slightly taller title
+   (sized by dagre at the 16px base, rendered at 18px) is never clipped. */
+html.docs-doc-id-features\/auto-optimize
+  .docusaurus-mermaid-container:has(g.node[id*="flowchart-gate-"])
+  g.node .nodeLabel p::first-line {
+  font-size: calc(1em + 4px) !important;
+}
+html.docs-doc-id-features\/auto-optimize
+  .docusaurus-mermaid-container:has(g.node[id*="flowchart-gate-"])
+  g.node foreignObject {
+  overflow: visible !important;
+}
+/* Center the wrapped label on both axes inside each box. Mermaid's inline
+   `display:table-cell; max-width:200px` on the label div leaves the text off-center once the
+   enlarged title makes the div render wider than the dagre-sized foreignObject; flex-centering
+   the div to fill the foreignObject fixes both the horizontal offset and vertical centering. */
+html.docs-doc-id-features\/auto-optimize
+  .docusaurus-mermaid-container:has(g.node[id*="flowchart-gate-"])
+  g.node foreignObject > div {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+}
+
+/* Doc sidebar: size the sticky box to its content so a short nav list stays fully pinned
+   and visible. Only scroll the menu once it is genuinely taller than the viewport. */
+@media (min-width: 997px) {
+  .theme-doc-sidebar-container > div {
+    height: fit-content;
+    max-height: 100vh;
+  }
+  .theme-doc-sidebar-container .menu.thin-scrollbar {
+    max-height: calc(100vh - var(--ifm-navbar-height));
+    overflow-y: auto;
+  }
+}
