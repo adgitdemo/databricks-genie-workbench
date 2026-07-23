@@ -519,6 +519,23 @@ export type GSOPromptRegistryReasonCode =
   | "unknown"
   | "probe_error"
 
+export interface SpaceColumnSelection {
+  enabled: boolean
+  data_sources: Record<string, string[]>
+}
+
+export interface ColumnRecommendation {
+  data_sources: Record<string, string[]>
+  meta: Record<string, {
+    analyzed_fqns?: string[]
+    via_base_tables?: boolean
+    column_count?: number
+    has_history?: boolean
+  }>
+  days: number
+  system_tables_available: boolean
+}
+
 export type GSOPromptRegistryActionableBy = "customer" | "platform"
 
 export interface GSOPermissionCheck {

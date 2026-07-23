@@ -224,6 +224,15 @@ async def agent_chat(body: AgentChatRequest, request: Request):
                 logger.info("Pre-loaded space config for fix flow: %s", body.space_id)
             except Exception as e:
                 logger.warning("Could not pre-load space config for %s: %s", body.space_id, e)
+            # Seed the session's column selection from the per-space setting so the
+            # create/fix agent honors the same allowlist used by IQ Scan.
+            try:
+                from backend.services.lakebase import get_space_column_selection
+                sel = await get_space_column_selection(body.space_id)
+                if sel:
+                    session.column_selection = sel
+            except Exception as e:
+                logger.warning("Could not load column selection for %s: %s", body.space_id, e)
 
     requested_model = (body.model or "").strip() or None
     if requested_model and not is_continuation:

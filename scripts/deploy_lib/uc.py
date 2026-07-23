@@ -38,6 +38,8 @@ WATCH_SYSTEM_GRANTS: list[tuple[str, str, str]] = [
     ("TABLE",   "system.billing.list_prices",     "SELECT"),
     ("TABLE",   "system.access.audit",            "SELECT"),
     ("TABLE",   "system.access.table_lineage",    "SELECT"),
+    # column_lineage powers the "Recommend columns from usage history" feature.
+    ("TABLE",   "system.access.column_lineage",   "SELECT"),
     # workspaces_latest is optional / newer; absence is handled in code.
     ("TABLE",   "system.access.workspaces_latest", "SELECT"),
 ]

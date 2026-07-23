@@ -31,6 +31,8 @@ import type {
   GSOQuestionDetail,
   GSOPermissionCheck,
   GSOPatch,
+  SpaceColumnSelection,
+  ColumnRecommendation,
 } from "@/types"
 
 const API_BASE = "/api"
@@ -233,6 +235,44 @@ export async function toggleStar(spaceId: string, starred: boolean): Promise<voi
       body: JSON.stringify({ starred }),
     },
     DEFAULT_TIMEOUT
+  )
+}
+
+export async function getColumnSelection(spaceId: string): Promise<SpaceColumnSelection> {
+  return fetchWithTimeout<SpaceColumnSelection>(
+    `${API_BASE}/spaces/${spaceId}/column-selection`,
+    {},
+    DEFAULT_TIMEOUT
+  )
+}
+
+export async function saveColumnSelection(
+  spaceId: string,
+  payload: SpaceColumnSelection
+): Promise<SpaceColumnSelection> {
+  return fetchWithTimeout<SpaceColumnSelection>(
+    `${API_BASE}/spaces/${spaceId}/column-selection`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    DEFAULT_TIMEOUT
+  )
+}
+
+export async function recommendColumnSelection(
+  spaceId: string,
+  days = 30
+): Promise<ColumnRecommendation> {
+  return fetchWithTimeout<ColumnRecommendation>(
+    `${API_BASE}/spaces/${spaceId}/column-selection/recommend`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ days }),
+    },
+    LONG_TIMEOUT
   )
 }
 

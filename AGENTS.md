@@ -71,6 +71,8 @@ backend/
     prompt_registry.py     # Thin re-export of genie_space_optimizer.common.prompt_registry (shared probe — see Key Patterns)
     genie_client.py        # Databricks Genie API (fetch space, list spaces, query for SQL)
     scanner.py             # Rule-based IQ scoring engine (0-12, 12 checks, 3-tier maturity, UC-enriched)
+    column_selection.py    # Per-space column allowlist filtering (parse_allowlist/allowed_columns/filter_*) — used by scanner, create agent, GSO
+    column_usage.py        # "Recommend from usage history": system.access.column_lineage + view/MV base-table resolution
     fix_agent.py           # LLM agent (Quick Fix in UI) that generates JSON patches and applies via Genie API
     create_agent.py        # Multi-turn LLM agent for creating new Genie Spaces
     create_agent_session.py # Session persistence for create agent (Lakebase)
@@ -141,6 +143,9 @@ All LLM calls go through Databricks model serving endpoints using OpenAI-compati
 
 ### Analysis
 IQ Scan (`scanner.py`) is the only analysis path — rule-based, instant, 0-12 score with 12 checks and 3-tier maturity (Not Ready / Ready to Optimize / Trusted). Before scoring, `scan_space()` enriches the config with upstream Unity Catalog table/column descriptions so checks 2–3 reflect metadata that exists in UC even if not inlined in the Genie Space config. `routers/analysis.py` only handles space fetching/parsing and settings — it does not perform analysis.
+
+### Column Selection (per-space, opt-in)
+An optional per-space column **allowlist** narrows which columns each data source contributes to analysis. Stored in Lakebase (`genie.space_column_selection`, in-memory fallback) and set on the Space Configuration UI panel (`ColumnSelectionPanel.tsx`) — no redeploy to change. `column_selection.py` (`parse_allowlist`/`allowed_columns`/`filter_columns`) is the shared filter, applied across three paths: IQ Scan (`scanner._enrich_with_uc_descriptions`), the Create/Fix agent (`handle_tool_call(..., column_override=)`), and Auto-Optimize/GSO (carried in the run snapshot as `_column_selection`, filtered in `optimization/preflight.py`). Precedence: per-space UI setting → global file (`COLUMN_SELECTION_ENABLED`/`COLUMN_SELECTION_CONFIG`) → all columns. "Recommend from usage history" (`column_usage.py`) pre-fills the allowlist from `system.access.column_lineage` (SP-only; needs an account-admin `SELECT` grant). See `docs/docs/features/column-selection.md`.
 
 ### Two Separate Optimization Paths
 - **Quick Fix** (`fix_agent.py`): triggered from scan findings, auto-applies JSON patches

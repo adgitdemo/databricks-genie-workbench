@@ -20,6 +20,8 @@ from backend.services.lakebase import (
     get_starred_spaces,
     is_space_starred,
     get_all_scan_summaries,
+    save_space_column_selection,
+    get_space_column_selection,
 )
 from backend.routers.auto_optimize import load_runs_with_fallback, _isoformat
 from backend.services.scanner import scan_space
@@ -27,6 +29,10 @@ from backend.models import (
     SpaceListItem,
     SpaceScanRequest,
     StarToggleRequest,
+    SpaceColumnSelectionRequest,
+    SpaceColumnSelectionResponse,
+    ColumnRecommendationRequest,
+    ColumnRecommendationResponse,
     ScanResult,
     FixRequest,
 )
@@ -225,6 +231,110 @@ async def toggle_star(space_id: SpaceId, request: StarToggleRequest) -> dict:
     except Exception as e:
         logger.exception(f"Failed to toggle star for {space_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to toggle star")
+
+
+@router.get("/spaces/{space_id}/column-selection", response_model=SpaceColumnSelectionResponse)
+async def get_column_selection(space_id: SpaceId) -> SpaceColumnSelectionResponse:
+    """Get the per-space column allowlist used during analysis/scan."""
+    try:
+        saved = await get_space_column_selection(space_id)
+        if not saved:
+            return SpaceColumnSelectionResponse(enabled=False, data_sources={})
+        return SpaceColumnSelectionResponse(
+            enabled=bool(saved.get("enabled")),
+            data_sources=saved.get("data_sources") or {},
+        )
+    except Exception as e:
+        logger.exception(f"Failed to get column selection for {space_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get column selection")
+
+
+@router.put("/spaces/{space_id}/column-selection", response_model=SpaceColumnSelectionResponse)
+async def update_column_selection(
+    space_id: SpaceId, request: SpaceColumnSelectionRequest
+) -> SpaceColumnSelectionResponse:
+    """Save the per-space column allowlist. Validates the data_sources shape."""
+    # Validate: keys are catalog.schema.name, values are lists of column-name strings.
+    for identifier, cols in request.data_sources.items():
+        if not isinstance(identifier, str) or len(identifier.split(".")) != 3:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid data source identifier '{identifier}': expected catalog.schema.name",
+            )
+        if not isinstance(cols, list) or any(not isinstance(c, str) for c in cols):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Columns for '{identifier}' must be a list of strings (use [\"*\"] for all).",
+            )
+    try:
+        await save_space_column_selection(space_id, request.enabled, request.data_sources)
+        return SpaceColumnSelectionResponse(
+            enabled=request.enabled, data_sources=request.data_sources
+        )
+    except Exception as e:
+        logger.exception(f"Failed to save column selection for {space_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save column selection")
+
+
+@router.post(
+    "/spaces/{space_id}/column-selection/recommend",
+    response_model=ColumnRecommendationResponse,
+)
+async def recommend_column_selection(
+    space_id: SpaceId, request: ColumnRecommendationRequest
+) -> ColumnRecommendationResponse:
+    """Recommend columns per data source from Databricks usage history.
+
+    Analyzes ``system.access.column_lineage`` for the space's data sources
+    (and, for views / metric views, their base tables) to surface only the
+    columns that have real usage history. Best-effort: if system tables are
+    inaccessible, returns an empty recommendation with
+    ``system_tables_available=false`` rather than erroring.
+    """
+    import asyncio
+    from backend.services.genie_client import get_serialized_space, normalize_metric_view_sources
+    from backend.services import column_usage
+
+    try:
+        space_data = await asyncio.to_thread(get_serialized_space, space_id)
+        if isinstance(space_data, dict):
+            normalize_metric_view_sources(space_data)
+    except Exception as e:
+        logger.exception("Failed to fetch space %s for recommendation: %s", space_id, e)
+        raise HTTPException(status_code=400, detail="Failed to fetch Genie space")
+
+    ds = space_data.get("data_sources", {}) if isinstance(space_data, dict) else {}
+    sources: list[dict] = []
+    for t in ds.get("tables", []) or []:
+        ident = (t or {}).get("identifier") if isinstance(t, dict) else None
+        if ident:
+            sources.append({"identifier": ident, "kind": "table"})
+    for mv in ds.get("metric_views", []) or []:
+        ident = (mv or {}).get("identifier") if isinstance(mv, dict) else None
+        if ident:
+            sources.append({"identifier": ident, "kind": "metric_view"})
+
+    if not sources:
+        return ColumnRecommendationResponse(
+            data_sources={}, meta={}, days=request.days, system_tables_available=True
+        )
+
+    try:
+        rec = await asyncio.to_thread(
+            column_usage.recommend_columns, space_id, sources, request.days
+        )
+    except Exception as e:
+        logger.exception("Column recommendation failed for %s: %s", space_id, e)
+        return ColumnRecommendationResponse(
+            data_sources={}, meta={}, days=request.days, system_tables_available=False
+        )
+
+    return ColumnRecommendationResponse(
+        data_sources=rec.get("data_sources", {}),
+        meta=rec.get("meta", {}),
+        days=rec.get("days", request.days),
+        system_tables_available=bool(rec.get("system_tables_available", True)),
+    )
 
 
 @router.post("/spaces/{space_id}/fix")

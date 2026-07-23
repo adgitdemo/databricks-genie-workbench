@@ -11,6 +11,7 @@ import { IQScoreTab } from "./IQScoreTab"
 import { HistoryTab } from "./HistoryTab"
 import { useAnalysis } from "@/hooks/useAnalysis"
 import { SpaceOverview } from "@/components/SpaceOverview"
+import { ColumnSelectionPanel } from "@/components/ColumnSelectionPanel"
 import { AutoOptimizeTab } from "@/components/auto-optimize/AutoOptimizeTab"
 
 type Tab = "score" | "optimize" | "history"
@@ -293,6 +294,7 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, initialTab, autoSc
               {configExpanded && (
                 <div className="border-t border-default">
                   <SpaceOverview spaceData={state.spaceData} isLoading={state.isLoading} />
+                  <ColumnSelectionPanel spaceId={spaceId} spaceData={state.spaceData} />
                 </div>
               )}
             </div>

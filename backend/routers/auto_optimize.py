@@ -1066,6 +1066,16 @@ async def trigger(body: TriggerRequest, request: Request):
             },
         )
 
+    # Per-space column selection (opt-in): restrict optimization to selected columns.
+    column_selection = None
+    try:
+        from backend.services.lakebase import get_space_column_selection
+        sel = await get_space_column_selection(body.space_id)
+        if sel and sel.get("enabled") and sel.get("data_sources"):
+            column_selection = sel
+    except Exception as e:
+        logger.warning("Could not load column selection for %s: %s", body.space_id, e)
+
     try:
         result = trigger_optimization(
             space_id=body.space_id,
@@ -1077,6 +1087,7 @@ async def trigger(body: TriggerRequest, request: Request):
             apply_mode=body.apply_mode,
             levers=body.levers,
             deploy_target=body.deploy_target,
+            column_selection=column_selection,
         )
         return {
             "runId": result.run_id,

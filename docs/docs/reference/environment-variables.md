@@ -34,6 +34,8 @@ These variables are defined in `app.yaml` and injected into the app runtime. Pla
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `GENIE_TARGET_DIRECTORY` | `/Shared/` | Where new Genie Spaces are created. Override to a specific folder if needed |
+| `COLUMN_SELECTION_ENABLED` | `false` | Global fallback: when truthy (`true`/`1`/`yes`/`on`), restricts analysis, profiling, sampling, and IQ Scan to the columns listed per table in `COLUMN_SELECTION_CONFIG`. Off by default (uses all columns). **Superseded per space by the UI setting** (Space Configuration → Column Selection), which is stored in Lakebase and needs no redeploy |
+| `COLUMN_SELECTION_CONFIG` | (empty) | Path to a JSON allowlist file. Shape: `{"data_sources": {"cat.schema.tbl": ["col_a", "col_b"], "cat.schema.mv": ["*"]}}`. `data_sources` holds any UC identifier — tables, views, or metric views (for a metric view, list its dimension/measure names). A source with `["*"]` or one not listed uses all its columns. Ignored unless `COLUMN_SELECTION_ENABLED` is truthy. Precedence: **per-space UI setting → this global file → all columns** |
 
 ### Local Development
 

@@ -63,6 +63,23 @@ env:
     value: "/Shared/"
 
   # ---------------------------------------------------------------------------
+  # Column selection (optional)
+  # When enabled, analysis / profiling / sampling and IQ Scan use only the
+  # columns listed per table in the config file below, instead of every column
+  # in the source table/view/metric view. Off by default (uses all columns).
+  # COLUMN_SELECTION_CONFIG is a JSON file with shape:
+  #   {"data_sources": {"cat.schema.tbl": ["col_a", "col_b"], "cat.schema.mv": ["*"]}}
+  # data_sources holds any UC identifier — tables, views, or metric views (for a
+  # metric view, list its dimension/measure names). A source with ["*"] (or
+  # omitted) uses all columns. Point the path at a file synced with the app
+  # source or a mounted UC volume path.
+  # ---------------------------------------------------------------------------
+  - name: COLUMN_SELECTION_ENABLED
+    value: "false"
+  - name: COLUMN_SELECTION_CONFIG
+    value: ""
+
+  # ---------------------------------------------------------------------------
   # Local dev auth (only used when running outside Databricks Apps)
   # ---------------------------------------------------------------------------
   - name: DEV_USER_EMAIL

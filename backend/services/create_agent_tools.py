@@ -18,6 +18,7 @@ import mlflow
 from mlflow.entities import SpanType
 
 from backend.services.auth import get_workspace_client, get_databricks_host, run_in_context
+from backend.services.column_selection import filter_column_names, filter_columns
 from backend.services.uc_client import list_catalogs, list_schemas, list_tables
 from backend.sql_executor import execute_sql, get_sql_warehouse_id
 from backend.genie_creator import create_genie_space
@@ -956,12 +957,21 @@ TOOL_DEFINITIONS = [
 
 # ── Tool implementations ─────────────────────────────────────────────────────
 
-def handle_tool_call(name: str, arguments: dict, session_config: dict | None = None) -> dict:
+def handle_tool_call(
+    name: str,
+    arguments: dict,
+    session_config: dict | None = None,
+    column_override: dict | None = None,
+) -> dict:
     """Dispatch a tool call to the appropriate handler.
 
     session_config is the last config produced by generate_config (from the session).
     Tools like validate_config and create_space can fall back to it when the LLM
     omits the config argument.
+
+    column_override is an optional per-space/per-session column allowlist (already
+    parsed via column_selection.parse_allowlist). When provided, the inspection
+    tools restrict analysis/profiling to the selected columns.
     """
     handlers = {
         "search_tables": _search_tables,
@@ -1015,6 +1025,12 @@ def handle_tool_call(name: str, arguments: dict, session_config: dict | None = N
                     arguments["columns"] = [cols]
             except (json.JSONDecodeError, ValueError):
                 arguments["columns"] = [c.strip().strip('"').strip("'") for c in cols.split(",") if c.strip()]
+
+    # Thread the per-space/per-session column allowlist into inspection tools.
+    if column_override is not None and name in (
+        "describe_table", "profile_columns", "assess_data_quality", "assess_readiness"
+    ):
+        arguments["column_override"] = column_override
 
     try:
         return handler(**arguments)
@@ -1109,11 +1125,12 @@ def _discover_tables(catalog: str, schema: str) -> dict:
 
 
 @mlflow.trace(name="describe_table", span_type=SpanType.TOOL)
-def _describe_table(table_identifier: str) -> dict:
+def _describe_table(table_identifier: str, column_override: dict | None = None) -> dict:
     """Get column metadata via the SDK.
 
     Flags ETL/metadata columns with structured recommendations the
-    agent and frontend can act on.
+    agent and frontend can act on. *column_override* optionally restricts
+    the columns to a per-space/per-session allowlist.
     """
     client = get_workspace_client()
     try:
@@ -1141,6 +1158,12 @@ def _describe_table(table_identifier: str) -> dict:
         if recommendations:
             entry["recommendations"] = recommendations
         columns.append(entry)
+
+    # Restrict to the configured allowlist (no-op when the feature is off or the
+    # table is unrestricted). Applied before capping so downstream tools
+    # (profile_columns, assess_data_quality, plan builder) all inherit the subset.
+    columns = filter_columns(table_identifier, columns, name_key="name", override=column_override)
+    exclude_etl = [c for c in exclude_etl if any(col["name"] == c for col in columns)]
 
     # Cap columns to avoid overwhelming context
     total_columns = len(columns)
@@ -1191,14 +1214,16 @@ def _describe_table(table_identifier: str) -> dict:
 
 
 @mlflow.trace(name="profile_columns", span_type=SpanType.TOOL)
-def _profile_columns(table_identifier: str, columns: list[str] | None = None) -> dict:
+def _profile_columns(
+    table_identifier: str, columns: list[str] | None = None, column_override: dict | None = None
+) -> dict:
     """Profile columns by querying distinct values and date ranges."""
     # Guard: if columns look like iterated characters from a string, fall back to auto-detect
     if columns and all(len(c) <= 1 for c in columns):
         logger.warning("profile_columns: columns look like iterated chars %s — falling back to auto-detect", columns)
         columns = None
     if not columns:
-        desc_result = _describe_table(table_identifier)
+        desc_result = _describe_table(table_identifier, column_override=column_override)
         if "error" in desc_result:
             return desc_result
         string_types = {"string", "varchar", "char", "boolean"}
@@ -1209,6 +1234,10 @@ def _profile_columns(table_identifier: str, columns: list[str] | None = None) ->
             if col_type in string_types or col_type in date_types:
                 columns_to_profile.append(col["name"])
         columns = columns_to_profile[:10]
+    else:
+        # Explicit columns from the LLM — intersect with the allowlist so a
+        # deselected column can never be profiled (no-op when unrestricted).
+        columns = filter_column_names(table_identifier, columns, override=column_override)
 
     # Cap columns to avoid overwhelming context
     total_columns = len(columns)
@@ -1260,18 +1289,19 @@ _MAX_QUALITY_COLS_PER_QUERY = 20
 
 
 @mlflow.trace(name="assess_data_quality", span_type=SpanType.TOOL)
-def _assess_data_quality(table_identifiers: list[str]) -> dict:
+def _assess_data_quality(table_identifiers: list[str], column_override: dict | None = None) -> dict:
     """Assess data quality across one or more tables in parallel.
 
     Each table gets a single-pass SQL query for null/empty/constant metrics,
     then targeted queries for string columns to detect casing issues and
     boolean-as-string values. Tables are processed concurrently.
+    *column_override* optionally restricts columns to a per-space/per-session allowlist.
     """
     results: dict[str, Any] = {}
 
     with ThreadPoolExecutor(max_workers=min(len(table_identifiers), _SQL_CONCURRENCY)) as pool:
         futures = {
-            pool.submit(run_in_context(_assess_single_table, tbl)): tbl
+            pool.submit(run_in_context(_assess_single_table, tbl, column_override)): tbl
             for tbl in table_identifiers
         }
         for future in as_completed(futures):
@@ -1286,10 +1316,10 @@ def _assess_data_quality(table_identifiers: list[str]) -> dict:
     return {"tables": results, "summary": global_summary}
 
 
-def _assess_single_table(table_identifier: str) -> dict:
+def _assess_single_table(table_identifier: str, column_override: dict | None = None) -> dict:
     """Run quality checks on a single table."""
     # Get column metadata first
-    desc = _describe_table(table_identifier)
+    desc = _describe_table(table_identifier, column_override=column_override)
     if "error" in desc:
         return {"error": desc["error"]}
 
@@ -1893,7 +1923,11 @@ def _extract_question_terms(questions: list[str]) -> dict[str, set[str]]:
 
 
 @mlflow.trace(name="assess_readiness", span_type=SpanType.TOOL)
-def _assess_readiness(table_identifiers: list[str], business_questions: list[str]) -> dict:
+def _assess_readiness(
+    table_identifiers: list[str],
+    business_questions: list[str],
+    column_override: dict | None = None,
+) -> dict:
     """Assess data readiness for answering business questions via Genie.
 
     Crawls UC metadata for the given tables and scores readiness across four
@@ -1930,18 +1964,27 @@ def _assess_readiness(table_identifiers: list[str], business_questions: list[str
         if len(parts) >= 2:
             schemas_seen.add(parts[1])
 
+        # Honor the column allowlist so readiness reflects only the columns that
+        # will actually be used (no-op when the feature is off / table unrestricted).
+        table_cols = [
+            {"name": col.name, "comment": col.comment,
+             "type": str(col.type_text or col.type_name or "")}
+            for col in (table_info.columns or [])
+        ]
+        table_cols = filter_columns(tbl_id, table_cols, name_key="name", override=column_override)
+
         cols_meta = []
-        for col in (table_info.columns or []):
-            col_name = (col.name or "").lower()
+        for col in table_cols:
+            col_name = (col["name"] or "").lower()
             all_col_names.append(col_name)
             total_columns += 1
-            if col.comment:
-                all_comments.append(col.comment.lower())
+            if col["comment"]:
+                all_comments.append(col["comment"].lower())
                 columns_with_comments += 1
             cols_meta.append({
-                "name": col.name,
-                "type": str(col.type_text or col.type_name or ""),
-                "has_comment": bool(col.comment),
+                "name": col["name"],
+                "type": col["type"],
+                "has_comment": bool(col["comment"]),
             })
 
         tables_metadata.append({

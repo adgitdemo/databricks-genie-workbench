@@ -17,8 +17,14 @@ from typing import Optional
 
 from databricks.sdk.errors import NotFound
 
+from backend.services.column_selection import allowed_columns, parse_allowlist
 from backend.services.genie_client import get_genie_space, get_serialized_space
-from backend.services.lakebase import save_scan_result, get_latest_score, get_latest_optimization_run
+from backend.services.lakebase import (
+    save_scan_result,
+    get_latest_score,
+    get_latest_optimization_run,
+    get_space_column_selection,
+)
 
 # Re-exported from the GSO iq_scan package so existing import paths keep working.
 from genie_space_optimizer.iq_scan.scoring import (  # noqa: F401
@@ -51,11 +57,14 @@ def _parse_identifier(identifier: str) -> tuple[str, str, str]:
     return "", "", parts[0] if parts else ""
 
 
-def _enrich_with_uc_descriptions(space_data: dict, ws) -> int:
+def _enrich_with_uc_descriptions(space_data: dict, ws, override: dict | None = None) -> int:
     """Fetch UC table/column descriptions and merge into *space_data* in-place.
 
     Only fills blanks — never overwrites existing ``description`` or ``comment``
     values in the Genie Space config.  Returns the number of enriched items.
+
+    *override* is an optional per-space column allowlist (parsed via
+    ``parse_allowlist``) that takes precedence over the global file config.
     """
     ds = space_data.get("data_sources", {})
     all_sources = list(ds.get("tables", [])) + list(ds.get("metric_views", []))
@@ -114,10 +123,14 @@ def _enrich_with_uc_descriptions(space_data: dict, ws) -> int:
                 src["comment"] = tbl_comment
                 enriched += 1
 
-        # Enrich column-level descriptions
+        # Enrich column-level descriptions. Honor the column allowlist so the
+        # scan reflects only the columns that will actually be used (no-op when
+        # the feature is off or the table is unrestricted).
+        allow = allowed_columns(fqn, override=override)
         uc_cols = {
             getattr(c, "name", "").lower(): getattr(c, "comment", None) or ""
             for c in (getattr(info, "columns", None) or [])
+            if allow is None or getattr(c, "name", "").lower() in allow
         }
         if not uc_cols:
             continue
@@ -151,12 +164,24 @@ async def scan_space(space_id: str, user_token: Optional[str] = None) -> dict:
         logger.error(f"Failed to fetch space {space_id}: {e}")
         raise ValueError(f"Cannot scan space {space_id}: {e}")
 
+    # Per-space column allowlist (opt-in): restrict analysis to selected columns.
+    override = None
+    try:
+        selection = await get_space_column_selection(space_id)
+        if selection and selection.get("enabled") and selection.get("data_sources"):
+            override = parse_allowlist(selection["data_sources"])
+            logger.info("Applying per-space column selection for %s (%d sources)", space_id, len(override))
+    except Exception as e:
+        logger.warning("Could not load column selection for %s: %s", space_id, e)
+
     # Enrich with UC descriptions so checks 2-3 reflect upstream metadata (#62)
     try:
         from backend.services.auth import get_workspace_client, run_in_context
         ws = get_workspace_client()
         loop = asyncio.get_event_loop()
-        n = await loop.run_in_executor(None, run_in_context(_enrich_with_uc_descriptions, space_data, ws))
+        n = await loop.run_in_executor(
+            None, run_in_context(_enrich_with_uc_descriptions, space_data, ws, override)
+        )
         if n:
             logger.info("Enriched %d descriptions from Unity Catalog for %s", n, space_id)
     except Exception as e:
