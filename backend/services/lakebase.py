@@ -22,6 +22,7 @@ _memory_store: dict = {
     "history": {},    # space_id -> list of ScanResult dicts (ordered by timestamp)
     "stars": set(),   # set of starred space_ids
     "seen": set(),    # set of seen space_ids
+    "column_selection": {},  # space_id -> {"enabled": bool, "data_sources": {fqn: [cols]}}
     "optimization_runs": {},  # space_id -> latest optimization run dict
     # ── GenieWatch caches (read-only observability surface) ──
     "watch_space_cache": {},        # space_id -> dict
@@ -188,6 +189,14 @@ async def _ensure_schema():
                 CREATE TABLE IF NOT EXISTS genie.seen_spaces (
                     space_id   VARCHAR(64) PRIMARY KEY,
                     first_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS genie.space_column_selection (
+                    space_id     VARCHAR(64) PRIMARY KEY,
+                    enabled      BOOLEAN     NOT NULL DEFAULT FALSE,
+                    data_sources JSONB       NOT NULL DEFAULT '{}',
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
             await conn.execute("""
@@ -589,6 +598,54 @@ async def record_space_seen(space_id: str) -> None:
             "INSERT INTO genie.seen_spaces (space_id) VALUES ($1) ON CONFLICT DO NOTHING",
             space_id,
         )
+
+
+async def save_space_column_selection(
+    space_id: str, enabled: bool, data_sources: dict
+) -> None:
+    """Persist a space's per-data-source column allowlist (upsert)."""
+    if not _lakebase_available or _pool is None:
+        _memory_store["column_selection"][space_id] = {
+            "enabled": bool(enabled),
+            "data_sources": data_sources or {},
+        }
+        return
+
+    import json
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO genie.space_column_selection (space_id, enabled, data_sources, updated_at)
+            VALUES ($1, $2, $3::jsonb, NOW())
+            ON CONFLICT (space_id) DO UPDATE SET
+                enabled      = EXCLUDED.enabled,
+                data_sources = EXCLUDED.data_sources,
+                updated_at   = NOW()
+            """,
+            space_id,
+            bool(enabled),
+            json.dumps(data_sources or {}),
+        )
+
+
+async def get_space_column_selection(space_id: str) -> dict | None:
+    """Return {"enabled": bool, "data_sources": dict} for a space, or None if unset."""
+    await _maybe_retry_schema()
+    if not _lakebase_available or _pool is None:
+        return _memory_store["column_selection"].get(space_id)
+
+    import json
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT enabled, data_sources FROM genie.space_column_selection WHERE space_id = $1",
+            space_id,
+        )
+        if row is None:
+            return None
+        return {
+            "enabled": bool(row["enabled"]),
+            "data_sources": json.loads(row["data_sources"]) if row["data_sources"] else {},
+        }
 
 
 async def get_all_scan_summaries() -> list[dict]:

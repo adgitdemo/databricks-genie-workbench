@@ -16,6 +16,7 @@ from backend.services.llm_utils import get_llm_model
 from backend.services.auth import get_workspace_client, run_in_context
 from backend.services.create_agent_session import AgentSession
 from backend.services.create_agent_tools import TOOL_DEFINITIONS, handle_tool_call, _present_plan
+from backend.services.column_selection import parse_allowlist
 from backend.services import plan_builder
 from backend.prompts_create import assemble_system_prompt, detect_step
 
@@ -93,6 +94,18 @@ class CreateGenieAgent:
     @staticmethod
     def _effective_model(session: AgentSession) -> str:
         return session.llm_model or get_llm_model()
+
+    @staticmethod
+    def _session_column_override(session: AgentSession) -> dict | None:
+        """Parse the session's opt-in column selection into an allowlist override.
+
+        Returns None (no restriction) unless the session has an enabled selection
+        with a non-empty data_sources map.
+        """
+        sel = session.column_selection
+        if not sel or not sel.get("enabled") or not sel.get("data_sources"):
+            return None
+        return parse_allowlist(sel["data_sources"])
 
     def _get_schema_content(self) -> str:
         if self._schema_content is None:
@@ -322,12 +335,12 @@ class CreateGenieAgent:
                         else:
                             loop = asyncio.get_event_loop()
                             future = loop.run_in_executor(
-                                None, run_in_context(handle_tool_call, tool_name, tool_args, session.space_config)
+                                None, run_in_context(handle_tool_call, tool_name, tool_args, session.space_config, self._session_column_override(session))
                             )
                     else:
                         loop = asyncio.get_event_loop()
                         future = loop.run_in_executor(
-                            None, run_in_context(handle_tool_call, tool_name, tool_args, session.space_config)
+                            None, run_in_context(handle_tool_call, tool_name, tool_args, session.space_config, self._session_column_override(session))
                         )
                     while not future.done():
                         try:

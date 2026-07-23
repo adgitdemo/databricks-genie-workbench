@@ -58,6 +58,41 @@ class StarToggleRequest(BaseModel):
     starred: bool
 
 
+class SpaceColumnSelectionRequest(BaseModel):
+    """Per-space column allowlist for analysis/scan (opt-in).
+
+    ``data_sources`` maps a fully-qualified ``catalog.schema.name`` (table, view,
+    or metric view) to the list of columns to consider. ``["*"]`` or an omitted
+    source means all columns. Only applied when ``enabled`` is true.
+    """
+    enabled: bool = False
+    data_sources: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class SpaceColumnSelectionResponse(BaseModel):
+    """Current per-space column allowlist."""
+    enabled: bool = False
+    data_sources: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ColumnRecommendationRequest(BaseModel):
+    """Request to recommend columns from usage history."""
+    days: int = Field(30, ge=1, le=365)
+
+
+class ColumnRecommendationResponse(BaseModel):
+    """Recommended columns per data source, derived from usage history.
+
+    ``data_sources`` contains only sources that HAVE usage history. ``meta``
+    carries per-source diagnostics (analyzed FQNs, whether base tables were
+    used, column counts) for UI transparency.
+    """
+    data_sources: dict[str, list[str]] = Field(default_factory=dict)
+    meta: dict[str, dict] = Field(default_factory=dict)
+    days: int = 30
+    system_tables_available: bool = True
+
+
 class FixRequest(BaseModel):
     """Request to run the AI fix agent on a space."""
     space_id: str = Field(..., min_length=1, max_length=64)

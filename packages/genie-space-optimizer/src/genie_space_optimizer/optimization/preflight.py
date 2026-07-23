@@ -1255,6 +1255,65 @@ def preflight_run_iq_scan(
     }
 
 
+def _apply_column_selection(uc_columns: list[dict], snapshot: dict) -> list[dict]:
+    """Filter UC column dicts to the per-space allowlist carried in the snapshot.
+
+    The allowlist (``snapshot["_column_selection"]``) has the shape
+    ``{"enabled": bool, "data_sources": {"cat.schema.name": ["col", ...]}}``.
+    A source listed with ``["*"]`` (or an empty list), or one not listed at all,
+    is unrestricted. Matching is case-insensitive on the fully-qualified
+    ``catalog_name.schema_name.table_name``. No-op when disabled/empty.
+
+    Self-contained (no backend import) because the GSO job runs without
+    ``backend`` on its path; mirrors ``backend.services.column_selection``.
+    """
+    sel = snapshot.get("_column_selection") if isinstance(snapshot, dict) else None
+    if not sel or not sel.get("enabled"):
+        return uc_columns
+    raw = sel.get("data_sources")
+    if not isinstance(raw, dict) or not raw:
+        return uc_columns
+
+    # Parse into {fqn_lower: set(col_lower)}; empty set = wildcard (all columns).
+    allow: dict[str, set[str]] = {}
+    for ident, cols in raw.items():
+        if not isinstance(ident, str) or not ident.strip():
+            continue
+        key = ident.strip().lower()
+        names = {str(c).strip().lower() for c in cols if str(c).strip()} if isinstance(cols, list) else set()
+        allow[key] = set() if ("*" in names or not names) else names
+
+    if not allow:
+        return uc_columns
+
+    kept: list[dict] = []
+    dropped = 0
+    for col in uc_columns:
+        if not isinstance(col, dict):
+            kept.append(col)
+            continue
+        cat = str(col.get("catalog_name") or "").strip().lower()
+        sch = str(col.get("schema_name") or "").strip().lower()
+        tbl = str(col.get("table_name") or "").strip().lower()
+        fqn = f"{cat}.{sch}.{tbl}"
+        allowed = allow.get(fqn)
+        if allowed is None or not allowed:
+            # Table not listed, or wildcard → unrestricted.
+            kept.append(col)
+            continue
+        if str(col.get("column_name") or "").strip().lower() in allowed:
+            kept.append(col)
+        else:
+            dropped += 1
+
+    print(
+        f"[PREFLIGHT] Column selection applied: kept {len(kept)}, dropped {dropped} "
+        f"of {len(uc_columns)} UC columns across {len(allow)} configured source(s)",
+        flush=True,
+    )
+    return kept
+
+
 def preflight_collect_uc_metadata(
     w: "WorkspaceClient",
     spark: "SparkSession",
@@ -1606,6 +1665,12 @@ def preflight_collect_uc_metadata(
             routine_samples.append(routine_name)
 
     print("\n".join(_lines))
+
+    # Per-space column selection (opt-in): restrict UC columns to the allowlist
+    # carried in the run snapshot. Filtering here means every downstream stage
+    # (benchmark generation, evaluation allowlist, RCA, proposals) — all of which
+    # read config["_uc_columns"] — inherits the reduced column set.
+    uc_columns_dicts = _apply_column_selection(uc_columns_dicts, snapshot)
 
     config["_uc_columns"] = uc_columns_dicts
     config["_uc_foreign_keys"] = uc_fk_dicts

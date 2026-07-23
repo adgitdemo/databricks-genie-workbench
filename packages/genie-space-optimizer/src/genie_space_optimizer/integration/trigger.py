@@ -46,6 +46,7 @@ def trigger_optimization(
     apply_mode: str = "genie_config",
     levers: list[int] | None = None,
     deploy_target: str | None = None,
+    column_selection: dict | None = None,
 ) -> TriggerResult:
     """Trigger a GSO optimization run using SQL Warehouse for state management.
 
@@ -158,6 +159,13 @@ def trigger_optimization(
             f"Cannot export Genie Space config for {space_id}. "
             f"Errors: {combined}"
         )
+
+    # Carry the per-space column selection (opt-in allowlist) into the run
+    # snapshot so the preflight stage can restrict UC columns. Stored here
+    # because the GSO job cannot import backend code — the snapshot is the
+    # shared channel (persisted in genie_opt_runs and loaded by run_preflight).
+    if column_selection and column_selection.get("enabled") and column_selection.get("data_sources"):
+        space_snapshot["_column_selection"] = column_selection
 
     title = str(space_snapshot.get("title", "") or "")
     domain = (
